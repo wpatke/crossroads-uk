@@ -137,28 +137,36 @@ Crossroads-UK provides an interactive, terminal-native console application that 
 crossroads-uk/
 │
 ├── docs/
-│   └── plans/              # Chronological Implementation Plans
-│       ├── 001_stats19_ingestion_pipeline.md
-│       └── ...
+│   └── plans/                              # Implementation plans — subdirectories named sequentially (examples below)
+│       ├── 001_spatial_infrastructure/     # Phase 1: ONS boundaries & DuckDB spatial
+│       ├── 002_stats19_ingestion/          # Phase 2: collision/vehicle/casualty pipeline
+│       ├── 003_console_architecture/       # Phase 3: CLI wizard
+│       └── 004_weather_integration/        # Phase 4: ERA5-Land grid matching
 │
 ├── src/
 │   └── crossroads/
 │       ├── __init__.py
-│       ├── client.py            # Primary pipeline orchestrator & database controller
-│       ├── console.py           # Wizard state machine
-│       ├── ...
+│       ├── client.py                       # Primary pipeline orchestrator & database controller
+│       ├── console.py                      # Wizard state machine
+│       ├── registry.py                     # Transformer discovery & injection
+│       ├── quality.py                      # data_quality_log & quarantine writer; build-end invariant checks
 │       │
-│       └── transformers/        # Dedicated ingestion & cleansing modules
-│           ├── stats19.py       # DfT Accidents stream, mapping, and extraction
-│           ├── weather.py       # ERA5-Land spatiotemporal grid matching
-│           ├── spatial.py       # ONS administrative boundary re-projections
-│           └── ...
+│       └── transformers/                   # Dedicated ingestion & cleansing modules
+│           ├── base.py                     # BaseTransformer ABC
+│           ├── spatial.py                  # ONS LAD/CTYUA boundary ingestion
+│           ├── stats19.py                  # DfT collision/vehicle/casualty
+│           └── weather.py                  # ERA5-Land NetCDF grid matching
 │
-├── tests/                       # Automated Verification Suites
-│   ├── test_transformers.py     # Schema validation and spatial index checks
-│   └── ...
+├── tests/                                  # Automated Verification Suites
+│   ├── conftest.py                         # Shared DuckDB fixture
+│   ├── test_spatial.py
+│   ├── test_stats19.py
+│   └── test_quality.py                     # Conservation invariant assertions
 │
-├── pyproject.toml               # Package dependencies & metadata (Poetry/Hatch)
+├── AI_DISCLOSURE.md
+├── CLAUDE.md
+├── LICENSE
+├── pyproject.toml                          # Package dependencies & metadata
 └── README.md
 ```
 
