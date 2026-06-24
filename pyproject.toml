@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crossroads-uk"
+version = "0.0.1"
+description = "A reproducible pipeline for unifying UK road-safety, weather, and boundary data into a single local DuckDB database."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "wpatke" }]
+keywords = ["uk", "road-safety", "stats19", "duckdb", "etl", "reproducible-research"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "duckdb>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crossroads"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

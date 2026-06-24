@@ -86,6 +86,14 @@ class BaseTransformer(ABC):
         """Unique identifier for the datasource (e.g., 'stats19', 'era5_weather')."""
         pass
 
+    def is_active(self, **kwargs) -> bool:
+        """Whether this source should run for a given build(**kwargs) call.
+
+        Defaults to True (always run). Sources gated behind a build flag override
+        this, e.g. a weather source returns kwargs.get("include_weather", False).
+        """
+        return True
+
     @abstractmethod
     def extract(self, cache_dir: str, **kwargs) -> None:
         """Stream/download raw files directly to local hardware cache."""
@@ -103,7 +111,7 @@ The orchestration engine uses Python's module inspection to dynamically discover
 
 ```python
 # Internal orchestrator execution flow
-for transformer in self.registry.get_active(kwargs):
+for transformer in self.registry.get_active(**kwargs):
     transformer.extract(self.cache_dir, **kwargs)
     transformer.transform_and_load(self.con, self.cache_dir)
 ```

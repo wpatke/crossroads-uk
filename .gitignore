@@ -1,2 +1,23 @@
 /CLAUDE.md
 .claude/
+.idea/
+
+# Plan implementer notes (AI/developer reference, not for commit)
+docs/plans/**/IMPLEMENTER_NOTES.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Crossroads build artifacts
+*.db
+*.duckdb
+.crossroads_cache/
