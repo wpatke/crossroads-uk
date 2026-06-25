@@ -17,6 +17,9 @@ dist/
 .venv/
 venv/
 
+# macOS metadata
+.DS_Store
+
 # Crossroads build artifacts
 *.db
 *.duckdb
