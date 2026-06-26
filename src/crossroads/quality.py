@@ -75,3 +75,140 @@ def create_clean_view(con, view_name, silver_table, flag_columns):
         f"CREATE OR REPLACE VIEW {view_name} AS "
         f"SELECT * FROM {silver_table} WHERE {where}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 02 — Shared audit tables and their writer helpers
+# ---------------------------------------------------------------------------
+
+
+def ensure_quality_tables(con):
+    """Create the shared audit tables if they do not already exist.
+
+    Idempotent: safe to call on every build(). These four tables are
+    source-agnostic (one set per database). Bronze/silver tables are NOT
+    created here — each source owns its own bronze/silver DDL.
+
+    ingested_at uses a DuckDB DEFAULT of current_timestamp: the database
+    stamps it, not Python. It is provenance metadata only and is explicitly
+    excluded from the structural-reproducibility guarantee (spec §2) — never
+    assert on its value in tests.
+    """
+    # How many rows each source READ from its source files. The conservation
+    # invariant (Stage 03) compares this against bronze + quarantine counts.
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS source_ingest_log ("
+        " source_id VARCHAR,"
+        " source_rows BIGINT,"
+        " ingested_at TIMESTAMP DEFAULT current_timestamp)"
+    )
+    # The exclusion ledger: one row per rule violation (spec §9).
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS data_quality_log ("
+        " source_id VARCHAR,"
+        " source_row_key VARCHAR,"
+        " column_name VARCHAR,"
+        " rule_id VARCHAR,"
+        " rule_desc VARCHAR,"
+        " severity VARCHAR,"
+        " raw_value VARCHAR,"
+        " ingested_at TIMESTAMP DEFAULT current_timestamp)"
+    )
+    # Rows that could not be structured into bronze at all (rare).
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS quarantine_raw ("
+        " source_id VARCHAR,"
+        " raw_text VARCHAR,"
+        " reason VARCHAR,"
+        " ingested_at TIMESTAMP DEFAULT current_timestamp)"
+    )
+    # The auditable record of which sources DELIBERATELY opted out of the
+    # invariants (one row per exempted source) and why. Spec §9: the database
+    # itself answers "what was not processed, and why?".
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS quality_exemptions ("
+        " source_id VARCHAR,"
+        " reason VARCHAR,"
+        " ingested_at TIMESTAMP DEFAULT current_timestamp)"
+    )
+
+
+def record_source_rows(con, source_id, source_rows):
+    """Record the number of rows a source READ from its source files.
+
+    Idempotent per source: any existing row for this source_id is removed
+    first, so re-running build() against an on-disk database does not
+    double-count. Values are bound parameters (never interpolated).
+    """
+    con.execute("DELETE FROM source_ingest_log WHERE source_id = ?", [source_id])
+    con.execute(
+        "INSERT INTO source_ingest_log (source_id, source_rows) VALUES (?, ?)",
+        [source_id, source_rows],
+    )
+
+
+def log_exclusion(con, *, source_id, source_row_key, rule_id, rule_desc,
+                  severity, column_name=None, raw_value=None):
+    """Write one exclusion-ledger row (a rule violation).
+
+    severity is 'reject_dimension' (the value failed and its clean column is
+    NULL / flag is FALSE) or 'warn' (informational; does not null a column).
+    All values are bound parameters.
+    """
+    con.execute(
+        "INSERT INTO data_quality_log "
+        "(source_id, source_row_key, column_name, rule_id, rule_desc,"
+        " severity, raw_value) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [source_id, source_row_key, column_name, rule_id, rule_desc,
+         severity, raw_value],
+    )
+
+
+def quarantine_row(con, *, source_id, raw_text, reason):
+    """Write one quarantine_raw row (an unparseable source line). Rare."""
+    con.execute(
+        "INSERT INTO quarantine_raw (source_id, raw_text, reason) "
+        "VALUES (?, ?, ?)",
+        [source_id, raw_text, reason],
+    )
+
+
+def record_exemption(con, source_id, reason):
+    """Record a source's deliberate opt-out from the quality invariants.
+
+    Idempotent per source: any existing exemption for this source_id is removed
+    first, so re-running build() does not accumulate duplicate rows. The Stage 03
+    coverage gate calls this whenever a transformer's quality_spec() returns a
+    QualityExemption. Values are bound parameters.
+    """
+    con.execute("DELETE FROM quality_exemptions WHERE source_id = ?", [source_id])
+    con.execute(
+        "INSERT INTO quality_exemptions (source_id, reason) VALUES (?, ?)",
+        [source_id, reason],
+    )
+
+
+# The four shared audit tables, all keyed by source_id.
+_SOURCE_AUDIT_TABLES = (
+    "source_ingest_log",
+    "data_quality_log",
+    "quarantine_raw",
+    "quality_exemptions",
+)
+
+
+def reset_source_audit(con, source_id):
+    """Clear all shared-audit rows for one source before it is (re)built.
+
+    The engine calls this at the top of the build loop for each active source
+    (Stage 03). It makes a re-build of the same on-disk database idempotent per
+    source: log_exclusion / quarantine_row are plain appends, so without this
+    reset they would accumulate across builds and break the invariants.
+
+    Resets only the tables the ENGINE owns. Each transformer is responsible for
+    recreating its OWN bronze/silver tables idempotently (CREATE OR REPLACE /
+    DROP+CREATE) in transform_and_load. Table names come from a code-controlled
+    tuple (trusted interpolation); the source_id is a bound parameter.
+    """
+    for table in _SOURCE_AUDIT_TABLES:
+        con.execute(f"DELETE FROM {table} WHERE source_id = ?", [source_id])
