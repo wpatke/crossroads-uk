@@ -8,6 +8,7 @@ table DDL — column shapes differ per source, so each transformer writes its
 own bronze/silver tables and simply describes them with a SourceQuality.
 """
 
+import logging
 from dataclasses import dataclass
 
 # Default reject-rate ceiling (spec §9-3). A source/dimension may override it;
@@ -212,3 +213,262 @@ def reset_source_audit(con, source_id):
     """
     for table in _SOURCE_AUDIT_TABLES:
         con.execute(f"DELETE FROM {table} WHERE source_id = ?", [source_id])
+
+
+# ---------------------------------------------------------------------------
+# Stage 03 — Invariants, coverage gate, and exception hierarchy
+# ---------------------------------------------------------------------------
+
+# Coverage-gate escalation flag (see resolve_quality_specs). The END STATE is to
+# FAIL the build when an active transformer's quality_spec() is undecided (None).
+# Step 2 ships False (warn only) because no real transformer exists yet.
+# ESCALATION TRIGGER: flip to True in Step 3, the moment the first real
+# transformer (spatial.py) lands and proves the SourceQuality shape end-to-end.
+UNDECIDED_QUALITY_SPEC_IS_FATAL = False
+
+
+class QualityInvariantError(Exception):
+    """Base for all build-halting data-quality failures (spec §9)."""
+
+
+class ConservationError(QualityInvariantError):
+    """source_rows != bronze + quarantine, or bronze != silver (rows vanished)."""
+
+
+class FlagLedgerAgreementError(QualityInvariantError):
+    """A silver flag and the exclusion ledger disagree about a rejected row."""
+
+
+class RejectRateExceededError(QualityInvariantError):
+    """A source/dimension reject rate exceeded its configured ceiling."""
+
+
+class SchemaContractError(QualityInvariantError):
+    """A silver table is missing a column its quality manifest relies on — the
+    key_column, or a dimension's flag_column. Raised BEFORE the three invariants
+    so a forgotten silver-schema convention fails with a clear, named error
+    instead of a cryptic DuckDB binder error deep inside the agreement SQL."""
+
+
+class UndecidedQualitySpecError(QualityInvariantError):
+    """An active transformer's quality_spec() returned None (undecided): it must
+    return a SourceQuality(...) to be audited or a QualityExemption(reason=...)
+    to opt out explicitly."""
+
+
+def _count(con, table):
+    """Row count of a table (identifier interpolated — code-supplied, trusted)."""
+    return con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+
+def _table_columns(con, table):
+    """The set of column names in a table, via DuckDB's information schema.
+
+    The table name is passed as a bound parameter (it is matched as a value here,
+    not interpolated as an identifier). Identifiers compare case-insensitively in
+    DuckDB, so callers should compare lower-cased.
+    """
+    rows = con.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = ?",
+        [table],
+    ).fetchall()
+    return {r[0].lower() for r in rows}
+
+
+def check_schema_contract(con, spec):
+    """Pre-flight (fatal): the silver table must carry every column the manifest
+    relies on — the key_column (used by flag/ledger agreement and the keep-in-place
+    key join) and each dimension's flag_column (used by agreement and reject-rate).
+
+    Run by run_invariants BEFORE the three invariants. Without it, a silver table
+    that omits a declared column surfaces as an opaque DuckDB binder error inside
+    the agreement/reject-rate SQL; here it is a clear, named contract violation.
+
+    Two distinct failures are reported separately so the error points the engineer
+    the right way:
+      • the silver table does not exist at all (it has no columns) -> "table missing";
+      • the table exists but lacks a declared column -> "column(s) missing".
+    Without the split, a wholly-missing table would mislead by complaining about
+    missing columns when the real fix is to create the table.
+    """
+    existing = _table_columns(con, spec.silver_table)
+    if not existing:
+        # No columns reported -> the table itself is absent (or empty-of-columns,
+        # which DuckDB does not allow), so this is a missing-table error.
+        raise SchemaContractError(
+            f"[{spec.source_id}] silver table '{spec.silver_table}' does not exist. "
+            f"The transformer must create its silver table before the build-end "
+            f"invariants run."
+        )
+    required = [spec.key_column] + [dim.flag_column for dim in spec.dimensions]
+    missing = sorted({col for col in required if col.lower() not in existing})
+    if missing:
+        raise SchemaContractError(
+            f"[{spec.source_id}] silver table '{spec.silver_table}' is missing "
+            f"required column(s) {missing} declared in its quality manifest "
+            f"(key_column / dimension flag_column). Every silver table must carry "
+            f"the manifest's key_column and each dimension's flag_column."
+        )
+
+
+def check_conservation(con, spec):
+    """Invariant 1 (fatal): source_rows == clean_rows + quarantined_rows.
+
+    Two checks:
+      A. keep-in-place identity: count(bronze) == count(silver).
+      B. conservation sum: source_rows == count(bronze) + count(quarantine).
+    source_rows is the count the transformer recorded via record_source_rows.
+    """
+    bronze = _count(con, spec.bronze_table)
+    silver = _count(con, spec.silver_table)
+    if bronze != silver:
+        raise ConservationError(
+            f"[{spec.source_id}] keep-in-place violated: "
+            f"bronze {spec.bronze_table}={bronze} != silver {spec.silver_table}={silver}"
+        )
+    quarantined = con.execute(
+        "SELECT count(*) FROM quarantine_raw WHERE source_id = ?",
+        [spec.source_id],
+    ).fetchone()[0]
+    source_rows = con.execute(
+        "SELECT coalesce(sum(source_rows), 0) FROM source_ingest_log "
+        "WHERE source_id = ?",
+        [spec.source_id],
+    ).fetchone()[0]
+    if source_rows != bronze + quarantined:
+        raise ConservationError(
+            f"[{spec.source_id}] conservation violated: source_rows={source_rows} "
+            f"!= bronze({bronze}) + quarantine({quarantined}) = {bronze + quarantined}. "
+            f"Rows are unaccounted for — this is a bug, not an expected rejection."
+        )
+
+
+def check_flag_ledger_agreement(con, spec):
+    """Invariant 2 (fatal): per dimension, silver flag==FALSE set == ledger set.
+
+    For each dimension: the set of silver rows whose flag_column is FALSE must
+    equal the set of source_row_keys in data_quality_log for this source whose
+    rule_id is one of the dimension's rule_ids AND severity='reject_dimension'.
+    Checked as two anti-join counts (each must be 0). 'warn' rows are ignored.
+    """
+    for dim in spec.dimensions:
+        if not dim.rule_ids:
+            # No rule_ids declared -> nothing to reconcile for this dimension.
+            continue
+        placeholders = ", ".join("?" for _ in dim.rule_ids)
+        rule_params = list(dim.rule_ids)
+
+        # (a) silver rows flagged FALSE but with NO matching ledger entry.
+        orphan_silver = con.execute(
+            f"SELECT count(*) FROM {spec.silver_table} s "
+            f"WHERE s.{dim.flag_column} = FALSE AND NOT EXISTS ("
+            f"  SELECT 1 FROM data_quality_log l "
+            f"  WHERE l.source_id = ? AND l.source_row_key = s.{spec.key_column} "
+            f"    AND l.severity = 'reject_dimension' "
+            f"    AND l.rule_id IN ({placeholders}))",
+            [spec.source_id, *rule_params],
+        ).fetchone()[0]
+
+        # (b) ledger entries with NO matching FALSE-flagged silver row.
+        orphan_ledger = con.execute(
+            f"SELECT count(*) FROM ("
+            f"  SELECT DISTINCT source_row_key FROM data_quality_log "
+            f"  WHERE source_id = ? AND severity = 'reject_dimension' "
+            f"    AND rule_id IN ({placeholders})) l "
+            f"WHERE NOT EXISTS ("
+            f"  SELECT 1 FROM {spec.silver_table} s "
+            f"  WHERE s.{spec.key_column} = l.source_row_key "
+            f"    AND s.{dim.flag_column} = FALSE)",
+            [spec.source_id, *rule_params],
+        ).fetchone()[0]
+
+        if orphan_silver or orphan_ledger:
+            raise FlagLedgerAgreementError(
+                f"[{spec.source_id}.{dim.name}] flag/ledger disagreement: "
+                f"{orphan_silver} silver row(s) flagged FALSE without a ledger entry, "
+                f"{orphan_ledger} ledger entr(ies) without a FALSE-flagged silver row."
+            )
+
+
+def check_reject_rates(con, spec, default_ceiling):
+    """Invariant 3 (configurable, fatal above ceiling): rejected/total <= ceiling.
+
+    Per dimension: rejected = count(silver WHERE flag = FALSE), total =
+    count(silver). The ceiling is the dimension's own reject_ceiling if set,
+    else default_ceiling. An empty silver table has rate 0 (passes).
+    """
+    total = _count(con, spec.silver_table)
+    if total == 0:
+        return
+    for dim in spec.dimensions:
+        rejected = con.execute(
+            f"SELECT count(*) FROM {spec.silver_table} "
+            f"WHERE {dim.flag_column} = FALSE"
+        ).fetchone()[0]
+        rate = rejected / total
+        ceiling = dim.reject_ceiling if dim.reject_ceiling is not None else default_ceiling
+        if rate > ceiling:
+            raise RejectRateExceededError(
+                f"[{spec.source_id}.{dim.name}] reject rate {rate:.4f} "
+                f"({rejected}/{total}) exceeds ceiling {ceiling:.4f}. "
+                f"This may signal a silent upstream format change."
+            )
+
+
+def run_invariants(con, specs, default_ceiling=DEFAULT_REJECT_CEILING):
+    """Run all checks for every source spec. Raises on first failure.
+
+    Per spec, a schema-contract pre-check runs FIRST (the silver table must carry
+    the manifest's declared columns), then the three invariants. Called at the end
+    of Client.build(); any raised QualityInvariantError halts the build (spec §9
+    halt semantics). With an empty specs list this is a no-op (a zero-transformer
+    build still succeeds).
+    """
+    for spec in specs:
+        check_schema_contract(con, spec)   # fail fast on a missing silver column
+        check_conservation(con, spec)
+        check_flag_ledger_agreement(con, spec)
+        check_reject_rates(con, spec, default_ceiling)
+
+
+def resolve_quality_specs(con, transformers,
+                          undecided_fatal=UNDECIDED_QUALITY_SPEC_IS_FATAL):
+    """Coverage gate: turn each active transformer's quality_spec() decision into
+    the list of SourceQuality manifests to audit, enforcing that every active
+    source made a CONSCIOUS choice (spec §9 — no source quietly escapes auditing).
+
+    Per transformer, quality_spec() returns one of three things:
+      • SourceQuality(...)        -> collected for run_invariants().
+      • QualityExemption(reason=) -> recorded in quality_exemptions (and logged);
+                                     deliberately not audited.
+      • None (inherited default)  -> 'undecided'. If undecided_fatal, raise
+                                     UndecidedQualitySpecError; else log a warning
+                                     (the interim behaviour — see the module flag).
+    Any other return type is a programming error -> TypeError.
+    """
+    log = logging.getLogger("crossroads.quality")
+    specs = []
+    for transformer in transformers:
+        decision = transformer.quality_spec()
+        if isinstance(decision, SourceQuality):
+            specs.append(decision)
+        elif isinstance(decision, QualityExemption):
+            record_exemption(con, transformer.source_id, decision.reason)
+            log.info("[%s] quality exemption recorded: %s",
+                     transformer.source_id, decision.reason)
+        elif decision is None:
+            msg = (f"[{transformer.source_id}] quality_spec() is undecided "
+                   f"(returned None): an active source must return a "
+                   f"SourceQuality(...) to be audited or a "
+                   f"QualityExemption(reason=...) to opt out explicitly.")
+            if undecided_fatal:
+                raise UndecidedQualitySpecError(msg)
+            log.warning("%s [interim: warning only — will become fatal]", msg)
+        else:
+            raise TypeError(
+                f"[{transformer.source_id}] quality_spec() must return "
+                f"SourceQuality, QualityExemption, or None; got "
+                f"{type(decision).__name__}."
+            )
+    return specs

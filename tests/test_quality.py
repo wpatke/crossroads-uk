@@ -187,3 +187,426 @@ def test_reset_source_audit_clears_only_that_source(con):
         assert con.execute(
             f"SELECT count(*) FROM {table} WHERE source_id = 'keep'"
         ).fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Stage 03 — Invariants, coverage gate, and build integration
+# ---------------------------------------------------------------------------
+
+from crossroads.quality import (
+    check_schema_contract,
+    check_conservation, check_flag_ledger_agreement, check_reject_rates,
+    run_invariants, resolve_quality_specs,
+    SchemaContractError,
+    ConservationError, FlagLedgerAgreementError, RejectRateExceededError,
+    UndecidedQualitySpecError,
+)
+
+import crossroads
+from crossroads.transformers.base import BaseTransformer
+
+
+def _make_clean_source(con, n_valid=9, n_invalid=1, source_rows=None):
+    """Create a synthetic, internally-consistent bronze+silver source.
+
+    Silver has n_valid rows with geom_valid=TRUE and n_invalid rows with
+    geom_valid=FALSE; each FALSE row has a matching reject_dimension ledger
+    entry. Bronze mirrors silver 1:1. Returns the SourceQuality manifest.
+    """
+    ensure_quality_tables(con)
+    total = n_valid + n_invalid
+    con.execute("CREATE TABLE synth_raw (source_row_key VARCHAR)")
+    con.execute("CREATE TABLE synth (source_row_key VARCHAR, geom_valid BOOLEAN)")
+    for i in range(n_valid):
+        key = f"v{i}"
+        con.execute("INSERT INTO synth_raw VALUES (?)", [key])
+        con.execute("INSERT INTO synth VALUES (?, TRUE)", [key])
+    for i in range(n_invalid):
+        key = f"x{i}"
+        con.execute("INSERT INTO synth_raw VALUES (?)", [key])
+        con.execute("INSERT INTO synth VALUES (?, FALSE)", [key])
+        log_exclusion(
+            con, source_id="synth", source_row_key=key, column_name="geom",
+            rule_id="synth.geom.bad", rule_desc="bad geom",
+            severity="reject_dimension", raw_value="-1",
+        )
+    record_source_rows(con, "synth", source_rows if source_rows is not None else total)
+    return SourceQuality(
+        source_id="synth", bronze_table="synth_raw", silver_table="synth",
+        dimensions=(Dimension("geom", "geom_valid", ("synth.geom.bad",)),),
+    )
+
+
+# --- Invariant unit/integration checks (called directly) ---
+
+def test_clean_source_passes_all_invariants(con):
+    spec = _make_clean_source(con, n_valid=99, n_invalid=1)  # 1% < 5% default ceiling
+    run_invariants(con, [spec])  # must not raise
+
+
+def test_schema_contract_passes_when_columns_present(con):
+    spec = _make_clean_source(con, n_valid=3, n_invalid=0)
+    check_schema_contract(con, spec)  # key_column + flag_column present -> no raise
+
+
+def test_schema_contract_fails_when_key_column_missing(con):
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE s_raw (k VARCHAR)")
+    # silver lacks the manifest's key_column ('source_row_key').
+    con.execute("CREATE TABLE s (wrong_key VARCHAR, geom_valid BOOLEAN)")
+    record_source_rows(con, "s", 0)
+    spec = SourceQuality(
+        source_id="s", bronze_table="s_raw", silver_table="s",
+        dimensions=(Dimension("geom", "geom_valid", ("s.geom.bad",)),),
+    )
+    with pytest.raises(SchemaContractError):
+        check_schema_contract(con, spec)
+    # run_invariants surfaces it FIRST, before conservation/agreement/reject-rate.
+    with pytest.raises(SchemaContractError):
+        run_invariants(con, [spec])
+
+
+def test_schema_contract_fails_when_flag_column_missing(con):
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE s_raw (k VARCHAR)")
+    # silver has the key_column but not the dimension's flag_column.
+    con.execute("CREATE TABLE s (source_row_key VARCHAR)")
+    record_source_rows(con, "s", 0)
+    spec = SourceQuality(
+        source_id="s", bronze_table="s_raw", silver_table="s",
+        dimensions=(Dimension("geom", "geom_valid", ("s.geom.bad",)),),
+    )
+    with pytest.raises(SchemaContractError):
+        check_schema_contract(con, spec)
+
+
+def test_schema_contract_distinguishes_missing_table(con):
+    ensure_quality_tables(con)
+    # The silver table was never created -> a TABLE-missing error, not a
+    # column-missing error. The message must say so, to point the engineer right.
+    spec = SourceQuality(
+        source_id="s", bronze_table="s_raw", silver_table="never_created",
+        dimensions=(Dimension("geom", "geom_valid", ("s.geom.bad",)),),
+    )
+    with pytest.raises(SchemaContractError, match="does not exist"):
+        check_schema_contract(con, spec)
+
+
+def test_conservation_fails_on_missing_silver_row(con):
+    spec = _make_clean_source(con, n_valid=9, n_invalid=1)
+    # Drop one silver row -> bronze(10) != silver(9): keep-in-place violated.
+    con.execute("DELETE FROM synth WHERE source_row_key = 'v0'")
+    with pytest.raises(ConservationError):
+        check_conservation(con, spec)
+
+
+def test_conservation_fails_on_unaccounted_source_rows(con):
+    spec = _make_clean_source(con, n_valid=9, n_invalid=1, source_rows=12)
+    # source claimed 12 rows but only 10 landed (bronze) + 0 quarantined.
+    with pytest.raises(ConservationError):
+        check_conservation(con, spec)
+
+
+def test_agreement_fails_flag_without_ledger(con):
+    spec = _make_clean_source(con, n_valid=9, n_invalid=0)
+    # Flip a valid row to FALSE without logging a ledger entry.
+    con.execute("UPDATE synth SET geom_valid = FALSE WHERE source_row_key = 'v0'")
+    with pytest.raises(FlagLedgerAgreementError):
+        check_flag_ledger_agreement(con, spec)
+
+
+def test_agreement_fails_ledger_without_flag(con):
+    spec = _make_clean_source(con, n_valid=9, n_invalid=0)
+    # Log a reject_dimension entry for a row whose flag is still TRUE.
+    log_exclusion(
+        con, source_id="synth", source_row_key="v0", column_name="geom",
+        rule_id="synth.geom.bad", rule_desc="bad geom",
+        severity="reject_dimension", raw_value="-1",
+    )
+    with pytest.raises(FlagLedgerAgreementError):
+        check_flag_ledger_agreement(con, spec)
+
+
+def test_reject_rate_within_ceiling_passes(con):
+    spec = _make_clean_source(con, n_valid=99, n_invalid=1)  # 1% < 5%
+    check_reject_rates(con, spec, default_ceiling=0.05)  # must not raise
+
+
+def test_reject_rate_over_ceiling_fails(con):
+    spec = _make_clean_source(con, n_valid=8, n_invalid=2)  # 20% > 5%
+    with pytest.raises(RejectRateExceededError):
+        check_reject_rates(con, spec, default_ceiling=0.05)
+
+
+def test_per_dimension_ceiling_override(con):
+    # 20% rejected, but this dimension explicitly tolerates up to 50%.
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE s_raw (k VARCHAR)")
+    con.execute("CREATE TABLE s (source_row_key VARCHAR, ok BOOLEAN)")
+    for i in range(8):
+        con.execute("INSERT INTO s_raw VALUES (?)", [f"v{i}"])
+        con.execute("INSERT INTO s VALUES (?, TRUE)", [f"v{i}"])
+    for i in range(2):
+        con.execute("INSERT INTO s_raw VALUES (?)", [f"x{i}"])
+        con.execute("INSERT INTO s VALUES (?, FALSE)", [f"x{i}"])
+    record_source_rows(con, "s", 10)
+    spec = SourceQuality(
+        source_id="s", bronze_table="s_raw", silver_table="s",
+        dimensions=(Dimension("d", "ok", (), reject_ceiling=0.5),),
+    )
+    check_reject_rates(con, spec, default_ceiling=0.05)  # 0.2 <= 0.5 -> passes
+
+
+# --- Coverage-gate tests — resolve_quality_specs ---
+
+class _FakeTransformer:
+    """Minimal stand-in: the coverage gate only needs source_id + quality_spec()."""
+
+    def __init__(self, source_id, decision):
+        self.source_id = source_id
+        self._decision = decision
+
+    def quality_spec(self):
+        return self._decision
+
+
+def test_resolve_collects_sourcequality(con):
+    ensure_quality_tables(con)
+    spec = SourceQuality(source_id="s", bronze_table="s_raw", silver_table="s")
+    out = resolve_quality_specs(con, [_FakeTransformer("s", spec)])
+    assert out == [spec]
+
+
+def test_resolve_records_exemption_and_skips_audit(con):
+    ensure_quality_tables(con)
+    out = resolve_quality_specs(
+        con, [_FakeTransformer("agg", QualityExemption(reason="aggregates rows"))]
+    )
+    assert out == []  # nothing to audit
+    row = con.execute(
+        "SELECT source_id, reason FROM quality_exemptions"
+    ).fetchone()
+    assert row == ("agg", "aggregates rows")
+
+
+def test_resolve_undecided_warns_in_interim(con):
+    ensure_quality_tables(con)
+    # Default flag is False (interim) -> a None decision warns, does not raise.
+    out = resolve_quality_specs(con, [_FakeTransformer("u", None)])
+    assert out == []
+
+
+def test_resolve_undecided_is_fatal_when_enabled(con):
+    ensure_quality_tables(con)
+    with pytest.raises(UndecidedQualitySpecError):
+        resolve_quality_specs(
+            con, [_FakeTransformer("u", None)], undecided_fatal=True
+        )
+
+
+def test_resolve_rejects_wrong_type(con):
+    ensure_quality_tables(con)
+    with pytest.raises(TypeError):
+        resolve_quality_specs(con, [_FakeTransformer("bad", "not a spec")])
+
+
+# --- Integration tests — end-to-end via client.build() ---
+
+class _SynthTransformer(BaseTransformer):
+    """A synthetic source used only to exercise build() integration."""
+
+    def __init__(self, n_valid=9, n_invalid=1, source_rows=None):
+        self._n_valid = n_valid
+        self._n_invalid = n_invalid
+        self._source_rows = source_rows
+
+    @property
+    def source_id(self):
+        return "synth"
+
+    def extract(self, cache_dir, **kwargs):
+        pass  # nothing to download for a synthetic source
+
+    def transform_and_load(self, con, cache_dir):
+        con.execute("CREATE OR REPLACE TABLE synth_raw (source_row_key VARCHAR)")
+        con.execute("CREATE OR REPLACE TABLE synth (source_row_key VARCHAR, geom_valid BOOLEAN)")
+        for i in range(self._n_valid):
+            key = f"v{i}"
+            con.execute("INSERT INTO synth_raw VALUES (?)", [key])
+            con.execute("INSERT INTO synth VALUES (?, TRUE)", [key])
+        for i in range(self._n_invalid):
+            key = f"x{i}"
+            con.execute("INSERT INTO synth_raw VALUES (?)", [key])
+            con.execute("INSERT INTO synth VALUES (?, FALSE)", [key])
+            log_exclusion(
+                con, source_id="synth", source_row_key=key, column_name="geom",
+                rule_id="synth.geom.bad", rule_desc="bad geom",
+                severity="reject_dimension", raw_value="-1",
+            )
+        total = self._n_valid + self._n_invalid
+        record_source_rows(
+            con, "synth",
+            self._source_rows if self._source_rows is not None else total,
+        )
+
+    def quality_spec(self):
+        return SourceQuality(
+            source_id="synth", bronze_table="synth_raw", silver_table="synth",
+            dimensions=(Dimension("geom", "geom_valid", ("synth.geom.bad",)),),
+        )
+
+
+def _client_with(transformer):
+    client = crossroads.init_engine()  # in-memory
+    client.registry._transformers = [transformer]  # inject synthetic source
+    return client
+
+
+def test_build_runs_invariants_and_succeeds_on_clean_source():
+    client = _client_with(_SynthTransformer(n_valid=99, n_invalid=1))  # 1% < 5% ceiling
+    result = client.build()
+    assert result is client
+    # The synthetic source's tables and the audit tables all exist.
+    assert client.con.execute("SELECT count(*) FROM synth").fetchone()[0] == 100
+    assert client.con.execute(
+        "SELECT count(*) FROM data_quality_log"
+    ).fetchone()[0] == 1
+    client.close()
+
+
+def test_build_halts_when_invariant_violated():
+    # source claims 12 rows but only 10 land -> conservation failure.
+    client = _client_with(_SynthTransformer(n_valid=9, n_invalid=1, source_rows=12))
+    with pytest.raises(ConservationError):
+        client.build()
+    client.close()
+
+
+def test_empty_build_still_succeeds():
+    # No transformers -> audit tables created, zero invariants, clean success.
+    client = crossroads.init_engine()
+    client.build()
+    assert client.con.execute(
+        "SELECT count(*) FROM data_quality_log"
+    ).fetchone()[0] == 0
+    client.close()
+
+
+class _ExemptTransformer(BaseTransformer):
+    """A deliberately non-conserving source that opts out via QualityExemption."""
+
+    @property
+    def source_id(self):
+        return "exempt"
+
+    def extract(self, cache_dir, **kwargs):
+        pass
+
+    def transform_and_load(self, con, cache_dir):
+        # Aggregating shape: 3 bronze rows collapse to 1 silver row, so
+        # count(bronze) != count(silver) by design -> conservation would fail
+        # IF it ran. The exemption is what makes this a clean build.
+        con.execute("CREATE OR REPLACE TABLE exempt_raw (k VARCHAR)")
+        con.execute("INSERT INTO exempt_raw VALUES ('a'), ('b'), ('c')")
+        con.execute("CREATE OR REPLACE TABLE exempt (k VARCHAR)")
+        con.execute("INSERT INTO exempt VALUES ('agg')")
+
+    def quality_spec(self):
+        return QualityExemption(reason="aggregates 3 bronze rows into 1 silver row")
+
+
+def test_build_with_exemption_succeeds_and_records_reason():
+    client = _client_with(_ExemptTransformer())
+    client.build()  # must NOT raise, despite bronze(3) != silver(1)
+    row = client.con.execute(
+        "SELECT source_id, reason FROM quality_exemptions"
+    ).fetchone()
+    assert row == ("exempt", "aggregates 3 bronze rows into 1 silver row")
+    client.close()
+
+
+class _UndecidedTransformer(BaseTransformer):
+    """A source that forgot to override quality_spec() (inherits None)."""
+
+    @property
+    def source_id(self):
+        return "undecided"
+
+    def extract(self, cache_dir, **kwargs):
+        pass
+
+    def transform_and_load(self, con, cache_dir):
+        pass
+    # quality_spec() is inherited -> returns None ("undecided").
+
+
+def test_build_with_undecided_source_warns_in_interim(caplog):
+    # Interim flag (UNDECIDED_QUALITY_SPEC_IS_FATAL = False): undecided warns,
+    # build still succeeds, nothing audited or exempted.
+    client = _client_with(_UndecidedTransformer())
+    with caplog.at_level("WARNING", logger="crossroads.quality"):
+        client.build()
+    assert any("undecided" in r.message.lower() for r in caplog.records)
+    assert client.con.execute(
+        "SELECT count(*) FROM quality_exemptions"
+    ).fetchone()[0] == 0
+    client.close()
+
+
+# --- Re-build idempotency test ---
+
+class _RebuildableTransformer(BaseTransformer):
+    """Recreates its own bronze/silver idempotently and writes one exclusion +
+    one quarantine row per build. reject_ceiling is loosened so the 1-of-2 FALSE
+    flag does not trip the reject-rate tripwire (not what this test exercises)."""
+
+    @property
+    def source_id(self):
+        return "rb"
+
+    def extract(self, cache_dir, **kwargs):
+        pass
+
+    def transform_and_load(self, con, cache_dir):
+        # The transformer owns its bronze/silver DDL -> recreate idempotently.
+        con.execute("CREATE OR REPLACE TABLE rb_raw (source_row_key VARCHAR)")
+        con.execute("INSERT INTO rb_raw VALUES ('a'), ('b')")
+        con.execute("CREATE OR REPLACE TABLE rb (source_row_key VARCHAR, ok BOOLEAN)")
+        con.execute("INSERT INTO rb VALUES ('a', TRUE), ('b', FALSE)")
+        log_exclusion(
+            con, source_id="rb", source_row_key="b", column_name="x",
+            rule_id="rb.x.bad", rule_desc="bad", severity="reject_dimension",
+            raw_value="-1",
+        )
+        quarantine_row(con, source_id="rb", raw_text="broken,line", reason="bad row")
+        # 2 rows landed in bronze + 1 quarantined = 3 rows read from source.
+        record_source_rows(con, "rb", 3)
+
+    def quality_spec(self):
+        return SourceQuality(
+            source_id="rb", bronze_table="rb_raw", silver_table="rb",
+            dimensions=(Dimension("x", "ok", ("rb.x.bad",), reject_ceiling=1.0),),
+        )
+
+
+def test_rebuild_against_same_file_is_idempotent(tmp_path):
+    db_path = str(tmp_path / "rb.db")
+
+    def run_once():
+        client = crossroads.init_engine(database_path=db_path)
+        client.registry._transformers = [_RebuildableTransformer()]
+        client.build()  # must not raise on EITHER run
+        return client
+
+    first = run_once()
+    first.close()
+    second = run_once()  # second build against the SAME on-disk database
+
+    # Each shared audit table holds this source's rows exactly once — not doubled.
+    # (Without reset_source_audit, quarantine_raw would have 2 rows and the
+    #  conservation invariant would have raised on this second build.)
+    for table in ("source_ingest_log", "data_quality_log", "quarantine_raw"):
+        assert second.con.execute(
+            f"SELECT count(*) FROM {table} WHERE source_id = 'rb'"
+        ).fetchone()[0] == 1
+    second.close()

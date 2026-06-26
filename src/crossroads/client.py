@@ -2,6 +2,7 @@
 
 import duckdb
 
+from crossroads import quality
 from crossroads.registry import Registry
 
 
@@ -24,12 +25,33 @@ class Client:
 
         ``**kwargs`` (e.g. ``years=[...]``, ``include_weather=True``,
         ``spatial_grain="local_authority"``) are forwarded to each transformer's
-        ``is_active`` and ``extract`` methods. Returns ``self`` for chaining.
+        ``is_active`` and ``extract`` methods. An optional ``reject_ceiling``
+        kwarg overrides the global default reject-rate ceiling. Returns ``self``.
+
+        At build end the shared data-quality invariants run (spec §9); any
+        violation raises and halts the build.
         """
         self.con = duckdb.connect(self.database_path)
-        for transformer in self.registry.get_active(**kwargs):
+        # Create the shared audit tables up-front so transformers can write to them.
+        quality.ensure_quality_tables(self.con)
+
+        active = self.registry.get_active(**kwargs)
+        for transformer in active:
+            # Clear this source's rows from the shared audit tables before it is
+            # (re)built, so a re-build against an existing on-disk database stays
+            # idempotent (log_exclusion / quarantine_row are plain appends). The
+            # transformer is responsible for recreating its own bronze/silver.
+            quality.reset_source_audit(self.con, transformer.source_id)
             transformer.extract(self.cache_dir, **kwargs)
             transformer.transform_and_load(self.con, self.cache_dir)
+
+        # Coverage gate: resolve each active source's quality_spec() decision
+        # (audit / explicit exemption / undecided), then run the build-end
+        # invariants (conservation, flag/ledger agreement, reject-rate tripwire).
+        # Both the gate and the invariants are fatal on violation.
+        specs = quality.resolve_quality_specs(self.con, active)
+        default_ceiling = kwargs.get("reject_ceiling") or quality.DEFAULT_REJECT_CEILING
+        quality.run_invariants(self.con, specs, default_ceiling=default_ceiling)
         return self
 
     def close(self) -> None:
