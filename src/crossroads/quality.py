@@ -219,12 +219,11 @@ def reset_source_audit(con, source_id):
 # Stage 03 — Invariants, coverage gate, and exception hierarchy
 # ---------------------------------------------------------------------------
 
-# Coverage-gate escalation flag (see resolve_quality_specs). The END STATE is to
-# FAIL the build when an active transformer's quality_spec() is undecided (None).
-# Step 2 ships False (warn only) because no real transformer exists yet.
-# ESCALATION TRIGGER: flip to True in Step 3, the moment the first real
-# transformer (spatial.py) lands and proves the SourceQuality shape end-to-end.
-UNDECIDED_QUALITY_SPEC_IS_FATAL = False
+# Coverage-gate escalation flag (see resolve_quality_specs). Every active
+# transformer must return SourceQuality or QualityExemption from quality_spec().
+# Escalation landed in Step 3 (spatial.py): spatial.py proves the SourceQuality
+# shape end-to-end, so None ("undecided") is now fatal.
+UNDECIDED_QUALITY_SPEC_IS_FATAL = True    # enforced from Step 3 onward
 
 
 class QualityInvariantError(Exception):

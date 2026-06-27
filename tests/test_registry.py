@@ -42,13 +42,12 @@ def make_transformer_package(tmp_path):
         sys.path.remove(str(tmp_path))
 
 
-def test_default_registry_discovers_no_concrete_transformers():
-    # The real crossroads.transformers package contains only the abstract base,
-    # so a default Registry finds zero concrete transformers (a clean no-op engine).
+def test_default_registry_discovers_at_least_one_transformer():
+    # The default registry should find at least one concrete transformer.
+    # (Exact contents vary as new transformers are added to the package.)
     registry = Registry()
-    assert registry.all() == []
-    assert registry.get_active() == []
-    assert registry.get_active(include_weather=True) == []
+    assert len(registry.all()) >= 1
+    assert len(registry.get_active()) >= 1
 
 
 def test_discovers_a_concrete_transformer(make_transformer_package):

@@ -389,10 +389,11 @@ def test_resolve_records_exemption_and_skips_audit(con):
     assert row == ("agg", "aggregates rows")
 
 
-def test_resolve_undecided_warns_in_interim(con):
+def test_resolve_undecided_warns_when_not_fatal(con):
     ensure_quality_tables(con)
-    # Default flag is False (interim) -> a None decision warns, does not raise.
-    out = resolve_quality_specs(con, [_FakeTransformer("u", None)])
+    # Pass undecided_fatal=False explicitly to test the warn-only code path
+    # (the module default is now True since spatial.py landed in Step 3).
+    out = resolve_quality_specs(con, [_FakeTransformer("u", None)], undecided_fatal=False)
     assert out == []
 
 
@@ -483,8 +484,9 @@ def test_build_halts_when_invariant_violated():
 
 
 def test_empty_build_still_succeeds():
-    # No transformers -> audit tables created, zero invariants, clean success.
+    # Explicitly no transformers -> audit tables created, zero invariants, clean success.
     client = crossroads.init_engine()
+    client.registry._transformers = []  # bypass auto-discovery of spatial transformers
     client.build()
     assert client.con.execute(
         "SELECT count(*) FROM data_quality_log"
@@ -540,16 +542,12 @@ class _UndecidedTransformer(BaseTransformer):
     # quality_spec() is inherited -> returns None ("undecided").
 
 
-def test_build_with_undecided_source_warns_in_interim(caplog):
-    # Interim flag (UNDECIDED_QUALITY_SPEC_IS_FATAL = False): undecided warns,
-    # build still succeeds, nothing audited or exempted.
+def test_build_with_undecided_source_is_fatal():
+    # From Step 3 on, UNDECIDED_QUALITY_SPEC_IS_FATAL is True: an active source
+    # that never overrode quality_spec() (inherits None) halts the build.
     client = _client_with(_UndecidedTransformer())
-    with caplog.at_level("WARNING", logger="crossroads.quality"):
+    with pytest.raises(UndecidedQualitySpecError):
         client.build()
-    assert any("undecided" in r.message.lower() for r in caplog.records)
-    assert client.con.execute(
-        "SELECT count(*) FROM quality_exemptions"
-    ).fetchone()[0] == 0
     client.close()
 
 
