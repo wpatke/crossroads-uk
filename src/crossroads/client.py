@@ -32,6 +32,13 @@ class Client:
         violation raises and halts the build.
         """
         self.con = duckdb.connect(self.database_path)
+        # Load the DuckDB Spatial Extension once, as foundational infrastructure
+        # (spec §5 Phase 1). It is generic (names no data source, so provider-plugin
+        # purity holds), idempotent, and cheap. INSTALL needs the network only on the
+        # first run on a machine; thereafter the extension is cached locally. Every
+        # spatial source (boundaries now, weather later) relies on this being loaded.
+        self.con.execute("INSTALL spatial")
+        self.con.execute("LOAD spatial")
         # Create the shared audit tables up-front so transformers can write to them.
         quality.ensure_quality_tables(self.con)
 
