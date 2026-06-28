@@ -34,3 +34,11 @@ packages = ["src/crossroads"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Integration tests (slow, or exercising real external services such as the live
+# ONS portal) are deselected by default so the normal suite stays fast, offline
+# and deterministic. A human runs them deliberately with:
+#   pytest -m integration
+addopts = "-m 'not integration'"
+markers = [
+  "integration: end-to-end tests against real components or live services (may be slow or reach the internet); deselected by default, run with -m integration",
+]

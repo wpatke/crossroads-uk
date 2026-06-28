@@ -2,7 +2,7 @@
 
 Crossroads-UK automates the downloading, cleansing, and unification of UK government datasets, including transport records, meteorological history, and geographic boundaries.
 
-The project is an open-source, Python orchestration pipeline merging all data into a single local DuckDB database. 
+The project is an open-source, Python orchestration pipeline merging all data into a single local DuckDB database. Road safety is where Crossroads-UK starts, not where it stops: the engine is dataset-agnostic by design (§4), and any UK public dataset can be added as a new source without touching the core. 
 
 This project was inspired by a suggestion from Dr. Robin Lovelace at [ropensci/stats19](https://github.com/ropensci/stats19/issues/230). Crossroads-UK intends to expand on this core idea.
 
@@ -56,6 +56,20 @@ To eliminate runtime query lag, all geometries are reprojected once at ingestion
 **The Problem:** Collision events are recorded at the exact minute of occurrence, whereas environmental weather data (ERA5-Land grids) are logged in discrete hourly increments. Furthermore, future data sources (e.g., high-frequency traffic loops or vehicle telematics) will introduce disparate temporal grains ranging from seconds to months. Permanent truncation at ingestion discards information and invalidates sub-hourly analysis.
 
 **The Engine Solution:** Crossroads-UK maintains the raw, pristine minute-level timestamp for absolute data fidelity, alongside deterministic interval keys (such as hourly or daily) generated dynamically to support clean relational joins.
+
+#### Temporal Zone Standardization
+
+Crossroads-UK is scoped to the UK, so every record lies within a single civil time zone. That scope — not any one use case — is what makes **UK local time** a coherent universal frame for the database: it is meaningful for every source, in a way it would not be for a global dataset. Which temporal columns a source carries then follows from §2 fidelity, not convenience:
+
+- **`*_local` — present for every source.** Stored in UK civil time (IANA zone `Europe/London`: GMT in winter, BST in summer). It is the common surface for cross-source joins, because every source can populate it faithfully: a UTC-native source converts UTC→local (total and deterministic), and a local-native source already is local.
+- **`*_utc` — present only where the source natively records a true instant.** It is never reconstructed from local time: a wall-clock reading carries no DST offset (the autumn fall-back hour is ambiguous, the spring-forward hour absent), so inventing a UTC instant for a local-native source is forbidden under §2.
+
+| Source kind | Temporal columns |
+|-------------|------------------|
+| Local-native (e.g. STATS19 collisions) | `*_local` |
+| UTC-native (e.g. ERA5-Land weather) | `*_utc` + `*_local` (derived) |
+
+Rules: every temporal column carries a mandatory zone suffix (`_local` / `_utc`) — a bare `timestamp` is a defect; columns are stored as naive `TIMESTAMP` (not `TIMESTAMP WITH TIME ZONE`, whose rendering depends on the session setting and would make the database environment-dependent). Machine-stamped provenance timestamps (e.g. `ingested_at`) are UTC and excluded from these rules and from the §2 reproducibility guarantee.
 
 ### C. Shifting Geopolitical Boundaries
 
@@ -118,7 +132,7 @@ for transformer in self.registry.get_active(**kwargs):
 
 ---
 
-## 5. Implementation Roadmap
+## 5. Initial Implementation Roadmap
 
 The spatial normalization layer must be fully established before processing environmental datasets. Stats19 records natively utilize the British National Grid (EPSG:27700), whereas meteorological grids (ERA5-Land) are indexed by global decimal degrees (EPSG:4326). 
 

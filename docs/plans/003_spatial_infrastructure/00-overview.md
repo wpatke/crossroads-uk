@@ -2,6 +2,12 @@
 > Multi-stage plan. Each session gets THIS overview + ONE stage file. Read this first.
 > Each stage's End State is the contract — adapt steps to reality and note deviations.
 
+> **Superseded detail (shapefile → GeoJSON):** This document describes committing ONS boundary
+> samples as shapefiles (`.shp/.shx/.dbf/.prj`) and reading them via `ST_Read`. The implemented
+> design instead downloads and commits **GeoJSON** (ONS publishes ArcGIS FeatureServer GeoJSON, not
+> shapefile ZIPs); the shapefile fixtures have been removed as unused. Treat shapefile-specific
+> steps below as historical — the GeoJSON equivalent is what shipped in `spatial.py`.
+
 Load the DuckDB **Spatial Extension** as foundational infrastructure, then ingest ONS **Local
 Authority District (LAD)** and **County/Unitary Authority (CTYUA)** boundaries — as the
 EPSG:27700 geometric base layer everything else joins against — through the Step 2 bronze →

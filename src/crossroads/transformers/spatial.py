@@ -10,13 +10,15 @@ validated.
 FeatureServer (WFS) services rather than as direct shapefile ZIP downloads.
 The url field in each Vintage points to the FeatureServer GeoJSON query
 endpoint; extract() downloads the GeoJSON file directly using urllib. ST_Read
-handles both .geojson (production download) and .shp (committed test fixtures)
-transparently via GDAL. For offline tests, the cache is pre-seeded with the
+reads the GeoJSON via GDAL. For offline tests, the cache is pre-seeded with the
 committed .geojson fixture files, so no network access occurs.
 """
 
+import json
 import os
+import urllib.parse
 import urllib.request
+import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
 
@@ -30,6 +32,49 @@ from crossroads.quality import (
 # (DuckDB GEOMETRY stores no SRID, so we sanity-check coordinate ranges.)
 BNG_MIN_E, BNG_MAX_E = 0, 700_000
 BNG_MIN_N, BNG_MAX_N = 0, 1_300_000
+
+# The vintage registry lives in a committed JSON manifest next to this module,
+# so adding a new ONS edition is a data change, not a code change.
+_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "ons_boundaries.json")
+
+
+def _build_query_url(feature_server, code_col, name_col):
+    """Build the ONS FeatureServer GeoJSON query endpoint for one vintage.
+
+    Downloads all features, only the code/name columns, reprojected to EPSG:27700.
+    """
+    params = urllib.parse.urlencode({
+        "where": "1=1",
+        "outFields": f"{code_col},{name_col}",
+        "outSR": "27700",
+        "f": "geojson",
+    })
+    return feature_server.rstrip("/") + "/0/query?" + params
+
+
+def _load_vintages(source_id):
+    """Load one source's vintages from the JSON manifest, newest LAST.
+
+    Sorts ascending by valid_from so vintages[-1] is the latest edition (the
+    snapshot). valid_to is derived by chaining: each vintage is valid until the
+    next edition's valid_from; the latest vintage is open-ended (valid_to = None).
+    """
+    with open(_MANIFEST_PATH, encoding="utf-8") as f:
+        rows = json.load(f)[source_id]
+    rows = sorted(rows, key=lambda r: r["valid_from"])
+    vintages = []
+    for i, r in enumerate(rows):
+        valid_to = rows[i + 1]["valid_from"] if i + 1 < len(rows) else None
+        vintages.append(Vintage(
+            label=r["label"],
+            url=_build_query_url(r["feature_server"], r["code_col"], r["name_col"]),
+            source_file=r["source_file"],
+            code_col=r["code_col"],
+            name_col=r["name_col"],
+            valid_from=r["valid_from"],
+            valid_to=valid_to,
+        ))
+    return tuple(vintages)
 
 
 @dataclass(frozen=True)
@@ -83,10 +128,48 @@ class _BoundaryTransformer(BaseTransformer):
 
     GEOM_RULE = "ons.geom.invalid"
 
-    # --- vintage selection (snapshot only in Stage 02; Stage 03 adds multi-vintage) ---
     def _vintages_for(self, **kwargs):
-        # Stage 02: snapshot only -> the latest vintage. Stage 03 widens this.
-        return (self.vintages[-1],)
+        """Which vintages this build loads, per spec §3C boundary drift.
+
+          boundary_mode='snapshot' (default) -> latest vintage only.
+          boundary_mode='temporal'           -> editions whose validity window overlaps
+                                               the requested build years (kwargs['years']);
+                                               if no years are given, every edition.
+
+        Years before this source's earliest edition have no ONS boundary coverage: the
+        earliest edition is used as a stand-in and a warning flags this to the researcher.
+        Unknown modes fall back to snapshot (non-spatial builds pass arbitrary kwargs
+        through, so an unrelated value must never break a build).
+        """
+        if kwargs.get("boundary_mode", "snapshot") != "temporal":
+            return (self.vintages[-1],)                 # snapshot / default / unknown
+
+        years = kwargs.get("years")
+        if not years:
+            return tuple(self.vintages)                 # temporal, unscoped -> all editions
+
+        # Half-open windows [valid_from, valid_to). Select any edition overlapping the
+        # requested span [Jan 1 of the earliest year, Dec 31 of the latest year]. Dates
+        # are 'YYYY-MM-DD' strings, which compare correctly lexicographically.
+        lo = f"{min(years)}-01-01"
+        hi = f"{max(years)}-12-31"
+        selected = [v for v in self.vintages
+                    if v.valid_from <= hi and (v.valid_to is None or v.valid_to > lo)]
+
+        earliest = self.vintages[0]                     # sorted oldest-first
+        if lo < earliest.valid_from:
+            # Requested years reach before this source's ONS boundary coverage.
+            warnings.warn(
+                f"{self.source_id}: requested years start {lo[:4]} but the earliest ONS "
+                f"boundary edition is {earliest.label} (from {earliest.valid_from}); using "
+                f"{earliest.label} as a stand-in for the earlier years.",
+                stacklevel=2,
+            )
+            if earliest not in selected:
+                selected.append(earliest)
+
+        selected.sort(key=lambda v: v.valid_from)       # keep newest selected edition last
+        return tuple(selected)
 
     def extract(self, cache_dir, **kwargs):
         os.makedirs(cache_dir, exist_ok=True)
@@ -190,25 +273,6 @@ class _BoundaryTransformer(BaseTransformer):
         )
 
 
-# Production URL: full UK LAD BGC dataset, all features, EPSG:27700, GeoJSON.
-# The ONS FeatureServer maxRecordCount is 2000, well above the 361 LAD features,
-# so a single request returns the entire dataset.
-_LAD_2024_URL = (
-    "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-    "Local_Authority_Districts_December_2024_Boundaries_UK_BGC/"
-    "FeatureServer/0/query"
-    "?where=1%3D1&outFields=LAD24CD,LAD24NM&outSR=27700&f=geojson"
-)
-
-# Production URL: full UK CTYUA BGC dataset (218 features), EPSG:27700, GeoJSON.
-_CTYUA_2024_URL = (
-    "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-    "Counties_and_Unitary_Authorities_December_2024_Boundaries_UK_BGC/"
-    "FeatureServer/0/query"
-    "?where=1%3D1&outFields=CTYUA24CD,CTYUA24NM&outSR=27700&f=geojson"
-)
-
-
 class LADBoundaryTransformer(_BoundaryTransformer):
     """Ingests ONS Local Authority District boundaries (snapshot, latest vintage)."""
 
@@ -216,20 +280,7 @@ class LADBoundaryTransformer(_BoundaryTransformer):
     bronze_table = "ons_lad_raw"
     silver_table = "lad_boundaries"
     clean_view = "lad_boundaries_clean"
-    vintages = (
-        Vintage(
-            label="2024",
-            url=_LAD_2024_URL,
-            # source_file matches the committed test fixture so offline tests skip
-            # the download. For production, extract() saves the downloaded GeoJSON
-            # under this same name in the cache directory.
-            source_file="lad_sample.geojson",
-            code_col="LAD24CD",
-            name_col="LAD24NM",
-            valid_from="2024-12-01",
-            valid_to=None,
-        ),
-    )
+    vintages = _load_vintages("ons_lad")
 
 
 class CTYUABoundaryTransformer(_BoundaryTransformer):
@@ -239,14 +290,4 @@ class CTYUABoundaryTransformer(_BoundaryTransformer):
     bronze_table = "ons_ctyua_raw"
     silver_table = "ctyua_boundaries"
     clean_view = "ctyua_boundaries_clean"
-    vintages = (
-        Vintage(
-            label="2024",
-            url=_CTYUA_2024_URL,
-            source_file="ctyua_sample.geojson",
-            code_col="CTYUA24CD",
-            name_col="CTYUA24NM",
-            valid_from="2024-12-01",
-            valid_to=None,
-        ),
-    )
+    vintages = _load_vintages("ons_ctyua")

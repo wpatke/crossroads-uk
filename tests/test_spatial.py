@@ -4,6 +4,7 @@ Offline tests: the cache is pre-seeded with committed fixture GeoJSON files
 so extract() finds the source files and performs no network download.
 """
 
+import json
 import os
 import shutil
 
@@ -19,15 +20,23 @@ FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "ons")
 
 
 def _seed_cache(cache_dir):
-    """Copy committed GeoJSON fixture files into the build cache.
+    """Copy each committed GeoJSON fixture into the build cache under the name the
+    newest vintage expects, so the snapshot build runs fully offline regardless of
+    which edition is currently newest in the manifest.
 
-    extract() checks for the source_file in the cache and skips the download
-    when it is present, so seeding here makes all boundary tests fully offline.
+    Each fixture directory is named lad_<year> / ctyua_<year> matching the newest
+    vintage's year; the file has the correct column names for that year.
     """
     os.makedirs(cache_dir, exist_ok=True)
-    for sub, stem in (("lad_2024", "lad_sample"), ("ctyua_2024", "ctyua_sample")):
-        src = os.path.join(FIXTURES, sub)
-        shutil.copy(os.path.join(src, stem + ".geojson"), cache_dir)
+    seeds = (
+        ("lad", LADBoundaryTransformer),
+        ("ctyua", CTYUABoundaryTransformer),
+    )
+    for prefix, cls in seeds:
+        newest = cls().vintages[-1]
+        year = newest.valid_from[:4]  # e.g. "2025" from "2025-12-01"
+        src = os.path.join(FIXTURES, f"{prefix}_{year}", f"{prefix}_sample.geojson")
+        shutil.copy(src, os.path.join(cache_dir, newest.source_file))
 
 
 def _boundary_client(tmp_path):
@@ -120,6 +129,7 @@ def test_invalid_geometry_is_flagged_and_logged(con):
 
     t = LADBoundaryTransformer()
     vintages = t._vintages_for()
+    label = vintages[-1].label  # newest vintage label, e.g. "2025-12"
 
     # Create a synthetic bronze: one valid polygon, one NULL geometry.
     vf_case, vt_case = t._validity_case_sql(vintages)
@@ -130,9 +140,10 @@ def test_invalid_geometry_is_flagged_and_logged(con):
     )
     con.execute(
         f"INSERT INTO {t.bronze_table} VALUES "
-        f"('2024', 'E99000001', 'Valid Area', "
+        f"(?, 'E99000001', 'Valid Area', "
         f"  ST_GeomFromText('POLYGON((0 0,100 0,100 100,0 100,0 0))')), "
-        f"('2024', 'E99000002', 'Null Geom Area', NULL)"
+        f"(?, 'E99000002', 'Null Geom Area', NULL)",
+        [label, label],
     )
 
     # Drive silver/ledger derivation directly (no bronze→file→extract roundtrip).
@@ -155,7 +166,7 @@ def test_invalid_geometry_is_flagged_and_logged(con):
     ).fetchall()
     assert len(ledger) == 1
     key, rule, sev = ledger[0]
-    assert key == "E99000002|2024"
+    assert key == "E99000002|" + label
     assert rule == LADBoundaryTransformer.GEOM_RULE
     assert sev == "reject_dimension"
 
@@ -163,6 +174,17 @@ def test_invalid_geometry_is_flagged_and_logged(con):
 # ---------------------------------------------------------------------------
 # Existing Stage 01 smoke tests (preserved)
 # ---------------------------------------------------------------------------
+
+def test_vintages_loaded_from_manifest():
+    # The registry now comes from ons_boundaries.json rather than hard-coded constants.
+    vintages = LADBoundaryTransformer().vintages
+    assert len(vintages) >= 1
+    latest = vintages[-1]
+    assert latest.url.endswith("f=geojson")
+    assert "outSR=27700" in latest.url
+    assert latest.code_col in latest.url
+    assert latest.valid_to is None
+
 
 def test_build_loads_spatial_extension():
     client = crossroads.init_engine()
@@ -180,6 +202,33 @@ def test_build_loads_spatial_extension():
     client.close()
 
 
+def test_full_registry_loaded():
+    lad = LADBoundaryTransformer().vintages
+    ctyua = CTYUABoundaryTransformer().vintages
+    assert len(lad) == 15
+    assert len(ctyua) == 11
+    # Newest edition is December 2025 for both types.
+    assert lad[-1].label == "2025-12" and lad[-1].valid_to is None
+    assert ctyua[-1].label == "2025-12" and ctyua[-1].valid_to is None
+
+
+def test_validity_windows_chain_by_date():
+    lad = LADBoundaryTransformer().vintages
+    # Sorted ascending by valid_from; each valid_to equals the next valid_from.
+    for earlier, later in zip(lad, lad[1:]):
+        assert earlier.valid_from < later.valid_from
+        assert earlier.valid_to == later.valid_from
+    # Spot-check: Dec 2016 valid_to should be Dec 2018 (2017 gap absorbed).
+    by_label = {v.label: v for v in lad}
+    assert by_label["2016-12"].valid_to == "2018-12-01"
+
+
+def test_field_name_casing_preserved():
+    by_label = {v.label: v for v in LADBoundaryTransformer().vintages}
+    assert by_label["2019-12"].code_col == "lad19cd"   # older editions lowercase
+    assert by_label["2024-12"].code_col == "LAD24CD"   # newer editions uppercase
+
+
 def test_existing_empty_build_still_succeeds():
     # Zero-transformer build: loading spatial must not break it.
     client = crossroads.init_engine()
@@ -189,3 +238,179 @@ def test_existing_empty_build_still_succeeds():
         "SELECT count(*) FROM data_quality_log"
     ).fetchone()[0] == 0
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# Stage 03 — Temporal boundary slicing
+# ---------------------------------------------------------------------------
+
+def _two_vintage_lad():
+    """A LAD transformer restricted to the two editions that have committed
+    fixtures, so temporal mode can be tested fully offline. Setting .vintages on
+    the instance shadows the manifest-loaded class attribute; _vintages_for reads
+    self.vintages, so temporal mode then resolves exactly these two."""
+    t = LADBoundaryTransformer()
+    t.vintages = tuple(v for v in t.vintages if v.label in ("2024-12", "2025-12"))
+    return t
+
+
+def _seed_cache_temporal_lad(cache_dir, vintages):
+    """Seed each given vintage's source_file from its matching committed fixture."""
+    os.makedirs(cache_dir, exist_ok=True)
+    fixture_for = {
+        "2024-12": ("lad_2024", "lad_sample"),
+        "2025-12": ("lad_2025", "lad_sample"),
+    }
+    for v in vintages:
+        sub, stem = fixture_for[v.label]
+        src = os.path.join(FIXTURES, sub, stem + ".geojson")
+        shutil.copy(src, os.path.join(cache_dir, v.source_file))
+
+
+def test_snapshot_mode_loads_latest_vintage_only(tmp_path):
+    # Default mode: only the newest LAD vintage (2025-12) is loaded.
+    client = _boundary_client(tmp_path)          # snapshot seed (newest only)
+    client.build()                               # no boundary_mode -> snapshot
+    vintages = [r[0] for r in client.con.execute(
+        "SELECT DISTINCT vintage FROM lad_boundaries ORDER BY vintage"
+    ).fetchall()]
+    assert vintages == ["2025-12"]
+    # The latest vintage is current (valid_to IS NULL).
+    assert client.con.execute(
+        "SELECT count(*) FROM lad_boundaries WHERE valid_to IS NOT NULL"
+    ).fetchone()[0] == 0
+    client.close()
+
+
+def test_temporal_mode_loads_all_vintages_with_windows(tmp_path):
+    t = _two_vintage_lad()
+    cache = str(tmp_path / "cache")
+    _seed_cache_temporal_lad(cache, t.vintages)
+    client = crossroads.init_engine(cache_dir=cache)
+    client.registry._transformers = [t]
+    client.build(boundary_mode="temporal")
+
+    vintages = [r[0] for r in client.con.execute(
+        "SELECT DISTINCT vintage FROM lad_boundaries ORDER BY vintage"
+    ).fetchall()]
+    assert vintages == ["2024-12", "2025-12"]
+
+    # The newest vintage is current (open window); the earlier one is closed.
+    assert client.con.execute(
+        "SELECT valid_to FROM lad_boundaries WHERE vintage = '2025-12' LIMIT 1"
+    ).fetchone()[0] is None
+    assert client.con.execute(
+        "SELECT valid_to FROM lad_boundaries WHERE vintage = '2024-12' LIMIT 1"
+    ).fetchone()[0] is not None
+
+    # Composite key keeps the same area code unique across vintages.
+    dupe_keys = client.con.execute(
+        "SELECT count(*) - count(DISTINCT source_row_key) FROM lad_boundaries"
+    ).fetchone()[0]
+    assert dupe_keys == 0
+    # The same area_code appears under both vintages (fixtures share codes).
+    shared = client.con.execute(
+        "SELECT count(*) FROM ("
+        "  SELECT area_code FROM lad_boundaries GROUP BY area_code HAVING count(*) = 2"
+        ")"
+    ).fetchone()[0]
+    assert shared == 3
+    client.close()
+
+
+def test_temporal_mode_passes_invariants(tmp_path):
+    # Conservation/agreement/reject-rate must hold across multiple vintages.
+    t = _two_vintage_lad()
+    cache = str(tmp_path / "cache")
+    _seed_cache_temporal_lad(cache, t.vintages)
+    client = crossroads.init_engine(cache_dir=cache)
+    client.registry._transformers = [t]
+    client.build(boundary_mode="temporal")   # raises if any invariant fails
+    # bronze == silver (keep-in-place) across both vintages.
+    b = client.con.execute("SELECT count(*) FROM ons_lad_raw").fetchone()[0]
+    s = client.con.execute("SELECT count(*) FROM lad_boundaries").fetchone()[0]
+    assert b == s and s == 6                  # 3 (2024-12) + 3 (2025-12)
+    client.close()
+
+
+# --- year-scoped selection (pure logic over the real registry; no build/network) ---
+
+def test_temporal_year_scoping_selects_overlapping_editions():
+    # Request 2020-2021: only the editions whose windows overlap that span load.
+    picked = {v.label for v in LADBoundaryTransformer()._vintages_for(
+        boundary_mode="temporal", years=[2020, 2021])}
+    assert picked == {"2019-12", "2020-12", "2021-05", "2021-12"}
+
+
+def test_temporal_years_before_coverage_use_earliest_and_warn():
+    # 2014-2015 precede the earliest LAD edition (2016-12): stand in + warn.
+    t = LADBoundaryTransformer()
+    with pytest.warns(UserWarning, match="earliest ONS boundary edition"):
+        picked = [v.label for v in t._vintages_for(
+            boundary_mode="temporal", years=[2014, 2015])]
+    assert picked == ["2016-12"]
+
+
+def test_temporal_unscoped_loads_every_edition():
+    t = LADBoundaryTransformer()
+    assert len(t._vintages_for(boundary_mode="temporal")) == len(t.vintages) == 15
+
+
+def test_snapshot_ignores_years():
+    # Default (snapshot) mode loads the latest edition regardless of years.
+    picked = [v.label for v in LADBoundaryTransformer()._vintages_for(years=[2014])]
+    assert picked == ["2025-12"]
+
+
+# ---------------------------------------------------------------------------
+# Integration test (opt-in) — exercises the real download against live ONS
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "transformer_cls",
+    [LADBoundaryTransformer, CTYUABoundaryTransformer],
+    ids=["lad", "ctyua"],
+)
+def test_download_latest_vintage(transformer_cls, tmp_path):
+    """Download the newest vintage of each boundary source from the live ONS
+    endpoint and verify the file is valid, projected GeoJSON.
+
+    Deselected by default (see the `integration` marker in pyproject.toml).
+    Run it deliberately with:  pytest -m integration
+
+    Uses extract() with an empty cache dir so the real download path executes.
+    tmp_path is cleaned up by pytest automatically after the test.
+    """
+    t = transformer_cls()
+    cache = str(tmp_path / "cache")
+
+    # extract() in snapshot mode downloads only the newest vintage.
+    t.extract(cache)
+
+    newest = t.vintages[-1]
+    dest = os.path.join(cache, newest.source_file)
+    assert os.path.exists(dest), "Downloaded file not found in cache"
+
+    with open(dest, encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Must be a GeoJSON FeatureCollection with at least one feature.
+    assert data.get("type") == "FeatureCollection"
+    features = data.get("features", [])
+    assert len(features) > 0, "Downloaded GeoJSON has no features"
+
+    # Confirm outSR=27700 was honoured: coordinates must be projected eastings/
+    # northings (metres, in the hundreds of thousands), NOT lon/lat degrees
+    # (which would be |lon|<180, |lat|<90). We test coordinate *magnitude*
+    # rather than a strict Great Britain box because the UK dataset includes
+    # Northern Ireland, whose EPSG:27700 eastings fall outside (west of) the GB
+    # envelope. Navigate down through Polygon/MultiPolygon nesting to a point.
+    coords = features[0]["geometry"]["coordinates"]
+    while isinstance(coords[0][0], list):
+        coords = coords[0]
+    easting, northing = coords[0]
+    assert 1_000 < abs(easting) < 2_000_000, (
+        f"Easting {easting} does not look like EPSG:27700 metres")
+    assert 1_000 < abs(northing) < 2_000_000, (
+        f"Northing {northing} does not look like EPSG:27700 metres")

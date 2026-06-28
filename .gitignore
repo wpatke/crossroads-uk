@@ -13,6 +13,10 @@ __pycache__/
 build/
 dist/
 
+# Test coverage artifacts
+.coverage
+.coverage.*
+
 # Virtual environments
 .venv/
 venv/
@@ -24,3 +28,4 @@ venv/
 *.db
 *.duckdb
 .crossroads_cache/
+/htmlcov/

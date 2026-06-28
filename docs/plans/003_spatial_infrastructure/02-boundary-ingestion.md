@@ -2,6 +2,12 @@
 > Part of Spatial Infrastructure & Boundaries. You have the overview + this stage; implement ONLY this stage.
 > Read the overview's Stage Map first. End State is the contract — if a step doesn't match reality, adapt and note it.
 
+> **Superseded detail (shapefile → GeoJSON):** This document describes committing ONS boundary
+> samples as shapefiles (`.shp/.shx/.dbf/.prj`) and reading them via `ST_Read`. The implemented
+> design instead downloads and commits **GeoJSON** (ONS publishes ArcGIS FeatureServer GeoJSON, not
+> shapefile ZIPs); the shapefile fixtures have been removed as unused. Treat shapefile-specific
+> steps below as historical — the GeoJSON equivalent is what shipped in `spatial.py`.
+
 ## Prerequisites / Starting State
 Stage 01 is done: `Client.build()` loads the spatial extension; `tests/test_spatial.py` exists and is
 green. Verify:
