@@ -218,6 +218,21 @@ class _BoundaryTransformer(BaseTransformer):
         # --- GOLD: valid-geometry view.
         create_clean_view(con, self.clean_view, self.silver_table, ["geom_valid"])
 
+        # --- INDEX: bounding-box R-Tree over the silver geometry. This is what
+        # makes Step 4's point-in-polygon joins fast (spec §5: avoids an unindexed
+        # spatial cross-join). The silver table was just (re)created via
+        # CREATE OR REPLACE, which drops any prior index with it, so we create a
+        # fresh one with a deterministic name. The DROP is belt-and-suspenders
+        # (DuckDB has no CREATE INDEX IF NOT EXISTS for custom indexes).
+        # Identifiers are code-controlled constants (trusted interpolation).
+        # NULL geometry is fine: a flagged-invalid boundary carries geom IS NULL
+        # (spec §9) and DuckDB's RTREE skips NULL rows without error.
+        index_name = f"{self.silver_table}_geom_rtree"
+        con.execute(f"DROP INDEX IF EXISTS {index_name}")
+        con.execute(
+            f"CREATE INDEX {index_name} ON {self.silver_table} USING RTREE (geom)"
+        )
+
     def _validity_case_sql(self, vintages):
         """Build CASE expressions mapping vintage label to valid_from / valid_to.
 
@@ -245,7 +260,13 @@ class _BoundaryTransformer(BaseTransformer):
             f"SELECT "
             f"  area_code || '|' || vintage AS source_row_key, "
             f"  area_code, area_name, vintage, "
-            f"  geom, "
+            # Cast to a plain GEOMETRY. ST_Read on the ONS GeoJSON (downloaded
+            # with outSR=27700) yields a CRS-qualified GEOMETRY('EPSG:27700')
+            # type; DuckDB's RTREE index only accepts a bare GEOMETRY column.
+            # The cast strips the CRS label without touching the coordinates,
+            # matching spec §3A (DuckDB GEOMETRY stores no SRID — we sanity-check
+            # EPSG:27700 by coordinate range, not by an embedded label).
+            f"  geom::GEOMETRY AS geom, "
             f"  (geom IS NOT NULL AND ST_IsValid(geom)) AS geom_valid, "
             f"  {vf_case} AS valid_from, "
             f"  {vt_case} AS valid_to "

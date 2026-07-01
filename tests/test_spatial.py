@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 
+import duckdb
 import pytest
 import crossroads
 from crossroads.quality import ensure_quality_tables
@@ -360,6 +361,113 @@ def test_snapshot_ignores_years():
     # Default (snapshot) mode loads the latest edition regardless of years.
     picked = [v.label for v in LADBoundaryTransformer()._vintages_for(years=[2014])]
     assert picked == ["2025-12"]
+
+
+# ---------------------------------------------------------------------------
+# R-Tree spatial index tests
+# ---------------------------------------------------------------------------
+
+def test_rtree_index_exists_on_boundary_tables(tmp_path):
+    client = _boundary_client(tmp_path)
+    client.build()
+    # duckdb_indexes() lists user indexes; assert an index exists on each silver table.
+    idx = client.con.execute(
+        "SELECT table_name, index_name FROM duckdb_indexes() "
+        "WHERE table_name IN ('lad_boundaries', 'ctyua_boundaries')"
+    ).fetchall()
+    tables_with_index = {r[0] for r in idx}
+    assert "lad_boundaries" in tables_with_index
+    assert "ctyua_boundaries" in tables_with_index
+    # The index name follows the deterministic convention.
+    names = {r[1] for r in idx}
+    assert "lad_boundaries_geom_rtree" in names
+    client.close()
+
+
+def test_rebuild_against_same_file_keeps_one_index(tmp_path):
+    # A second build against the SAME on-disk database must not error on a
+    # duplicate index and must leave exactly one index per silver table.
+    db_path = str(tmp_path / "b.db")
+    cache = str(tmp_path / "cache")
+    _seed_cache(cache)
+
+    def run_once():
+        client = crossroads.init_engine(database_path=db_path, cache_dir=cache)
+        client.registry._transformers = [
+            CTYUABoundaryTransformer(), LADBoundaryTransformer(),
+        ]
+        client.build()
+        return client
+
+    first = run_once(); first.close()
+    second = run_once()           # must not raise on the duplicate-index path
+    count = second.con.execute(
+        "SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'lad_boundaries'"
+    ).fetchone()[0]
+    assert count == 1
+    # Invariants still pass (index creation changes no row counts).
+    assert second.con.execute("SELECT count(*) FROM lad_boundaries").fetchone()[0] == 3
+    second.close()
+
+
+def test_spatial_predicate_works(tmp_path):
+    # Functional proof a spatial predicate runs correctly against the indexed
+    # table (index present and not breaking queries; not a proof the planner
+    # uses it — real perf validation lands in Step 4's point-in-polygon joins).
+    client = _boundary_client(tmp_path)
+    client.build()
+    # A point known to fall inside one of the sample polygons should match exactly
+    # that polygon via ST_Contains. (Pick a point from inside a fixture polygon's
+    # extent; ST_Centroid of a row is guaranteed inside a convex-ish polygon, and is
+    # a safe choice for the sample.)
+    hit = client.con.execute(
+        "SELECT count(*) FROM lad_boundaries "
+        "WHERE ST_Contains(geom, (SELECT ST_Centroid(geom) FROM lad_boundaries LIMIT 1))"
+    ).fetchone()[0]
+    assert hit >= 1
+    client.close()
+
+
+def test_rtree_index_tolerates_null_geometry():
+    # A flagged-invalid boundary carries geom = NULL (spec §9). The R-Tree build
+    # must not error on it, and the NULL row must simply be absent from spatial
+    # results rather than breaking the query. Guards against a DuckDB version bump
+    # changing NULL handling.
+    con = duckdb.connect()
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    con.execute("CREATE TABLE t (id INT, geom GEOMETRY)")
+    con.execute("INSERT INTO t VALUES "
+                "(1, ST_GeomFromText('POLYGON((0 0,0 10,10 10,10 0,0 0))')), "
+                "(2, NULL)")                     # the flagged-invalid case
+    con.execute("CREATE INDEX t_geom_rtree ON t USING RTREE (geom)")  # must not raise
+    hit = con.execute(
+        "SELECT id FROM t WHERE ST_Contains(geom, ST_Point(5,5))").fetchall()
+    assert hit == [(1,)]                          # valid polygon matched, NULL ignored
+
+
+def test_silver_geom_column_is_bare_geometry(tmp_path):
+    # GUARD for the load-bearing `geom::GEOMETRY` cast in the silver projection.
+    # ST_Read on the ONS GeoJSON (which declares crs EPSG:27700) yields a
+    # CRS-qualified GEOMETRY('EPSG:27700') column, and DuckDB's RTREE index
+    # rejects that type ("RTree indexes can only be created over GEOMETRY
+    # columns"). The cast strips the CRS label to a bare GEOMETRY. If someone
+    # removes the cast, the silver geom type changes and this test fails with a
+    # clear message (rather than only an opaque index-build error at build time).
+    client = _boundary_client(tmp_path)
+    client.build()
+
+    # DESCRIBE reports each column's declared type as a string. The bare type is
+    # exactly "GEOMETRY"; a CRS-qualified column reports "GEOMETRY('EPSG:27700')".
+    for table in ("lad_boundaries", "ctyua_boundaries"):
+        rows = client.con.execute(f"DESCRIBE {table}").fetchall()
+        geom_type = {r[0]: r[1] for r in rows}["geom"]
+        assert geom_type == "GEOMETRY", (
+            f"{table}.geom must be a bare GEOMETRY for the RTREE index; got "
+            f"{geom_type!r}. Did the `geom::GEOMETRY` cast get removed from "
+            f"_derive_silver_and_ledger in spatial.py?"
+        )
+
+    client.close()
 
 
 # ---------------------------------------------------------------------------
