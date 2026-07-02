@@ -48,7 +48,10 @@ class Client:
             # (re)built, so a re-build against an existing on-disk database stays
             # idempotent (log_exclusion / quarantine_row are plain appends). The
             # transformer is responsible for recreating its own bronze/silver.
-            quality.reset_source_audit(self.con, transformer.source_id)
+            # A transformer may write audit rows under several source_ids (e.g.
+            # STATS19's collision/vehicle/casualty) — reset each one.
+            for source_id in quality.declared_source_ids(transformer):
+                quality.reset_source_audit(self.con, source_id)
             transformer.extract(self.cache_dir, **kwargs)
             transformer.transform_and_load(self.con, self.cache_dir)
 

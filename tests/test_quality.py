@@ -608,3 +608,117 @@ def test_rebuild_against_same_file_is_idempotent(tmp_path):
             f"SELECT count(*) FROM {table} WHERE source_id = 'rb'"
         ).fetchone()[0] == 1
     second.close()
+
+
+# --- Stage 04-prep (Step 4) — multi-spec generalization ---
+
+def test_resolve_quality_specs_flattens_tuple(con):
+    from crossroads.quality import (
+        ensure_quality_tables, resolve_quality_specs, declared_source_ids,
+        SourceQuality,
+    )
+    from crossroads.transformers.base import BaseTransformer
+    ensure_quality_tables(con)
+
+    class MultiUnit(BaseTransformer):
+        source_id = "multi"
+        def extract(self, cache_dir, **kwargs): pass
+        def transform_and_load(self, con, cache_dir): pass
+        def quality_spec(self):
+            return (
+                SourceQuality("multi_a", "a_raw", "a", key_column="source_row_key"),
+                SourceQuality("multi_b", "b_raw", "b", key_column="source_row_key"),
+            )
+
+    t = MultiUnit()
+    specs = resolve_quality_specs(con, [t])
+    assert {s.source_id for s in specs} == {"multi_a", "multi_b"}
+    assert declared_source_ids(t) == ["multi_a", "multi_b"]
+
+
+def test_resolve_quality_specs_mixed_tuple(con):
+    # A tuple may mix an audited unit with an explicit opt-out. The SourceQuality
+    # is collected for auditing; the QualityExemption is recorded (not audited).
+    from crossroads.quality import (
+        ensure_quality_tables, resolve_quality_specs, declared_source_ids,
+        SourceQuality, QualityExemption,
+    )
+    from crossroads.transformers.base import BaseTransformer
+    ensure_quality_tables(con)
+
+    class Mixed(BaseTransformer):
+        source_id = "mixed"
+        def extract(self, cache_dir, **kwargs): pass
+        def transform_and_load(self, con, cache_dir): pass
+        def quality_spec(self):
+            return (
+                SourceQuality("mixed_a", "a_raw", "a", key_column="source_row_key"),
+                QualityExemption(reason="aggregate unit; conservation N/A"),
+            )
+
+    t = Mixed()
+    specs = resolve_quality_specs(con, [t])
+
+    # Only the SourceQuality is returned for auditing.
+    assert [s.source_id for s in specs] == ["mixed_a"]
+
+    # The exemption is recorded under the transformer's own source_id (there is
+    # no separate audit source for an opt-out).
+    assert con.execute(
+        "SELECT source_id, reason FROM quality_exemptions"
+    ).fetchall() == [("mixed", "aggregate unit; conservation N/A")]
+
+    # declared_source_ids reports the audited unit(s) only — the exemption
+    # contributes no id, and the SourceQuality means we don't fall back.
+    assert declared_source_ids(t) == ["mixed_a"]
+
+
+def test_declared_source_ids_falls_back_without_source_quality(con):
+    # A transformer that only opts out (no SourceQuality) has no audit-specific
+    # id, so declared_source_ids falls back to its own source_id — this is the id
+    # Client.build uses to reset the shared audit tables before a (re)build.
+    from crossroads.quality import (
+        ensure_quality_tables, declared_source_ids, QualityExemption,
+    )
+    from crossroads.transformers.base import BaseTransformer
+    ensure_quality_tables(con)
+
+    class OptOut(BaseTransformer):
+        source_id = "optout"
+        def extract(self, cache_dir, **kwargs): pass
+        def transform_and_load(self, con, cache_dir): pass
+        def quality_spec(self):
+            return QualityExemption(reason="static lookup; no source rows")
+
+    assert declared_source_ids(OptOut()) == ["optout"]
+
+
+def test_resolve_rejects_wrong_type_inside_tuple(con):
+    # A bad element anywhere in the tuple is still a programming error — each
+    # element is validated independently, so the string here raises TypeError.
+    ensure_quality_tables(con)
+    spec = SourceQuality(source_id="ok", bronze_table="ok_raw", silver_table="ok")
+    with pytest.raises(TypeError):
+        resolve_quality_specs(con, [_FakeTransformer("bad", (spec, "not a spec"))])
+
+
+def test_resolve_undecided_inside_tuple_is_fatal_when_enabled(con):
+    # A None element inside a tuple hits the same undecided path as a lone None:
+    # fatal when enabled, even though a valid SourceQuality sits alongside it.
+    ensure_quality_tables(con)
+    spec = SourceQuality(source_id="ok", bronze_table="ok_raw", silver_table="ok")
+    with pytest.raises(UndecidedQualitySpecError):
+        resolve_quality_specs(
+            con, [_FakeTransformer("u", (spec, None))], undecided_fatal=True
+        )
+
+
+def test_resolve_undecided_inside_tuple_warns_when_not_fatal(con):
+    # Warn-only path: the None is skipped with a warning and the sibling
+    # SourceQuality is still collected for auditing.
+    ensure_quality_tables(con)
+    spec = SourceQuality(source_id="ok", bronze_table="ok_raw", silver_table="ok")
+    out = resolve_quality_specs(
+        con, [_FakeTransformer("u", (spec, None))], undecided_fatal=False
+    )
+    assert out == [spec]

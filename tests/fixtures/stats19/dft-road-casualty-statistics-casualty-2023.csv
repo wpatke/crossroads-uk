@@ -1,0 +1,10 @@
+accident_index,accident_year,accident_reference,vehicle_reference,casualty_reference,casualty_class,sex_of_casualty,age_of_casualty,age_band_of_casualty,casualty_severity,pedestrian_location,pedestrian_movement,car_passenger,bus_or_coach_passenger,pedestrian_road_maintenance_worker,casualty_type,casualty_imd_decile,lsoa_of_casualty,enhanced_casualty_severity,casualty_injury_based,casualty_adjusted_severity_serious,casualty_adjusted_severity_slight,casualty_distance_banding
+2023010419189,2023,010419189,1,1,1,1,50,8,3,0,0,0,0,0,9,5,E01002443,-1,0,0,1,-1
+2023010419192,2023,010419192,2,1,1,1,24,5,3,0,0,0,0,0,3,-1,-1,-1,0,0,1,-1
+2023010419205,2023,010419205,1,1,1,1,20,4,3,0,0,0,0,0,9,3,E01003629,-1,0,0,1,-1
+2023010419183,2023,010419183,2,1,1,1,25,5,3,0,0,0,0,0,9,3,E01001546,-1,0,0,1,-1
+2023010419191,2023,010419191,2,1,1,1,34,6,3,0,0,0,0,0,1,2,E01004679,-1,0,0,1,-1
+2023010419171,2023,010419171,1,1,3,2,20,4,3,5,1,0,0,0,0,10,E01030370,-1,0,0,1,-1
+2023010419198,2023,010419198,1,1,3,1,65,9,3,4,4,0,0,0,0,5,E01023593,-1,0,0,1,-1
+2023010419183,2023,010419183,3,2,2,2,38,7,3,0,0,2,0,0,9,-1,-1,-1,0,0,1,-1
+2023010419201,2023,010419201,1,1,1,1,22,5,3,0,0,0,0,0,1,10,E01026413,-1,0,0,1,-1

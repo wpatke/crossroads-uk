@@ -11,6 +11,7 @@ def test_init_engine_returns_client():
 
 def test_empty_build_is_noop_in_memory():
     client = crossroads.init_engine()
+    client.registry._transformers = []   # no sources: a genuine no-op build (offline, deterministic)
     result = client.build(years=[2023], include_weather=True, spatial_grain="local_authority")
     # build returns self and leaves an open, queryable connection
     assert result is client

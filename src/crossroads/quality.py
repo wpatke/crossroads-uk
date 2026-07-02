@@ -437,37 +437,59 @@ def resolve_quality_specs(con, transformers,
     the list of SourceQuality manifests to audit, enforcing that every active
     source made a CONSCIOUS choice (spec §9 — no source quietly escapes auditing).
 
-    Per transformer, quality_spec() returns one of three things:
+    Per transformer, quality_spec() returns one of these:
       • SourceQuality(...)        -> collected for run_invariants().
       • QualityExemption(reason=) -> recorded in quality_exemptions (and logged);
                                      deliberately not audited.
       • None (inherited default)  -> 'undecided'. If undecided_fatal, raise
                                      UndecidedQualitySpecError; else log a warning
                                      (the interim behaviour — see the module flag).
+      • a tuple/list of the above -> a transformer may declare MORE THAN ONE audit
+                                     unit (e.g. STATS19's collision/vehicle/casualty).
+                                     Each element is resolved independently; a lone
+                                     value behaves exactly as before.
     Any other return type is a programming error -> TypeError.
     """
     log = logging.getLogger("crossroads.quality")
     specs = []
     for transformer in transformers:
         decision = transformer.quality_spec()
-        if isinstance(decision, SourceQuality):
-            specs.append(decision)
-        elif isinstance(decision, QualityExemption):
-            record_exemption(con, transformer.source_id, decision.reason)
-            log.info("[%s] quality exemption recorded: %s",
-                     transformer.source_id, decision.reason)
-        elif decision is None:
-            msg = (f"[{transformer.source_id}] quality_spec() is undecided "
-                   f"(returned None): an active source must return a "
-                   f"SourceQuality(...) to be audited or a "
-                   f"QualityExemption(reason=...) to opt out explicitly.")
-            if undecided_fatal:
-                raise UndecidedQualitySpecError(msg)
-            log.warning("%s [interim: warning only — will become fatal]", msg)
-        else:
-            raise TypeError(
-                f"[{transformer.source_id}] quality_spec() must return "
-                f"SourceQuality, QualityExemption, or None; got "
-                f"{type(decision).__name__}."
-            )
+        # Normalise to a list so one transformer can declare several audit units.
+        items = list(decision) if isinstance(decision, (tuple, list)) else [decision]
+        for item in items:
+            if isinstance(item, SourceQuality):
+                specs.append(item)
+            elif isinstance(item, QualityExemption):
+                record_exemption(con, transformer.source_id, item.reason)
+                log.info("[%s] quality exemption recorded: %s",
+                         transformer.source_id, item.reason)
+            elif item is None:
+                msg = (f"[{transformer.source_id}] quality_spec() is undecided "
+                       f"(returned None): an active source must return a "
+                       f"SourceQuality(...) to be audited or a "
+                       f"QualityExemption(reason=...) to opt out explicitly.")
+                if undecided_fatal:
+                    raise UndecidedQualitySpecError(msg)
+                log.warning("%s [interim: warning only — will become fatal]", msg)
+            else:
+                raise TypeError(
+                    f"[{transformer.source_id}] quality_spec() must return "
+                    f"SourceQuality, QualityExemption, None, or a tuple/list of "
+                    f"those; got {type(item).__name__}."
+                )
     return specs
+
+
+def declared_source_ids(transformer):
+    """The audit source_ids a transformer will write rows under.
+
+    For a transformer declaring SourceQuality(s), these are the specs' source_ids
+    (a transformer may own several — e.g. STATS19). For a QualityExemption or an
+    undecided (None) spec there is no separate audit source, so fall back to the
+    transformer's own source_id. Used by Client.build to reset the shared audit
+    tables for every source the transformer touches before it (re)runs.
+    """
+    decision = transformer.quality_spec()
+    items = list(decision) if isinstance(decision, (tuple, list)) else [decision]
+    ids = [item.source_id for item in items if isinstance(item, SourceQuality)]
+    return ids or [transformer.source_id]

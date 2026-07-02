@@ -1,0 +1,15 @@
+accident_index,accident_year,accident_reference,vehicle_reference,vehicle_type,towing_and_articulation,vehicle_manoeuvre_historic,vehicle_manoeuvre,vehicle_direction_from,vehicle_direction_to,vehicle_location_restricted_lane_historic,vehicle_location_restricted_lane,junction_location,skidding_and_overturning,hit_object_in_carriageway,vehicle_leaving_carriageway,hit_object_off_carriageway,first_point_of_impact,vehicle_left_hand_drive,journey_purpose_of_driver_historic,journey_purpose_of_driver,sex_of_driver,age_of_driver,age_band_of_driver,engine_capacity_cc,propulsion_code,age_of_vehicle,generic_make_model,driver_imd_decile,lsoa_of_driver,escooter_flag,driver_distance_banding
+2023010419171,2023,010419171,1,11,0,4,4,1,5,0,0,5,0,0,0,0,1,1,1,1,1,61,9,4500,2,13,ALEXANDER DENNIS MODEL MISSING,3,E01001177,0,-1
+2023010419201,2023,010419201,2,11,0,2,2,0,0,0,0,2,0,0,0,0,2,1,6,6,3,-1,-1,4500,2,7,ALEXANDER DENNIS MODEL MISSING,-1,-1,0,-1
+2023010419183,2023,010419183,2,9,0,9,9,1,6,0,0,1,0,10,0,0,4,1,6,6,1,25,5,1490,8,1,TOYOTA YARIS,3,E01001546,0,-1
+2023010419198,2023,010419198,1,9,0,18,19,5,1,0,0,0,0,0,0,0,1,1,6,6,3,-1,-1,-1,-1,-1,-1,-1,-1,0,-1
+2023010419205,2023,010419205,1,9,0,16,19,5,1,0,0,0,2,10,4,4,3,1,6,6,1,20,4,-1,-1,-1,-1,3,E01003629,0,-1
+2023010419201,2023,010419201,1,1,0,18,19,7,3,0,0,2,0,0,0,0,1,1,6,6,1,22,5,-1,-1,-1,-1,10,E01026413,0,-1
+2023010419191,2023,010419191,2,1,0,18,19,8,4,0,0,1,5,0,0,0,3,1,6,6,1,34,6,-1,-1,-1,-1,2,E01004679,0,-1
+2023010419191,2023,010419191,1,9,0,18,19,2,6,0,0,6,0,0,0,0,1,1,6,6,3,-1,-1,-1,-1,-1,-1,-1,-1,0,-1
+2023010419192,2023,010419192,2,3,0,18,19,5,1,0,0,8,0,0,0,0,1,1,6,6,1,24,5,125,1,3,YAMAHA GPD,-1,-1,0,-1
+2023010419183,2023,010419183,1,11,0,18,19,5,1,0,0,1,0,0,0,0,1,1,1,1,1,54,8,6692,2,9,WRIGHTBUS GEMINI,6,E01001419,0,-1
+2023010419189,2023,010419189,2,9,0,18,19,5,1,0,0,4,0,0,0,0,1,1,2,2,1,30,6,1618,1,7,NISSAN JUKE,4,E01002211,0,-1
+2023010419189,2023,010419189,1,9,0,18,19,7,3,0,0,3,0,0,0,0,4,1,6,6,1,50,8,3311,8,16,LEXUS RX 400,5,E01002443,0,-1
+2023010419192,2023,010419192,1,9,0,3,3,5,1,0,0,8,0,0,0,0,2,1,1,1,1,33,6,1798,8,7,LEXUS CT 200,-1,-1,0,-1
+2023010419183,2023,010419183,3,9,0,8,8,7,1,0,0,1,0,0,0,0,1,1,6,6,1,42,7,1998,1,4,BMW 2 SERIES,4,E01001686,0,-1
