@@ -18,7 +18,7 @@ import urllib.request
 
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
-    SourceQuality, record_source_rows,
+    SourceQuality, Dimension, record_source_rows, log_exclusion,
 )
 
 # DfT publishes per-year CSVs under this base. The per-year filename template is
@@ -57,6 +57,10 @@ class Stats19Transformer(BaseTransformer):
     COLLISION_BRONZE, COLLISION_SILVER = "stats19_collision_raw", "collisions"
     VEHICLE_BRONZE, VEHICLE_SILVER = "stats19_vehicle_raw", "vehicles"
     CASUALTY_BRONZE, CASUALTY_SILVER = "stats19_casualty_raw", "casualties"
+
+    # --- ledger rules for the collision dimensions (also referenced by quality_spec) ---
+    COORD_RULE = "stats19.coord.sentinel"
+    DATETIME_RULE = "stats19.datetime.invalid"
 
     def is_active(self, **kwargs):
         # Nothing to ingest without years; a no-years build (e.g. boundary-only)
@@ -139,6 +143,9 @@ class Stats19Transformer(BaseTransformer):
 
     # --- silver derivations (factored so tests can drive them on a synthetic bronze) ---
     def _derive_collision_silver(self, con):
+        """Collision silver: keep-in-place 1:1, with typed coordinates, an EPSG:27700
+        geom point, a naive local datetime, and the ledger rows for missing/invalid
+        values. Bad values are flagged + logged, never dropped (spec §9)."""
         # accident_reference candidates include collision_ref_no: verified against
         # live 2020-2024 DfT files, whose reference column is named collision_ref_no
         # (not collision_reference as the older accident_* convention would suggest).
@@ -151,11 +158,71 @@ class Stats19Transformer(BaseTransformer):
                                      "accident_reference")
         # accident_index doubles as the source_row_key (globally unique).
         idx_expr = acc.replace(" AS accident_index", "")
+
+        sentinels_sql = ", ".join(f"'{s}'" for s in COORD_SENTINELS)
+
+        # Two-level select: the inner CTE types the coordinates and parses dates (SQL
+        # cannot reference a sibling alias in the same SELECT list), the outer builds
+        # geom / datetime / flags from those typed values. OSGR eastings/northings ARE
+        # EPSG:27700, so ST_Point casts them directly — no reprojection (spec §3A).
+        # A coordinate that is a sentinel ('-1'/'0'), blank, or non-numeric becomes
+        # NULL (TRY_CAST) -> geom NULL -> geom_valid FALSE. date is DfT 'DD/MM/YYYY',
+        # time 'HH:MM' (may be blank); a missing time falls back to midnight and is not
+        # a rejection — only an unparseable DATE nulls datetime_local.
         con.execute(
             f"CREATE OR REPLACE TABLE {self.COLLISION_SILVER} AS "
-            f"SELECT ({idx_expr}) AS source_row_key, {acc}, {yr}, {ref} "
-            f"FROM {self.COLLISION_BRONZE}"
+            f"WITH typed AS ("
+            f"  SELECT "
+            f"    ({idx_expr}) AS source_row_key, {acc}, {yr}, {ref}, "
+            f"    location_easting_osgr  AS easting_raw, "
+            f"    location_northing_osgr AS northing_raw, "
+            f"    CASE WHEN location_easting_osgr IN ({sentinels_sql}, '') THEN NULL "
+            f"         ELSE TRY_CAST(location_easting_osgr AS DOUBLE) END AS easting, "
+            f"    CASE WHEN location_northing_osgr IN ({sentinels_sql}, '') THEN NULL "
+            f"         ELSE TRY_CAST(location_northing_osgr AS DOUBLE) END AS northing, "
+            f"    date AS date_raw, time AS time_raw, "
+            f"    TRY_STRPTIME(date, '%d/%m/%Y') AS date_parsed, "
+            f"    TRY_STRPTIME(date || ' ' || time, '%d/%m/%Y %H:%M') AS datetime_parsed "
+            f"  FROM {self.COLLISION_BRONZE}"
+            f") "
+            f"SELECT "
+            f"  source_row_key, accident_index, accident_year, accident_reference, "
+            f"  easting_raw, northing_raw, easting, northing, "
+            f"  CASE WHEN easting IS NULL OR northing IS NULL THEN NULL "
+            f"       ELSE ST_Point(easting, northing)::GEOMETRY END AS geom, "
+            f"  (easting IS NOT NULL AND northing IS NOT NULL) AS geom_valid, "
+            f"  date_raw, time_raw, "
+            # Prefer the full datetime; fall back to midnight when only the date parsed.
+            f"  COALESCE(datetime_parsed, date_parsed) AS datetime_local, "
+            f"  (date_parsed IS NOT NULL) AS datetime_valid, "
+            # Filled by the Stage 04 spatial stamp; present now so the schema is stable.
+            f"  CAST(NULL AS VARCHAR) AS lad_code, "
+            f"  CAST(NULL AS VARCHAR) AS ctyua_code "
+            f"FROM typed"
         )
+
+        # --- LEDGER: one reject_dimension row per FALSE flag, so flag/ledger agreement
+        # holds. Aggregate scan + a small Python loop over the (bounded) FALSE rows.
+        bad_geom = con.execute(
+            f"SELECT source_row_key, easting_raw, northing_raw FROM {self.COLLISION_SILVER} "
+            f"WHERE geom_valid = FALSE").fetchall()
+        for key, e, n in bad_geom:
+            log_exclusion(
+                con, source_id=self.COLLISION_SID, source_row_key=key,
+                column_name="geom", rule_id=self.COORD_RULE,
+                rule_desc="easting/northing missing or out of range "
+                          "(sentinel -1/0, blank, or non-numeric)",
+                severity="reject_dimension", raw_value=f"{e},{n}")
+
+        bad_dt = con.execute(
+            f"SELECT source_row_key, date_raw FROM {self.COLLISION_SILVER} "
+            f"WHERE datetime_valid = FALSE").fetchall()
+        for key, d in bad_dt:
+            log_exclusion(
+                con, source_id=self.COLLISION_SID, source_row_key=key,
+                column_name="datetime_local", rule_id=self.DATETIME_RULE,
+                rule_desc="collision date is missing or unparseable",
+                severity="reject_dimension", raw_value=str(d))
 
     def _derive_vehicle_silver(self, con):
         acc = self._coalesce_present(con, self.VEHICLE_BRONZE,
@@ -181,11 +248,17 @@ class Stats19Transformer(BaseTransformer):
         )
 
     def quality_spec(self):
-        # Three audit units. Dimensions are empty in Stage 01 (no validation yet);
-        # Stages 02-03 add geom/datetime/link dimensions to the right specs.
+        # Three audit units. Collision now declares its geom/datetime dimensions
+        # (Stage 02); vehicle/casualty stay dimension-less until Stage 03 adds
+        # their link dimension.
         return (
-            SourceQuality(self.COLLISION_SID, self.COLLISION_BRONZE, self.COLLISION_SILVER,
-                          dimensions=(), key_column="source_row_key"),
+            SourceQuality(
+                self.COLLISION_SID, self.COLLISION_BRONZE, self.COLLISION_SILVER,
+                dimensions=(
+                    Dimension("geom", "geom_valid", (self.COORD_RULE,)),
+                    Dimension("datetime", "datetime_valid", (self.DATETIME_RULE,)),
+                ),
+                key_column="source_row_key"),
             SourceQuality(self.VEHICLE_SID, self.VEHICLE_BRONZE, self.VEHICLE_SILVER,
                           dimensions=(), key_column="source_row_key"),
             SourceQuality(self.CASUALTY_SID, self.CASUALTY_BRONZE, self.CASUALTY_SILVER,

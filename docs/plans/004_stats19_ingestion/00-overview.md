@@ -226,6 +226,66 @@ nothing to ingest, so the transformer is simply skipped — no empty tables, no 
 and existing no-`years` builds (e.g. boundary-only tests) are unaffected. A real build always passes
 `years` (spec §8). Document this clearly.
 
+### Codebook, missing-value cleaning & labelled views (Stages 05–07)
+STATS19 encodes most non-coordinate fields as integers whose meaning lives in DfT's published data guide
+(e.g. `casualty_severity` 1=Fatal, 2=Serious, 3=Slight). Two accuracy hazards follow, and Stages 05–07
+handle them as **two clearly separate jobs**.
+
+**Job A — missing-value cleaning (writes to the stored tables; Stage 06).** DfT does not encode "missing"
+as a single value: it uses a *set* of sentinels ("Data missing or out of range", "Unknown", "Undefined",
+"Not known", a deprecated-code marker, and the numeric `-1`). Left raw, these silently corrupt aggregates
+(an `AVG`/count over a column salted with `-1`s is wrong). Job A converts the **full** missing set — not
+just `-1` — to `NULL` when producing a typed/computed column. The value stays **numeric/coded**: `NULL`
+means "empty cell", never a label. This reuses the exact data-quality discipline of Stages 02/03 —
+keep-in-place (never drop a row), keep the raw copy, and for a promoted field add a `*_valid` flag +
+`reject_dimension` ledger row + a `Dimension` on the `SourceQuality`.
+
+**Job B — code→label translation (NEVER stored; Stage 07).** English labels are **not** baked into the
+stored tables; silver keeps integer codes. Translation is an **opt-in surface**: a labelled *view*
+(`casualties_labelled`) that `JOIN`s the codebook, sitting *alongside* the canonical coded table. The
+default surface is codes (`casualties`); "turning translation off" just means querying the coded table
+instead of the view. There is no global on/off flag and no hidden default translation layer. A labelled
+view is built only where there is a real consumer (type-on-demand).
+
+**The codebook (shared reference data; Stage 05).** Both jobs read one small reference table,
+`codebook(variable, code, label, is_missing)`. It is loaded — once, at the **top** of
+`transform_and_load` — from a committed CSV that ships inside the package, exactly as `spatial.py` ships
+and loads `ons_boundaries.json` via `os.path.dirname(__file__)`. It is a **reference table, not an audited
+source**: no new `source_id`, no bronze/silver pair, no conservation obligation (a static lookup, the kind
+the quality overview names as a legitimate non-source). The engine still audits only the three STATS19
+`SourceQuality` units; the codebook is just another table the transformer builds, like an index or a view.
+*Alternatives rejected:* a dedicated `CodebookTransformer` (more machinery for a table only STATS19 uses
+today) and a fourth bronze/silver audit unit (treats static reference data as observational — heavy and
+wrong-shaped).
+
+**Source of truth (resolved, not hand-waved).** The codebook is derived **independently from DfT's
+published "Guide to variables / code lists" for the Road Safety Open Dataset** — the same publisher and
+Open Government Licence v3.0 as the CSVs themselves. `is_missing` is set during that one-time derivation by
+matching each label against a documented missing-marker vocabulary (plus the `-1` sentinel), and the
+committed CSV carries `is_missing` as an explicit column so the decision is auditable in the repo. A
+licence-incompatible **GPL** reference package ships a similar code-list table; it must **not** be copied —
+derive from the DfT guide. Provenance + the derivation recipe live in a committed README beside the CSV,
+mirroring the `tests/fixtures/**/README.md` discipline.
+
+**Decode by intersect (graceful degradation).** Cleaning only touches a column that appears in **both** the
+incoming data **and** the codebook. A future-year file that renames or drops a coded column degrades
+gracefully (the field is left raw / a stable NULL placeholder + a warning) instead of erroring — the same
+robustness principle as `_coalesce_present`'s presence check for the `accident_*`/`collision_*` rename.
+
+**What gets promoted now (lean, type-on-demand).** Exactly **one** field is promoted to full validation in
+this pass: **`casualty_severity`** — the headline killed-or-seriously-injured outcome, with a small clean
+domain and an obvious consumer. It gains a typed `casualty_severity` (`INTEGER`, missing→`NULL`), a
+`casualty_severity_valid` flag, a ledger rule, and a `severity` `Dimension` on the casualty spec; the
+reusable `_clean_coded_column` helper it is built on generalises to any future promotion. Every other coded
+field stays raw exactly as today — promote it the same way when a consumer appears. This mirrors Stage 03's
+deliberate "linkage now, per-field typing on demand" stance.
+
+**Scope / blast radius.** This is confined to a **new reference table** + the **casualty** silver
+derivation + **one labelled view**. Collisions, vehicles, the linkage model, and the **Stage 04 spatial
+join are untouched** (geometry has nothing to do with coded-field decoding). Plan-stage order (05–07 come
+after 04) is independent of within-build execution order — the codebook is built early in
+`transform_and_load` even though its stage number is late, just as Stage 04's spatial stamp runs late.
+
 ## Cross-Cutting Constraints (every stage follows these)
 - **No new dependencies.** `duckdb` + `pytest` only. CSV read is in-DB; download via stdlib
   `urllib.request`. Do not edit `pyproject.toml` dependencies.
@@ -262,6 +322,9 @@ and existing no-`years` builds (e.g. boundary-only tests) are unaffected. A real
 | 02 | Collision silver & coordinates | Enrich collision silver: identity normalization, typed `easting`/`northing`, `geom` (EPSG:27700), `geom_valid` + sentinel ledger, `datetime_local` + `datetime_valid`; add the `geom`/`datetime` dimensions to the collision spec; `collisions` gold-ready. | A build casts valid coords to BNG geometry, flags+logs `-1`/`0`/blank/non-numeric coords (geom `NULL`, retained), builds `datetime_local`; flag/ledger agreement + reject-rate hold; FALSE-branch proven by a synthetic-bronze test. `pytest` green. | Stage 01 | `02-collision-silver.md` |
 | 03 | Vehicle & casualty silver & linkage | Type vehicle/casualty silver; compute `link_valid` (accident_index resolves to a collision) with ledger rules; add the `link` dimension to each spec; `vehicles_clean`/`casualties_clean` gold views. | A build links vehicles/casualties to collisions, flags+logs orphans (retained), and passes all invariants across all three sources; orphan FALSE-branch proven. `pytest` green. | Stage 02 | `03-vehicle-casualty-linkage.md` |
 | 04 | Spatial join & gold view | Point-in-polygon stamp `lad_code`/`ctyua_code` onto valid collisions (snapshot default; temporal window option); build `collisions_spatial`; confirm reject ceilings + all invariants; optional R-Tree on `collisions.geom`. | An end-to-end build (boundaries + Stats19) stamps valid collisions with the correct LAD/CTYUA codes, leaves sentinel points unstamped, exposes `collisions_spatial`, and passes every Step 2 invariant. `pytest` green. | Stage 03 | `04-spatial-join.md` |
+| 05 | Codebook reference table | Commit `src/crossroads/reference/stats19_codebook.csv` (`variable,code,label,is_missing`) derived independently from DfT's published data guide, + a provenance README; load it into a `codebook` table at the top of `transform_and_load` (a reference table, **not** an audited source). | A build creates a `codebook` table; `casualty_severity` decodes correctly (2→"Serious") and every missing marker (incl. non-`-1`) is `is_missing = TRUE`; the CSV is unique on `(variable, code)`; all prior tests stay green. `pytest` green. | Stage 04 | `05-codebook-reference.md` |
+| 06 | Missing-value cleaning (Job A) | Add the reusable `_clean_coded_column` decode-by-intersect helper; promote **`casualty_severity`** to a typed column (full missing set→`NULL`, raw kept) with `casualty_severity_valid` + ledger rule + a `severity` `Dimension`. Nothing else promoted (type-on-demand). | A build produces `casualty_severity` (`INTEGER`, missing→`NULL`), flags+logs missing values (row retained), passes flag/ledger agreement + reject-rate across all sources; the FALSE branch and the column-absent degrade-gracefully path are proven by synthetic tests. `pytest` green. | Stage 05 | `06-missing-value-cleaning.md` |
+| 07 | Labelled views (Job B) | Add the opt-in `casualties_labelled` view that `JOIN`s the codebook to expose `casualty_severity_label` alongside the codes; stored tables keep **codes only** (no label column ever written); no global translation flag. | A build exposes `casualties_labelled` (code 2 shows "Serious"); the stored `casualties` table has **no** `*_label` column; the view has the same row count as `casualties`. `pytest` green. | Stage 06 | `07-labelled-views.md` |
 
 ## Global Testing & Ship
 All tests are **real and runnable** (manual testing is not relied upon). A new `tests/test_stats19.py`
@@ -302,3 +365,13 @@ deterministic and independent of the geographic fixture coupling.
   overridable per-build (`build(reject_ceiling=...)`) or per-dimension when ingesting deep history.
 - **`extract`→`transform_and_load` instance hand-off.** Relies on the engine calling them back-to-back
   on the same instance (it does — see `client.py`). Document the contract in `stats19.py`, as `spatial.py` does.
+- **Codebook source of truth & drift (Stages 05–07).** DfT's data guide is versioned and its layout can
+  change; the committed CSV is a point-in-time transcription, and `is_missing` involves a documented
+  judgement call for a few ambiguous labels (e.g. "Other" is deliberately **not** treated as missing).
+  Pin the guide URL/vintage and the missing-marker vocabulary in the committed README; tests depend only on
+  the committed CSV, so a guide change never breaks the offline suite — it is a deliberate, reviewed
+  refresh. The codebook must be derived from the DfT guide, never copied from a GPL-licensed package's
+  shipped code-list table (licence-incompatible).
+- **Labels never stored (Stage 07).** The stored tables keep integer codes; English labels appear only in
+  opt-in views. A test asserts the stored `casualties` table carries no `*_label` column so this cannot
+  regress into a hidden default translation layer.
