@@ -184,6 +184,43 @@ def test_missing_time_falls_back_to_midnight(con):
     assert row[0] is True and row[1].startswith("2023-01-07 00:00:00")
 
 
+def test_vehicles_and_casualties_link_to_collisions(tmp_path):
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)
+    # Every sample child row links to a collision (fixtures preserve integrity).
+    for silver in ("vehicles", "casualties"):
+        bad = client.con.execute(
+            f"SELECT count(*) FROM {silver} WHERE link_valid = FALSE").fetchone()[0]
+        assert bad == 0, f"{silver} has unexpected orphan rows"
+    # Gold views exist and equal their silver (all-linked sample).
+    for silver, view in (("vehicles", "vehicles_clean"), ("casualties", "casualties_clean")):
+        s = client.con.execute(f"SELECT count(*) FROM {silver}").fetchone()[0]
+        v = client.con.execute(f"SELECT count(*) FROM {view}").fetchone()[0]
+        assert s == v and s > 0
+    client.close()
+
+
+def test_orphan_vehicle_is_flagged_and_logged(con):
+    # collisions has c1 only; a vehicle referencing c1 links, one referencing cX is an orphan.
+    from crossroads.quality import ensure_quality_tables
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE collisions AS SELECT * FROM (VALUES ('c1')) AS t(accident_index)")
+    con.execute(
+        "CREATE TABLE stats19_vehicle_raw AS SELECT * FROM (VALUES "
+        "  ('c1','1'), ('cX','1')"
+        ") AS t(accident_index, vehicle_reference)")
+    t = Stats19Transformer(); t._derive_vehicle_silver(con)
+
+    rows = {r[0]: r[1] for r in con.execute(
+        "SELECT accident_index, link_valid FROM vehicles").fetchall()}
+    assert rows["c1"] is True and rows["cX"] is False
+    assert con.execute("SELECT count(*) FROM vehicles").fetchone()[0] == 2   # retained
+    ledger = con.execute(
+        "SELECT source_row_key, rule_id FROM data_quality_log "
+        "WHERE source_id = 'stats19_vehicle' AND severity = 'reject_dimension'").fetchall()
+    assert ledger == [("cX|1", "stats19.link.orphan_vehicle")]
+
+
 @pytest.mark.integration
 def test_download_real_dft_sample(tmp_path):
     t = Stats19Transformer()

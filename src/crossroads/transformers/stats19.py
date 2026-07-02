@@ -18,7 +18,7 @@ import urllib.request
 
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
-    SourceQuality, Dimension, record_source_rows, log_exclusion,
+    SourceQuality, Dimension, record_source_rows, log_exclusion, create_clean_view,
 )
 
 # DfT publishes per-year CSVs under this base. The per-year filename template is
@@ -61,6 +61,10 @@ class Stats19Transformer(BaseTransformer):
     # --- ledger rules for the collision dimensions (also referenced by quality_spec) ---
     COORD_RULE = "stats19.coord.sentinel"
     DATETIME_RULE = "stats19.datetime.invalid"
+
+    # --- ledger rules for the vehicle/casualty link dimension ---
+    VEHICLE_LINK_RULE = "stats19.link.orphan_vehicle"
+    CASUALTY_LINK_RULE = "stats19.link.orphan_casualty"
 
     def is_active(self, **kwargs):
         # Nothing to ingest without years; a no-years build (e.g. boundary-only)
@@ -135,11 +139,16 @@ class Stats19Transformer(BaseTransformer):
             n = con.execute(f"SELECT count(*) FROM {bronze}").fetchone()[0]
             record_source_rows(con, sid, n)
 
-        # --- SILVER (×3): minimal keep-in-place 1:1 (Stage 01). Identity + key only;
-        # coordinates/datetime/linkage/dimensions arrive in Stages 02-04. ---
+        # --- SILVER (×3): keep-in-place 1:1. Collision silver must be derived FIRST —
+        # vehicle/casualty silver compute link_valid by joining to the collisions table. ---
         self._derive_collision_silver(con)
         self._derive_vehicle_silver(con)
         self._derive_casualty_silver(con)
+
+        # --- GOLD: valid-link projections (spec §9 clean views). collisions_spatial
+        # is added in Stage 04 once lad_code/ctyua_code are stamped.
+        create_clean_view(con, "vehicles_clean", self.VEHICLE_SILVER, ["link_valid"])
+        create_clean_view(con, "casualties_clean", self.CASUALTY_SILVER, ["link_valid"])
 
     # --- silver derivations (factored so tests can drive them on a synthetic bronze) ---
     def _derive_collision_silver(self, con):
@@ -225,17 +234,26 @@ class Stats19Transformer(BaseTransformer):
                 severity="reject_dimension", raw_value=str(d))
 
     def _derive_vehicle_silver(self, con):
+        """Vehicle silver: keep-in-place 1:1, linked to collisions by accident_index.
+        A vehicle whose accident_index has no matching collision is flagged
+        link_valid = FALSE and logged (orphan), never dropped (spec §9)."""
         acc = self._coalesce_present(con, self.VEHICLE_BRONZE,
                                      ["collision_index", "accident_index"], "accident_index")
         idx_expr = acc.replace(" AS accident_index", "")
         con.execute(
             f"CREATE OR REPLACE TABLE {self.VEHICLE_SILVER} AS "
             f"SELECT ({idx_expr}) || '|' || vehicle_reference AS source_row_key, "
-            f"       {acc}, vehicle_reference "
+            f"       {acc}, vehicle_reference, "
+            f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
+            f"         AS link_valid "
             f"FROM {self.VEHICLE_BRONZE}"
         )
+        self._log_orphans(con, self.VEHICLE_SILVER, self.VEHICLE_SID, self.VEHICLE_LINK_RULE)
 
     def _derive_casualty_silver(self, con):
+        """Casualty silver: keep-in-place 1:1, linked to collisions by accident_index
+        (also carries vehicle_reference for a finer casualty-to-vehicle link). Orphans
+        are flagged link_valid = FALSE and logged, never dropped (spec §9)."""
         acc = self._coalesce_present(con, self.CASUALTY_BRONZE,
                                      ["collision_index", "accident_index"], "accident_index")
         idx_expr = acc.replace(" AS accident_index", "")
@@ -243,14 +261,29 @@ class Stats19Transformer(BaseTransformer):
             f"CREATE OR REPLACE TABLE {self.CASUALTY_SILVER} AS "
             f"SELECT ({idx_expr}) || '|' || vehicle_reference || '|' || casualty_reference "
             f"         AS source_row_key, "
-            f"       {acc}, vehicle_reference, casualty_reference "
+            f"       {acc}, vehicle_reference, casualty_reference, "
+            f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
+            f"         AS link_valid "
             f"FROM {self.CASUALTY_BRONZE}"
         )
+        self._log_orphans(con, self.CASUALTY_SILVER, self.CASUALTY_SID, self.CASUALTY_LINK_RULE)
+
+    def _log_orphans(self, con, silver_table, source_id, rule_id):
+        """Write one reject_dimension ledger row per link_valid = FALSE row in
+        silver_table, so flag/ledger agreement holds for the link dimension."""
+        orphans = con.execute(
+            f"SELECT source_row_key, accident_index FROM {silver_table} "
+            f"WHERE link_valid = FALSE").fetchall()
+        for key, acc_idx in orphans:
+            log_exclusion(
+                con, source_id=source_id, source_row_key=key,
+                column_name="accident_index", rule_id=rule_id,
+                rule_desc="accident_index has no matching collision row",
+                severity="reject_dimension", raw_value=str(acc_idx))
 
     def quality_spec(self):
-        # Three audit units. Collision now declares its geom/datetime dimensions
-        # (Stage 02); vehicle/casualty stay dimension-less until Stage 03 adds
-        # their link dimension.
+        # Three audit units. Collision declares its geom/datetime dimensions
+        # (Stage 02); vehicle/casualty declare their link dimension (Stage 03).
         return (
             SourceQuality(
                 self.COLLISION_SID, self.COLLISION_BRONZE, self.COLLISION_SILVER,
@@ -259,8 +292,12 @@ class Stats19Transformer(BaseTransformer):
                     Dimension("datetime", "datetime_valid", (self.DATETIME_RULE,)),
                 ),
                 key_column="source_row_key"),
-            SourceQuality(self.VEHICLE_SID, self.VEHICLE_BRONZE, self.VEHICLE_SILVER,
-                          dimensions=(), key_column="source_row_key"),
-            SourceQuality(self.CASUALTY_SID, self.CASUALTY_BRONZE, self.CASUALTY_SILVER,
-                          dimensions=(), key_column="source_row_key"),
+            SourceQuality(
+                self.VEHICLE_SID, self.VEHICLE_BRONZE, self.VEHICLE_SILVER,
+                dimensions=(Dimension("link", "link_valid", (self.VEHICLE_LINK_RULE,)),),
+                key_column="source_row_key"),
+            SourceQuality(
+                self.CASUALTY_SID, self.CASUALTY_BRONZE, self.CASUALTY_SILVER,
+                dimensions=(Dimension("link", "link_valid", (self.CASUALTY_LINK_RULE,)),),
+                key_column="source_row_key"),
         )
