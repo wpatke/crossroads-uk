@@ -9,8 +9,10 @@ import shutil
 import pytest
 import crossroads
 from crossroads.transformers.stats19 import Stats19Transformer
+from crossroads.transformers.spatial import LADBoundaryTransformer, CTYUABoundaryTransformer
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "stats19")
+ONS_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "ons")
 YEARS = [2023]
 
 
@@ -228,3 +230,135 @@ def test_download_real_dft_sample(tmp_path):
     t.extract(cache, years=[2023])
     assert os.path.exists(os.path.join(
         cache, "dft-road-casualty-statistics-collision-2023.csv"))
+
+
+# --- Stage 04: spatial join -------------------------------------------------
+
+def _stub_boundaries(con):
+    # Two boundary silver stubs with one polygon each, current vintage (valid_to NULL).
+    for tbl, code in (("lad_boundaries", "E-LAD"), ("ctyua_boundaries", "E-CTY")):
+        con.execute(
+            f"CREATE TABLE {tbl} AS SELECT * FROM (VALUES "
+            f"  ('{code}','Area', "
+            f"   ST_GeomFromText('POLYGON((0 0,0 100,100 100,100 0,0 0))'), TRUE, "
+            f"   DATE '2020-01-01', CAST(NULL AS DATE))"
+            f") AS t(area_code, area_name, geom, geom_valid, valid_from, valid_to)")
+
+
+def _stub_collisions(con, rows):
+    # rows: list of (key, easting, northing, iso_datetime)
+    values = ", ".join(
+        f"('{k}', ST_Point({e},{n})::GEOMETRY, TRUE, TIMESTAMP '{dt}', "
+        f" CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR))"
+        for k, e, n, dt in rows)
+    con.execute(
+        f"CREATE TABLE collisions AS SELECT * FROM (VALUES {values}) "
+        f"AS t(source_row_key, geom, geom_valid, datetime_local, lad_code, ctyua_code)")
+
+
+def test_spatial_stamp_snapshot(con):
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    _stub_boundaries(con)
+    _stub_collisions(con, [("k_in", 50, 50, "2023-01-01 08:00"),
+                           ("k_out", 500, 500, "2023-01-01 08:00")])   # inside / outside
+    t = Stats19Transformer(); t._boundary_mode = "snapshot"; t._spatial_stamp(con)
+    res = {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT source_row_key, lad_code, ctyua_code FROM collisions").fetchall()}
+    assert res["k_in"] == ("E-LAD", "E-CTY")      # point inside -> stamped
+    assert res["k_out"] == (None, None)           # point outside -> unstamped
+
+
+def test_spatial_stamp_temporal_picks_window(con):
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    # Same polygon under two vintages with different codes and adjacent windows.
+    con.execute(
+        "CREATE TABLE lad_boundaries AS SELECT * FROM (VALUES "
+        "  ('OLD','Old', ST_GeomFromText('POLYGON((0 0,0 100,100 100,100 0,0 0))'), TRUE, DATE '2010-01-01', DATE '2020-01-01'), "
+        "  ('NEW','New', ST_GeomFromText('POLYGON((0 0,0 100,100 100,100 0,0 0))'), TRUE, DATE '2020-01-01', CAST(NULL AS DATE))"
+        ") AS t(area_code, area_name, geom, geom_valid, valid_from, valid_to)")
+    _stub_collisions(con, [("k_2015", 50, 50, "2015-06-01 08:00"),
+                           ("k_2023", 50, 50, "2023-06-01 08:00")])
+    t = Stats19Transformer(); t._boundary_mode = "temporal"; t._spatial_stamp(con)
+    res = {r[0]: r[1] for r in con.execute(
+        "SELECT source_row_key, lad_code FROM collisions").fetchall()}
+    assert res["k_2015"] == "OLD" and res["k_2023"] == "NEW"
+
+
+def test_spatial_stamp_tolerates_missing_boundary_table(con):
+    # No boundary tables -> codes stay NULL and a warning is emitted (build still works).
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    _stub_collisions(con, [("k1", 50, 50, "2023-01-01 08:00")])
+    t = Stats19Transformer(); t._boundary_mode = "snapshot"
+    with pytest.warns(UserWarning, match="boundary table"):
+        t._spatial_stamp(con)
+    assert con.execute("SELECT lad_code FROM collisions").fetchone()[0] is None
+
+
+def _seed_ons_cache(cache_dir):
+    # Copy each committed ONS fixture to the name the newest vintage expects (mirrors
+    # tests/test_spatial.py::_seed_cache).
+    for prefix, cls in (("lad", LADBoundaryTransformer), ("ctyua", CTYUABoundaryTransformer)):
+        newest = cls().vintages[-1]
+        year = newest.valid_from[:4]
+        src = os.path.join(ONS_FIXTURES, f"{prefix}_{year}", f"{prefix}_sample.geojson")
+        shutil.copy(src, os.path.join(cache_dir, newest.source_file))
+
+
+def _full_client(tmp_path):
+    cache = str(tmp_path / "cache")
+    _seed_cache(cache)          # stats19 CSVs
+    _seed_ons_cache(cache)      # ONS boundary geojson
+    client = crossroads.init_engine(cache_dir=cache)
+    client.registry._transformers = [
+        CTYUABoundaryTransformer(), LADBoundaryTransformer(), Stats19Transformer()]
+    return client
+
+
+def test_end_to_end_build_stamps_collisions(tmp_path):
+    client = _full_client(tmp_path)
+    client.build(years=YEARS)          # snapshot default; runs all Step 2 invariants
+
+    # collisions_spatial view == valid-geometry collisions.
+    n_view = client.con.execute("SELECT count(*) FROM collisions_spatial").fetchone()[0]
+    n_valid = client.con.execute(
+        "SELECT count(*) FROM collisions WHERE geom_valid").fetchone()[0]
+    assert n_view == n_valid and n_valid > 0
+
+    # Every stamped code is a real LAD code (consistency).
+    bad = client.con.execute(
+        "SELECT count(*) FROM collisions WHERE lad_code IS NOT NULL "
+        "AND lad_code NOT IN (SELECT area_code FROM lad_boundaries)").fetchone()[0]
+    assert bad == 0
+
+    # At least one collision stamped (requires the aligned fixture from step C).
+    stamped = client.con.execute(
+        "SELECT count(*) FROM collisions WHERE lad_code IS NOT NULL").fetchone()[0]
+    assert stamped >= 1, ("No collisions stamped — re-trim the collision fixture to fall "
+                          "inside the committed LAD sample (Stage 04 step C).")
+
+    # R-Tree exists on collisions.geom.
+    idx = {r[0] for r in client.con.execute(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'collisions'").fetchall()}
+    assert "collisions_geom_rtree" in idx
+    client.close()
+
+
+def test_rebuild_same_file_is_idempotent(tmp_path):
+    # A second build against the SAME on-disk DB must not double rows or break invariants.
+    db = str(tmp_path / "s.db")
+    cache = str(tmp_path / "cache")
+    _seed_cache(cache); _seed_ons_cache(cache)
+
+    def run():
+        cl = crossroads.init_engine(database_path=db, cache_dir=cache)
+        cl.registry._transformers = [
+            CTYUABoundaryTransformer(), LADBoundaryTransformer(), Stats19Transformer()]
+        cl.build(years=YEARS)
+        return cl
+
+    first = run(); n1 = first.con.execute("SELECT count(*) FROM collisions").fetchone()[0]; first.close()
+    second = run(); n2 = second.con.execute("SELECT count(*) FROM collisions").fetchone()[0]
+    assert n1 == n2 and n2 > 0
+    assert second.con.execute(
+        "SELECT count(*) FROM duckdb_indexes() WHERE table_name='collisions'").fetchone()[0] == 1
+    second.close()

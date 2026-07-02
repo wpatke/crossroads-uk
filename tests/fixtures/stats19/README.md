@@ -11,8 +11,16 @@ Trimmed samples for testing only — **not** the full dataset.
 ## Row counts
 
 - `dft-road-casualty-statistics-collision-2023.csv` — 8 collisions
-- `dft-road-casualty-statistics-vehicle-2023.csv` — 14 vehicles
-- `dft-road-casualty-statistics-casualty-2023.csv` — 9 casualties
+- `dft-road-casualty-statistics-vehicle-2023.csv` — 17 vehicles
+- `dft-road-casualty-statistics-casualty-2023.csv` — 12 casualties
+
+## Geographic alignment (Stage 04 spatial join)
+
+The 8 collisions were re-selected (superseding the plain `LIMIT` originally used, see
+"How they were produced" below) so their OSGR points fall **inside** the committed
+ONS LAD sample (`tests/fixtures/ons/lad_2025/lad_sample.geojson`). This lets the
+Stage 04 end-to-end test observe a real point-in-polygon stamp (`lad_code` populated)
+instead of only proving the join logic via synthetic fixtures.
 
 ## Naming note
 
@@ -31,8 +39,9 @@ these fixtures.
 ## How they were produced
 
 1. Downloaded the three real per-year 2023 files from the URLs above.
-2. Selected 8 collisions with valid (non-sentinel) coordinates, ordered by
-   `collision_index`, via DuckDB.
+2. Selected 8 collisions with valid (non-sentinel) coordinates whose OSGR point
+   falls inside a polygon in the committed LAD sample (`ST_Contains`), ordered by
+   `collision_index`, via DuckDB + the `spatial` extension.
 3. Kept only vehicle/casualty rows whose `collision_index` matches one of those 8
    collisions (`SEMI JOIN`), preserving referential integrity.
 4. Renamed the three identity columns as described above and wrote each table back
@@ -42,16 +51,22 @@ Reproduction recipe (`SRC` = a scratch dir holding the three real downloaded fil
 
 ```python
 import duckdb
-c = duckdb.connect()
+c = duckdb.connect(); c.execute("INSTALL spatial"); c.execute("LOAD spatial")
 SRC, OUT = "/scratch", "tests/fixtures/stats19"
+LAD_FIXTURE = "tests/fixtures/ons/lad_2025/lad_sample.geojson"   # newest committed LAD vintage
+c.execute(f"CREATE TABLE lad AS SELECT geom FROM ST_Read('{LAD_FIXTURE}')")
 c.execute(f"CREATE TABLE col AS SELECT * FROM read_csv_auto('{SRC}/dft-road-casualty-statistics-collision-2023.csv', all_varchar=true)")
 c.execute(f"CREATE TABLE veh AS SELECT * FROM read_csv_auto('{SRC}/dft-road-casualty-statistics-vehicle-2023.csv', all_varchar=true)")
 c.execute(f"CREATE TABLE cas AS SELECT * FROM read_csv_auto('{SRC}/dft-road-casualty-statistics-casualty-2023.csv', all_varchar=true)")
 c.execute("""CREATE TABLE cols AS
-  SELECT * FROM col
-  WHERE location_easting_osgr NOT IN ('-1','0','')
-    AND location_northing_osgr NOT IN ('-1','0','')
-  ORDER BY collision_index LIMIT 8""")
+  SELECT col.* FROM col
+  WHERE col.location_easting_osgr NOT IN ('-1','0','')
+    AND col.location_northing_osgr NOT IN ('-1','0','')
+    AND EXISTS (SELECT 1 FROM lad
+                WHERE ST_Contains(lad.geom,
+                      ST_Point(CAST(col.location_easting_osgr AS DOUBLE),
+                               CAST(col.location_northing_osgr AS DOUBLE))))
+  ORDER BY col.collision_index LIMIT 8""")
 c.execute("CREATE TABLE vehs AS SELECT v.* FROM veh v SEMI JOIN cols USING (collision_index)")
 c.execute("CREATE TABLE cass AS SELECT k.* FROM cas k SEMI JOIN cols USING (collision_index)")
 for src, name in (("cols", "collision"), ("vehs", "vehicle"), ("cass", "casualty")):

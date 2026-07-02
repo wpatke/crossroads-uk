@@ -15,6 +15,7 @@ committed sample CSVs, so no network access occurs.
 
 import os
 import urllib.request
+import warnings
 
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
@@ -145,10 +146,23 @@ class Stats19Transformer(BaseTransformer):
         self._derive_vehicle_silver(con)
         self._derive_casualty_silver(con)
 
-        # --- GOLD: valid-link projections (spec §9 clean views). collisions_spatial
-        # is added in Stage 04 once lad_code/ctyua_code are stamped.
+        # --- GOLD: valid-link projections (spec §9 clean views). ---
         create_clean_view(con, "vehicles_clean", self.VEHICLE_SILVER, ["link_valid"])
         create_clean_view(con, "casualties_clean", self.CASUALTY_SILVER, ["link_valid"])
+
+        # --- SPATIAL STAMP: valid collision points -> LAD/CTYUA codes. ---
+        self._spatial_stamp(con)
+
+        # --- GOLD: the valid-geometry collision projection (spec §9 worked example). ---
+        create_clean_view(con, "collisions_spatial", self.COLLISION_SILVER, ["geom_valid"])
+
+        # --- INDEX: R-Tree on collision geometry for downstream spatial queries.
+        # Built AFTER the stamp UPDATE so the index is not maintained during the update.
+        # collisions was CREATE OR REPLACE'd (dropping any prior index); the DROP is
+        # belt-and-suspenders. NULL geom rows are skipped by the RTREE without error.
+        con.execute("DROP INDEX IF EXISTS collisions_geom_rtree")
+        con.execute(
+            f"CREATE INDEX collisions_geom_rtree ON {self.COLLISION_SILVER} USING RTREE (geom)")
 
     # --- silver derivations (factored so tests can drive them on a synthetic bronze) ---
     def _derive_collision_silver(self, con):
@@ -280,6 +294,53 @@ class Stats19Transformer(BaseTransformer):
                 column_name="accident_index", rule_id=rule_id,
                 rule_desc="accident_index has no matching collision row",
                 severity="reject_dimension", raw_value=str(acc_idx))
+
+    def _table_exists(self, con, name):
+        return con.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+            [name]).fetchone()[0] > 0
+
+    def _boundary_predicate(self, mode):
+        """Extra ON-clause for the point-in-polygon join.
+
+        snapshot (default): only the current boundary vintage (valid_to IS NULL).
+        temporal: the vintage whose [valid_from, valid_to) window contains the
+                  incident date (CAST(datetime_local AS DATE)); a NULL datetime
+                  matches nothing (cannot be placed in time) and is left unstamped.
+        """
+        if mode == "temporal":
+            return ("AND b.valid_from <= CAST(c2.datetime_local AS DATE) "
+                    "AND (b.valid_to IS NULL "
+                    "     OR CAST(c2.datetime_local AS DATE) < b.valid_to)")
+        return "AND b.valid_to IS NULL"
+
+    def _spatial_stamp(self, con):
+        """Stamp lad_code/ctyua_code onto valid collision points via point-in-polygon
+        against the Step 3 boundary silver tables. Defensive: if a boundary table is
+        absent (e.g. a stats19-only build/test), leave that code NULL and warn — the
+        pipeline still succeeds. ST_Contains needs the boundary R-Tree (built in Step 3)
+        to stay fast (spec §5). area_code is aggregated with min() for a deterministic
+        result even if polygons were to overlap (they should not within one vintage)."""
+        mode = getattr(self, "_boundary_mode", "snapshot")
+        pred = self._boundary_predicate(mode)
+        for code_col, btable in (("lad_code", "lad_boundaries"),
+                                 ("ctyua_code", "ctyua_boundaries")):
+            if not self._table_exists(con, btable):
+                warnings.warn(
+                    f"stats19: boundary table {btable} not found; {code_col} left NULL "
+                    f"(build boundaries alongside stats19 to enable the spatial join).",
+                    stacklevel=2)
+                continue
+            con.execute(
+                f"UPDATE {self.COLLISION_SILVER} AS c SET {code_col} = m.area_code "
+                f"FROM ("
+                f"  SELECT c2.source_row_key AS k, min(b.area_code) AS area_code "
+                f"  FROM {self.COLLISION_SILVER} c2 JOIN {btable} b "
+                f"    ON c2.geom IS NOT NULL AND b.geom_valid = TRUE "
+                f"       AND ST_Contains(b.geom, c2.geom) {pred} "
+                f"  GROUP BY c2.source_row_key"
+                f") m WHERE c.source_row_key = m.k"
+            )
 
     def quality_spec(self):
         # Three audit units. Collision declares its geom/datetime dimensions
