@@ -38,6 +38,14 @@ COORD_SENTINELS = ("-1", "0")
 BNG_MIN_E, BNG_MAX_E = 0, 700_000
 BNG_MIN_N, BNG_MAX_N = 0, 1_300_000
 
+# Reference data (shared lookups), derived independently from DfT's published data guide
+# (Road Safety Open Dataset Data Guide, 2024 edition, OGL v3.0) and committed under
+# src/crossroads/reference/. They ship in the wheel like transformers/ons_boundaries.json
+# and load once per build. NEITHER is an audited source — they are static lookups.
+_REFERENCE_DIR = os.path.join(os.path.dirname(__file__), "..", "reference")
+_CODEBOOK_PATH = os.path.join(_REFERENCE_DIR, "stats19_codebook.csv")
+_COLUMN_MANIFEST_PATH = os.path.join(_REFERENCE_DIR, "stats19_columns.csv")
+
 
 class Stats19Transformer(BaseTransformer):
     """Ingests STATS19 Collision/Vehicle/Casualty into three bronze/silver pairs.
@@ -58,6 +66,10 @@ class Stats19Transformer(BaseTransformer):
     COLLISION_BRONZE, COLLISION_SILVER = "stats19_collision_raw", "collisions"
     VEHICLE_BRONZE, VEHICLE_SILVER = "stats19_vehicle_raw", "vehicles"
     CASUALTY_BRONZE, CASUALTY_SILVER = "stats19_casualty_raw", "casualties"
+
+    # --- reference tables (static lookups, not audited sources) ---
+    CODEBOOK_TABLE = "codebook"
+    COLUMN_MANIFEST_TABLE = "column_manifest"
 
     # --- ledger rules for the collision dimensions (also referenced by quality_spec) ---
     COORD_RULE = "stats19.coord.sentinel"
@@ -110,6 +122,48 @@ class Stats19Transformer(BaseTransformer):
             f"SELECT * FROM read_csv({paths_sql}, union_by_name=true, all_varchar=true)"
         )
 
+    def _load_codebook(self, con):
+        """Load the committed codebook CSV into the `codebook` reference table.
+
+        codebook(variable, code, label, is_missing) maps STATS19 integer codes to DfT
+        labels and marks missing/unknown sentinels. Reference data, NOT an audited
+        source. Read all-string then cast so `code` keeps '-1'/'07' exactly and
+        is_missing is a real BOOLEAN. CREATE OR REPLACE keeps a same-file rebuild
+        idempotent. Path is code-controlled (trusted); no row values are interpolated.
+        """
+        if not os.path.exists(_CODEBOOK_PATH):
+            raise FileNotFoundError(
+                f"[stats19] codebook reference file missing: {_CODEBOOK_PATH}. "
+                f"It ships in the package under src/crossroads/reference/.")
+        con.execute(
+            f"CREATE OR REPLACE TABLE {self.CODEBOOK_TABLE} AS "
+            f"SELECT CAST(variable AS VARCHAR) AS variable, "
+            f"       CAST(code AS VARCHAR)     AS code, "
+            f"       CAST(label AS VARCHAR)    AS label, "
+            f"       CAST(is_missing AS BOOLEAN) AS is_missing "
+            f"FROM read_csv('{_CODEBOOK_PATH}', header=true, all_varchar=true)")
+
+    def _load_column_manifest(self, con):
+        """Load the committed column manifest into the `column_manifest` reference table.
+
+        column_manifest(tbl, col, kind, dtype) classifies EVERY column of every file:
+        kind in {identity, geo, datetime, coded, numeric, text}; dtype is the target
+        type for numeric/coded. Single source of truth for how the keep-in-place silver
+        (Stage 06) treats each column. Reference data, NOT an audited source. The CSV
+        headers are `table,column,...`; alias them to tbl/col (both reserved-ish).
+        """
+        if not os.path.exists(_COLUMN_MANIFEST_PATH):
+            raise FileNotFoundError(
+                f"[stats19] column manifest missing: {_COLUMN_MANIFEST_PATH}. "
+                f"It ships in the package under src/crossroads/reference/.")
+        con.execute(
+            f"CREATE OR REPLACE TABLE {self.COLUMN_MANIFEST_TABLE} AS "
+            f'SELECT CAST("table" AS VARCHAR)  AS tbl, '
+            f'       CAST("column" AS VARCHAR) AS col, '
+            f"       CAST(kind AS VARCHAR)     AS kind, "
+            f"       CAST(dtype AS VARCHAR)    AS dtype "
+            f"FROM read_csv('{_COLUMN_MANIFEST_PATH}', header=true, all_varchar=true)")
+
     def _coalesce_present(self, con, table, candidates, alias):
         """Build `COALESCE(<present candidates>) AS alias` over only columns that
         exist in `table` (else `NULL AS alias`). Handles the accident_*/collision_*
@@ -129,6 +183,11 @@ class Stats19Transformer(BaseTransformer):
         years = getattr(self, "_years", None) or []
         if not years:
             return   # defensive: is_active gates on years, so this is unreachable in practice
+
+        # --- REFERENCE: load the codebook + column manifest before any silver clean, so
+        # every Stage-06+ consumer finds them. Static lookups, not audited sources. ---
+        self._load_codebook(con)
+        self._load_column_manifest(con)
 
         # --- BRONZE (×3): faithful copies; record rows read for conservation. ---
         for sid, bronze, ftype in (

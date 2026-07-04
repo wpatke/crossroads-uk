@@ -365,13 +365,113 @@ deterministic and independent of the geographic fixture coupling.
   overridable per-build (`build(reject_ceiling=...)`) or per-dimension when ingesting deep history.
 - **`extract`→`transform_and_load` instance hand-off.** Relies on the engine calling them back-to-back
   on the same instance (it does — see `client.py`). Document the contract in `stats19.py`, as `spatial.py` does.
-- **Codebook source of truth & drift (Stages 05–07).** DfT's data guide is versioned and its layout can
-  change; the committed CSV is a point-in-time transcription, and `is_missing` involves a documented
-  judgement call for a few ambiguous labels (e.g. "Other" is deliberately **not** treated as missing).
-  Pin the guide URL/vintage and the missing-marker vocabulary in the committed README; tests depend only on
-  the committed CSV, so a guide change never breaks the offline suite — it is a deliberate, reviewed
-  refresh. The codebook must be derived from the DfT guide, never copied from a GPL-licensed package's
-  shipped code-list table (licence-incompatible).
+- **Codebook source of truth & drift (Stages 05–09).** **RESOLVED (2026-07-04).** The guide is located,
+  downloaded, and analysed; the derivation script was run and its outputs verified (see Stage 05). Pinned:
+  the 2024-edition URL, the single-sheet `.xlsx` format, the OGL-v3.0 licence, the exact missing-marker
+  vocabulary (the 2024-guide "not recorded" labels), the severity code lists (both `1/2/3`, no sentinel), and
+  the full 99-row column classification (Stage 05 Appendix A). Remaining residual risk is only *future*
+  drift: the guide is re-issued annually, so a refresh is a deliberate, reviewed step — the committed CSVs
+  are what the offline tests use, so a guide change never breaks the suite. The codebook is derived from the
+  DfT guide, never copied from the GPL-licensed package's shipped code-list table (licence-incompatible).
+  One known coverage gap is documented, not open: `enhanced_severity_collision` is a real coded column whose
+  code list is absent from the 2024 guide, so it has no labels until DfT publishes them (Stage 09 handles
+  this by decoding on intersect).
 - **Labels never stored (Stage 07).** The stored tables keep integer codes; English labels appear only in
   opt-in views. A test asserts the stored `casualties` table carries no `*_label` column so this cannot
   regress into a hidden default translation layer.
+
+---
+
+## Enhancement Phase (post-Stage 04) — Full Descriptive-Layer Coverage
+
+> **Status & provenance.** Stages 01–04 are **implemented and committed** and are treated as **read-only** —
+> everything above this line describes the structural layer that is already built. This section is
+> **append-only**: it records a change of direction decided *after* Stage 04 was implemented, and it
+> **supersedes the original Stage Map rows 05–07 above** (the lean, single-field plan). Nothing in Stages
+> 00–04 is edited. The revised descriptive-layer plan is Stages **05–09**, defined below.
+
+### What we built, and what we changed our minds about
+Stages 01–04 deliver the **structural** layer end-to-end and keep-in-place: bronze copies of all three files;
+collision silver with typed coordinates, an EPSG:27700 `geom`, `datetime_local`, and the LAD/CTYUA spatial
+stamp; vehicle/casualty linkage; and the clean gold views — all audited. What silver does **not** yet carry
+is the **descriptive** layer: the ~50 integer-coded columns researchers analyse (`collision_severity`,
+`casualty_severity`, `casualty_type`, `vehicle_type`, `weather_conditions`, `light_conditions`, `road_type`,
+`speed_limit`, `sex_of_casualty`, `age_of_casualty`, …) still sit in bronze as untyped, sentinel-laden
+strings.
+
+The original plan (Stage Map rows 05–07) addressed this **leanly** — one codebook, one promoted field
+(`casualty_severity`), one labelled view, "type-on-demand." **The lesson, on reflection:** that is too little
+for a dataset researchers write papers from. Whichever descriptive column a given study needs should already
+be typed, missing-cleaned, and analysable — not left as a per-field promotion someone must remember to do.
+**Decision: broaden the descriptive layer to full coverage**, using the *same* careful mechanism the
+structural layer already uses (keep-in-place, codes kept, the full missing set nulled, audit where it is
+load-bearing).
+
+### Decisions this enhancement commits to
+1. **Full keep-in-place silver.** Every bronze column reaches silver. Every integer-coded and continuous-
+   numeric column is missing-cleaned (the full DfT sentinel set — the label markers *and* `-1` → `NULL`) and
+   typed. The cleaned value stays a **code / number**; it is never overwritten with an English label.
+   Free-text columns (e.g. `generic_make_model`, `lsoa_*`) are carried **raw**; bespoke make/model
+   normalization is noted as a separate future effort.
+2. **Two committed reference files drive the clean**, both derived independently from DfT's published Road
+   Safety Open Dataset **Data Guide** (2024 edition, published 25 Sep 2025, OGL v3.0; pinned URL + scriptable
+   recipe in Stage 05), committed under `src/crossroads/reference/` with a provenance README (packaged like
+   `transformers/ons_boundaries.json`):
+   - `stats19_codebook.csv` (`variable, code, label, is_missing`) — the missing-set + labels for every coded
+     variable; complete coverage of the coded variables is a ship requirement. **Verified ≈1130 rows / ≈71
+     variables** from the pinned script. `is_missing` flags `-1` **plus** the 2024-guide "not recorded"
+     labels *data missing or out of range / unknown / undefined / not known / code deprecated* (consistent
+     with the stats19 package's prior art, never copied). The `9`/`99` "unknown (self reported)" codes are
+     **kept** (not missing) — decided with the user.
+   - `stats19_columns.csv` (`table, column, kind, dtype`) — classifies **every** column
+     (`identity`/`geo`/`datetime`/`coded`/`numeric`/`text`); the single source of truth for how each column
+     is treated. **Verified exactly 99 rows** (identity 12, geo 4, datetime 2, coded 60, numeric 14, text 7);
+     the complete table is embedded in Stage 05 Appendix A. The four probabilistic `*_adjusted_severity_*`
+     weights are `numeric`/`DOUBLE`; the ONS-string-coded `local_authority_*` fields are `text` (carried raw)
+     — both decided with the user, matching stats19. Neither file is an audited source — both are static lookups.
+3. **Rigor where load-bearing; a report everywhere else.** The two headline severity outcomes
+   (`collision_severity`, `casualty_severity`) get the **full formal audit** — a `*_raw` twin, a `*_valid`
+   flag, a per-row ledger rule, a `Dimension`, and the reject-rate gate — exactly as geom/datetime/link do
+   today. Every **other** cleaned column gets one row in a queryable `stats19_completeness` table
+   (`n_total`/`n_present`/`n_missing`/`missing_rate`). Deliberately **no** reject gate on the broad columns
+   (many are legitimately >5% missing by nature — e.g. `second_road_class` on single-road collisions — so a
+   blanket gate would fail valid builds) and **no** per-cell ledger (it would grow to tens of millions of
+   rows across ~50 columns).
+4. **Codes kept; raw always available.** The cleaned value takes the column's **canonical** name (missing →
+   `NULL`, typed). A `*_raw` twin is stored **only** for the two audited severities (whose ledger needs the
+   raw value inline); for every other column the untouched raw value remains in **bronze** (the faithful
+   copy), so keep-in-place still holds and nothing is lost.
+5. **Labels via views, at full breadth.** Per-table views (`collisions_labelled`, `vehicles_labelled`,
+   `casualties_labelled`) expose a `<col>_label` for **every** coded column by joining the codebook, along-
+   side the coded tables. Stored tables keep integer codes only; there is no global translation flag and no
+   stored label column.
+
+The reference `../stats19/` package (GPL-3) is consulted **only** as prior art for field meanings and the
+shape of the DfT code lists — nothing is copied, and it is not treated as a benchmark. The codebook and
+manifest are derived independently from the DfT guide, keeping Crossroads MIT-clean.
+
+### How it is delivered (additive — Stages 01–04 untouched)
+The enhancement **extends the existing `src/crossroads/transformers/stats19.py`**: it widens the three
+`_derive_*_silver` methods and adds reference loaders, a small broad-clean generator, a completeness writer,
+and labelled-view builders. It does **not** re-plan or re-implement Stages 01–04 — those remain the committed
+structural baseline. Each enhancement stage begins from the **real current code** (narrow silver) and layers
+onto it, leaving the build green at every step. The cross-cutting constraints above (no new dependencies, one
+module, keep-in-place, aggregate SQL, determinism, trusted-identifier interpolation, offline tests, git
+discipline) all continue to apply.
+
+### Revised Stage Map (Stages 05–09 — supersedes original rows 05–07)
+
+| NN | Title | Summary | Deliverable / End State | Depends on | File |
+|----|-------|---------|-------------------------|-----------|------|
+| 05 | Reference data (codebook + column manifest) | Commit `stats19_codebook.csv` (all coded variables) + `stats19_columns.csv` (every column classified) + provenance README; add `_load_codebook`/`_load_column_manifest` and call them at the top of `transform_and_load`. Reference tables, **not** audited sources. | A build creates `codebook` + `column_manifest`; the codebook covers `collision_severity`/`casualty_severity` completely (incl. non-`-1` missing markers) and is unique on `(variable, code)`; every fixture column is classified; all prior tests stay green. `pytest` green. | Stage 04 | `05-reference-data.md` |
+| 06 | Keep-in-place silver (broad clean) | Widen `_derive_collision/_vehicle/_casualty_silver` to carry **every** bronze column: coded/numeric cleaned (full missing set → NULL) + typed via a manifest-driven generator, text carried raw — keeping the existing identity/geom/datetime/link logic + dimensions. | A build gives full-width `collisions`/`vehicles`/`casualties` silver (all ~44/32/23 columns), codes kept, no raw `-1`/`9` leaking into a cleaned numeric column; conservation + existing dimensions still pass; FALSE/degrade branches proven synthetically. `pytest` green. | Stage 05 | `06-keep-in-place-silver.md` |
+| 07 | Core severity audit | Promote `collision_severity` (collision) + `casualty_severity` (casualty) out of the broad loop to the formal audit: `*_raw` twin + `*_valid` flag + ledger rule + `Dimension` + reject gate, via a small helper. | A build produces validated severities (missing set → NULL, raw kept), flags+logs missing/unparseable, and passes flag/ledger agreement + reject-rate on both; legacy `accident_severity` coalesces; FALSE-branch proven synthetically. `pytest` green. | Stage 06 | `07-core-severity-audit.md` |
+| 08 | Completeness report | Build `stats19_completeness(source_id, column_name, kind, n_total, n_present, n_missing, missing_rate)` — one row per cleaned column per source — via one aggregate scan per silver table + a bounded insert loop. Stats19-owned report table, not an audited source. | A build creates `stats19_completeness` with a row for every cleaned coded/numeric column across all three sources; rates are correct (0 for the clean sample) and in `[0,1]`; idempotent on rebuild. `pytest` green. | Stage 07 | `08-completeness-report.md` |
+| 09 | Labelled views (all coded columns) | Build `collisions_labelled`/`vehicles_labelled`/`casualties_labelled` exposing a `<col>_label` for **every** coded column via per-column codebook joins; labels never stored. | A build exposes the three labelled views (e.g. `casualty_severity` code 2 → "Serious"); no stored table gains a `*_label` column; each view's row count equals its silver's (no fan-out/loss). `pytest` green. | Stage 08 | `09-labelled-views.md` |
+
+**Testing & ship (enhancement).** Same discipline as Stages 01–04: real, runnable `pytest` (offline core +
+opt-in `-m integration`), green at the end of every stage including all pre-existing tests. Each enhancement
+stage adds its own real proof — reference coverage assertions (05), a full-width `DESCRIBE`-driven column
+check + "no raw `-1` in any cleaned numeric" scan (06), the severity FALSE-branch + e2e types (07), a
+populated `stats19_completeness` (08), decoding + never-stored-label checks (09) — plus focused
+synthetic-input tests for every FALSE/degrade branch.

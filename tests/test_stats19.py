@@ -362,3 +362,74 @@ def test_rebuild_same_file_is_idempotent(tmp_path):
     assert second.con.execute(
         "SELECT count(*) FROM duckdb_indexes() WHERE table_name='collisions'").fetchone()[0] == 1
     second.close()
+
+
+# --- Stage 05: reference data (codebook + column manifest) -------------------
+
+def test_reference_tables_load(con):
+    t = Stats19Transformer()
+    t._load_codebook(con); t._load_column_manifest(con)
+
+    # Decodes a known code (casualty_severity 2 -> Serious).
+    lab = con.execute(
+        "SELECT label FROM codebook WHERE variable='casualty_severity' AND code='2'").fetchone()
+    assert lab and lab[0].lower().startswith("serious")
+    # A -1 sentinel is flagged missing (use a variable that HAS a -1 code — severity has none).
+    assert con.execute(
+        "SELECT is_missing FROM codebook WHERE variable='age_band_of_casualty' AND code='-1'"
+    ).fetchone()[0] is True
+    # The FULL missing set is flagged, not just -1 (2024 guide: ~6 non-(-1) missing rows).
+    assert con.execute(
+        "SELECT count(*) FROM codebook WHERE is_missing AND code <> '-1'").fetchone()[0] >= 1
+    # Self-reported '9'/'99' unknowns are KEPT (is_missing = FALSE), matching stats19's behaviour.
+    speed99 = con.execute(
+        "SELECT is_missing FROM codebook WHERE variable='speed_limit' AND code='99'").fetchone()
+    if speed99:                                      # present in the 2024 guide
+        assert speed99[0] is False
+    # Both audited severities are covered and exactly 1/2/3 (Fatal/Serious/Slight) — no sentinel.
+    for v in ("collision_severity", "casualty_severity"):
+        codes = {r[0] for r in con.execute(
+            "SELECT code FROM codebook WHERE variable=?", [v]).fetchall()}
+        assert {"1", "2", "3"} <= codes
+        assert con.execute(
+            "SELECT count(*) FROM codebook WHERE variable=? AND is_missing", [v]).fetchone()[0] == 0
+    # Unique on (variable, code); is_missing is a real BOOLEAN.
+    assert con.execute(
+        "SELECT count(*)-count(DISTINCT (variable||'\x1f'||code)) FROM codebook").fetchone()[0] == 0
+    assert {r[0]: r[1] for r in con.execute("DESCRIBE codebook").fetchall()}["is_missing"] == "BOOLEAN"
+
+
+def test_column_manifest_covers_every_fixture_column(con):
+    t = Stats19Transformer(); t._load_column_manifest(con)
+    for table_kind in ("collision", "vehicle", "casualty"):
+        with open(os.path.join(
+                FIXTURES, f"dft-road-casualty-statistics-{table_kind}-2023.csv")) as f:
+            header = {h.strip().lower() for h in f.readline().strip().split(",")}
+        classified = {r[0].lower() for r in con.execute(
+            "SELECT col FROM column_manifest WHERE tbl = ?", [table_kind]).fetchall()}
+        missing = header - classified
+        assert not missing, f"{table_kind}: unclassified columns {missing}"
+    kinds = {r[0] for r in con.execute(
+        "SELECT DISTINCT kind FROM column_manifest").fetchall()}
+    assert kinds <= {"identity", "geo", "datetime", "coded", "numeric", "text"}, f"bad kinds {kinds}"
+    # Verified size + breakdown for the committed (2024) manifest.
+    assert con.execute("SELECT count(*) FROM column_manifest").fetchone()[0] == 99
+    by_kind = {r[0]: r[1] for r in con.execute(
+        "SELECT kind, count(*) FROM column_manifest GROUP BY kind").fetchall()}
+    assert by_kind == {"identity": 12, "geo": 4, "datetime": 2, "coded": 60, "numeric": 14, "text": 7}
+    # coded/numeric carry a dtype; identity/geo/datetime/text do not.
+    assert con.execute("SELECT count(*) FROM column_manifest "
+                       "WHERE kind IN ('coded','numeric') AND (dtype IS NULL OR dtype='')"
+                       ).fetchone()[0] == 0
+    # The four probabilistic severity-adjustment weights are DOUBLE numerics (note: column is `col`).
+    assert con.execute("SELECT count(*) FROM column_manifest "
+                       "WHERE col LIKE '%adjusted_severity%' AND kind='numeric' AND dtype='DOUBLE'"
+                       ).fetchone()[0] == 4
+
+
+def test_build_creates_reference_tables(tmp_path):
+    client = _stats19_client(tmp_path)     # stats19-only registry helper
+    client.build(years=YEARS)
+    assert client.con.execute("SELECT count(*) FROM codebook").fetchone()[0] > 0
+    assert client.con.execute("SELECT count(*) FROM column_manifest").fetchone()[0] > 0
+    client.close()
