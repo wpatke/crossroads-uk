@@ -44,10 +44,12 @@ IDENTITY = {
     "accident_index", "accident_year", "accident_reference",
     "vehicle_reference", "casualty_reference",
 }
-# Coordinates. OSGR eastings/northings and WGS84 lon/lat. Handled by the bespoke
-# Stage 02 geometry logic, so dtype is left blank here.
+# Coordinates. OSGR eastings/northings are handled by the bespoke Stage 02 geometry
+# logic (turned into easting/northing/geom), so dtype is left blank here. WGS84
+# longitude/latitude are NOT bespoke-handled — they fall to the broad clean and must be
+# typed real-valued (see NUMERIC_DOUBLE), not carried raw, so they are not `geo` here.
 GEO = {
-    "location_easting_osgr", "location_northing_osgr", "longitude", "latitude",
+    "location_easting_osgr", "location_northing_osgr",
 }
 # Date/time strings, parsed by the bespoke Stage 02 datetime logic.
 DATETIME = {"date", "time"}
@@ -57,9 +59,16 @@ NUMERIC_INT = {
     "first_road_number", "second_road_number",
     "age_of_driver", "age_of_casualty", "age_of_vehicle", "engine_capacity_cc",
     "driver_imd_decile", "casualty_imd_decile",
+    # speed_limit is a literal mph quantity (20/30/.../70), not a labelled code list:
+    # the guide gives no discrete value labels, so only its -1/99 sentinels reach the
+    # codebook. Treat it as numeric like the ages above, so it is cleaned as a number
+    # and not carried into the labelled views (where it would show all-NULL labels).
+    "speed_limit",
 }
-# Probabilistic severity-adjustment weights (real-valued), the only DOUBLE columns.
+# Real-valued (DOUBLE) columns: the WGS84 coordinates and the probabilistic
+# severity-adjustment weights.
 NUMERIC_DOUBLE = {
+    "longitude", "latitude",
     "collision_adjusted_severity_serious", "collision_adjusted_severity_slight",
     "casualty_adjusted_severity_serious", "casualty_adjusted_severity_slight",
 }

@@ -90,7 +90,8 @@ Classifies **every** column of all three files. `table` is `collision`/`vehicle`
 keep-in-place silver (stage 06) treats each column.
 
 - **Committed size:** exactly 99 rows (44 collision + 32 vehicle + 23 casualty headers). Breakdown:
-  identity 12, geo 4, datetime 2, coded 60, numeric 14, text 7.
+  identity 12, geo 2, datetime 2, coded 59, numeric 17, text 7. (`geo` is just the two OSGR
+  easting/northing columns; `longitude`/`latitude` are `numeric DOUBLE`.)
 - **Not derived from the guide's `code/format` column** — that column mixes real code lists with format
   strings and the `-1`-on-numerics sentinel, so it cannot cleanly separate `coded` from `numeric`/`text`.
   Instead, `scripts/build_stats19_column_manifest.py` applies explicit, documented classification rules (the

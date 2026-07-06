@@ -20,7 +20,7 @@ collision,local_authority_highway_current,text,
 collision,first_road_class,coded,INTEGER
 collision,first_road_number,numeric,INTEGER
 collision,road_type,coded,INTEGER
-collision,speed_limit,coded,INTEGER
+collision,speed_limit,numeric,INTEGER
 collision,junction_detail_historic,coded,INTEGER
 collision,junction_detail,coded,INTEGER
 collision,junction_control,coded,INTEGER

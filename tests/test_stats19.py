@@ -431,8 +431,9 @@ def test_column_manifest_covers_every_fixture_column(con):
     by_kind = {r[0]: r[1] for r in con.execute(
         "SELECT kind, count(*) FROM column_manifest GROUP BY kind").fetchall()}
     # longitude/latitude are numeric (DOUBLE), not geo — they carry real coordinate numbers
-    # into silver (Stage 06 keep-in-place), so geo is 2 (OSGR easting/northing) and numeric 16.
-    assert by_kind == {"identity": 12, "geo": 2, "datetime": 2, "coded": 60, "numeric": 16, "text": 7}
+    # into silver (Stage 06 keep-in-place), so geo is 2 (OSGR easting/northing). speed_limit is
+    # numeric (a literal mph quantity, not a labelled code list), so coded is 59 and numeric 17.
+    assert by_kind == {"identity": 12, "geo": 2, "datetime": 2, "coded": 59, "numeric": 17, "text": 7}
     # coded/numeric carry a dtype; identity/geo/datetime/text do not.
     assert con.execute("SELECT count(*) FROM column_manifest "
                        "WHERE kind IN ('coded','numeric') AND (dtype IS NULL OR dtype='')"
@@ -750,4 +751,77 @@ def test_completeness_report_end_to_end(tmp_path):
         "SELECT missing_rate FROM stats19_completeness "
         "WHERE source_id='stats19_casualty' AND column_name='casualty_severity'").fetchone()[0]
     assert sev == 0.0        # mandatory field, clean sample
+    client.close()
+
+
+def test_labelled_view_decodes_and_never_stores(con):
+    t = Stats19Transformer()
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('casualty_severity','1','Fatal',FALSE),('casualty_severity','2','Serious',FALSE),"
+        "  ('casualty_severity','-1','Data missing or out of range',TRUE),"
+        "  ('sex_of_casualty','1','Male',FALSE)) AS t(variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('casualty','casualty_severity','coded','INTEGER'),"
+        "  ('casualty','sex_of_casualty','coded','INTEGER'),"
+        "  ('casualty','age_of_casualty','numeric','INTEGER')) AS t(tbl,col,kind,dtype)")   # numeric -> not labelled
+    con.execute("CREATE TABLE casualties AS SELECT * FROM (VALUES "
+        "  ('k1', 2,    1, 34),('k2', NULL, 1, NULL)"
+        ") AS t(source_row_key, casualty_severity, sex_of_casualty, age_of_casualty)")
+    t._create_labelled_views(con)
+    rows = {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT source_row_key, casualty_severity_label, sex_of_casualty_label "
+        "FROM casualties_labelled").fetchall()}
+    assert rows["k1"] == ("Serious", "Male")
+    assert rows["k2"][0] is None                 # cleaned-NULL severity -> NULL label
+    cols = {r[0] for r in con.execute("DESCRIBE casualties").fetchall()}
+    assert not any(c.endswith("_label") for c in cols)       # labels NOT stored
+    view_cols = {r[0] for r in con.execute("DESCRIBE casualties_labelled").fetchall()}
+    assert "age_of_casualty_label" not in view_cols          # numeric not labelled
+    assert con.execute("SELECT count(*) FROM casualties_labelled").fetchone()[0] == 2   # no fan-out
+
+
+def test_labelled_views_end_to_end(tmp_path):
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)
+    for silver, view, kind in (("collisions","collisions_labelled","collision"),
+                               ("vehicles","vehicles_labelled","vehicle"),
+                               ("casualties","casualties_labelled","casualty")):
+        silver_cols = {r[0].lower() for r in client.con.execute(f"DESCRIBE {silver}").fetchall()}
+        coded = [c for (c,) in client.con.execute(
+            "SELECT col FROM column_manifest WHERE tbl=? AND kind='coded'", [kind]).fetchall()
+            if c.lower() in silver_cols]
+        view_cols = {r[0].lower() for r in client.con.execute(f"DESCRIBE {view}").fetchall()}
+        for c in coded:
+            assert f"{c}_label" in view_cols, f"{view} missing {c}_label"
+        s = client.con.execute(f"SELECT count(*) FROM {silver}").fetchone()[0]
+        v = client.con.execute(f"SELECT count(*) FROM {view}").fetchone()[0]
+        assert v == s and s > 0                                         # no fan-out/loss
+        assert not any(c.endswith("_label") for c in silver_cols), f"{silver} must not store labels"
+    lab = client.con.execute(
+        "SELECT DISTINCT casualty_severity_label FROM casualties_labelled "
+        "WHERE casualty_severity = 2").fetchone()
+    assert lab and lab[0].lower().startswith("serious")
+    # Every PRESENT code in a codebook-COVERED column must decode -- across ALL coded columns
+    # of ALL three views, not just casualty_severity. This is the regression tripwire for a
+    # systematic decode break (e.g. a future zero-padded code '07' that the INTEGER->VARCHAR
+    # join would silently miss): if any covered column loses its labels, the suite fails loudly
+    # and names the column, instead of quietly serving blanks. Scope to covered columns only
+    # (>=1 codebook row) so a legitimately-uncovered column like enhanced_severity_collision
+    # (all-NULL labels by design) is NOT treated as a failure.
+    for silver, view, kind in (("collisions","collisions_labelled","collision"),
+                               ("vehicles","vehicles_labelled","vehicle"),
+                               ("casualties","casualties_labelled","casualty")):
+        silver_cols = {r[0].lower() for r in client.con.execute(f"DESCRIBE {silver}").fetchall()}
+        coded = [c for (c,) in client.con.execute(
+            "SELECT col FROM column_manifest WHERE tbl=? AND kind='coded'", [kind]).fetchall()
+            if c.lower() in silver_cols]
+        for c in coded:
+            covered = client.con.execute(
+                "SELECT count(*) FROM codebook WHERE variable = ?", [c]).fetchone()[0] > 0
+            if not covered:
+                continue                 # dictionary has nothing for this column yet -> blanks expected
+            undecoded = client.con.execute(
+                f"SELECT count(*) FROM {view} "
+                f"WHERE {c} IS NOT NULL AND {c}_label IS NULL").fetchone()[0]
+            assert undecoded == 0, f"{view}.{c} has {undecoded} undecoded codes"
     client.close()

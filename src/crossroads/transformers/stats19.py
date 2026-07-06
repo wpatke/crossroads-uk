@@ -409,6 +409,9 @@ class Stats19Transformer(BaseTransformer):
         con.execute(
             f"CREATE INDEX collisions_geom_rtree ON {self.COLLISION_SILVER} USING RTREE (geom)")
 
+        # --- LABELS (opt-in, NEVER stored): code->label views alongside the coded tables. ---
+        self._create_labelled_views(con)
+
     # --- silver derivations (factored so tests can drive them on a synthetic bronze) ---
     def _derive_collision_silver(self, con):
         """Collision silver: FULL keep-in-place. Existing identity/geom/datetime/lad/ctyua
@@ -641,6 +644,70 @@ class Stats19Transformer(BaseTransformer):
                 f"  GROUP BY c2.source_row_key"
                 f") m WHERE c.source_row_key = m.k"
             )
+
+    def _create_labelled_views(self, con):
+        """Opt-in code->label translation, at full breadth. Labels are NEVER stored: each
+        *_labelled view joins the codebook to expose a <col>_label for every coded column
+        ALONGSIDE the canonical coded silver table. Default surface = the coded table;
+        'translation off' = query the silver table. No global flag, no stored label column.
+
+        One LEFT JOIN per coded column, aliased, ON cb.variable='<col>' AND
+        cb.code = CAST(s.<col> AS VARCHAR). codebook is unique on (variable, code) and each
+        join filters variable, so joins are 1:1 -> the view row count == silver row count.
+        Column/variable identifiers come from the trusted manifest (interpolated); no row
+        values are interpolated. Views are lazy: the join cost is paid only when queried.
+
+        After each view is built, REPORT (never halt) any undecoded codes -- a code that
+        is present but whose label came back NULL -- in the codebook-COVERED coded columns,
+        via warnings.warn. This is the build-time 'report loudly and continue': the build
+        always succeeds, but a systematic decode gap (e.g. a future zero-padded code the
+        INTEGER->VARCHAR join misses) or a stray junk code is surfaced, not silent. Uncovered
+        columns (no codebook rows, e.g. enhanced_severity_collision) are skipped -- their
+        NULL labels are expected. Mirrors the non-fatal warnings.warn already used in
+        _spatial_stamp for a missing boundary table."""
+        for silver, table_kind in ((self.COLLISION_SILVER, "collision"),
+                                   (self.VEHICLE_SILVER,   "vehicle"),
+                                   (self.CASUALTY_SILVER,  "casualty")):
+            # Defensive: skip a silver table that doesn't exist (e.g. a focused unit test
+            # that built only one table). A real build has all three. Mirrors the
+            # missing-table guard in _spatial_stamp.
+            if not self._table_exists(con, silver):
+                continue
+            silver_cols = self._bronze_columns(con, silver)     # reuse info_schema helper
+            coded = [c for (c,) in con.execute(
+                f"SELECT col FROM {self.COLUMN_MANIFEST_TABLE} "
+                f"WHERE tbl = ? AND kind = 'coded' ORDER BY col", [table_kind]).fetchall()
+                if c.lower() in silver_cols]
+            selects, joins = ["s.*"], []
+            for i, col in enumerate(coded):
+                a = f"cb{i}"
+                selects.append(f"{a}.label AS {col}_label")
+                joins.append(
+                    f"LEFT JOIN {self.CODEBOOK_TABLE} {a} "
+                    f"  ON {a}.variable = '{col}' AND {a}.code = CAST(s.{col} AS VARCHAR)")
+            con.execute(
+                f"CREATE OR REPLACE VIEW {silver}_labelled AS "
+                f"SELECT {', '.join(selects)} FROM {silver} s {' '.join(joins)}")
+
+            # --- REPORT (non-fatal): warn on undecoded codes in COVERED columns. ---
+            # A covered column has >=1 codebook row; only those are expected to decode.
+            covered = [c for c in coded if con.execute(
+                f"SELECT count(*) FROM {self.CODEBOOK_TABLE} WHERE variable = ?",
+                [c]).fetchone()[0] > 0]
+            if covered:
+                # One scan of the view: an undecoded count per covered column.
+                exprs = ", ".join(
+                    f"count(*) FILTER (WHERE {c} IS NOT NULL AND {c}_label IS NULL)"
+                    for c in covered)
+                counts = con.execute(f"SELECT {exprs} FROM {silver}_labelled").fetchone()
+                bad = [(c, n) for c, n in zip(covered, counts) if n]
+                if bad:
+                    warnings.warn(
+                        f"stats19: {silver}_labelled has undecoded codes (code present but "
+                        f"label NULL) in covered columns: "
+                        + ", ".join(f"{c}={n}" for c, n in bad)
+                        + ". Those rows show a blank label; check the codebook covers every "
+                        f"code in use (e.g. a new or zero-padded code).", stacklevel=2)
 
     def quality_spec(self):
         # Three audit units. Collision declares geom/datetime (Stage 02) + severity
