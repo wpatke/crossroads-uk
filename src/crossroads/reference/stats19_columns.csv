@@ -4,8 +4,8 @@ collision,accident_year,identity,
 collision,accident_reference,identity,
 collision,location_easting_osgr,geo,
 collision,location_northing_osgr,geo,
-collision,longitude,geo,
-collision,latitude,geo,
+collision,longitude,numeric,DOUBLE
+collision,latitude,numeric,DOUBLE
 collision,police_force,coded,INTEGER
 collision,collision_severity,coded,INTEGER
 collision,number_of_vehicles,numeric,INTEGER

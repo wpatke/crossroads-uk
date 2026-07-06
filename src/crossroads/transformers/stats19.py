@@ -34,6 +34,12 @@ _FILE_TEMPLATE = "dft-road-casualty-statistics-{ftype}-{year}.csv"
 # Stage 02 onward; declared here as the shared constant.
 COORD_SENTINELS = ("-1", "0")
 
+# Sentinels for the broad numeric clean (Stage 06). A numeric column equal to any of
+# these — or blank / non-numeric — becomes NULL. A coded column uses the codebook's
+# is_missing set instead. (Note: DfT leaves missing longitude/latitude blank, so '' is
+# the sentinel that fires in practice; '-1' is inert for those but harmless.)
+NUMERIC_SENTINELS = ("-1", "")
+
 # British National Grid envelope, for verifying geometry really is EPSG:27700 in tests.
 BNG_MIN_E, BNG_MAX_E = 0, 700_000
 BNG_MIN_N, BNG_MAX_N = 0, 1_300_000
@@ -179,6 +185,75 @@ class Stats19Transformer(BaseTransformer):
             return f"{present[0]} AS {alias}"
         return "COALESCE(" + ", ".join(present) + f") AS {alias}"
 
+    # --- broad keep-in-place clean (Stage 06): carry EVERY bronze column into silver ---
+    # These sit next to _coalesce_present because they share the "only touch what's present,
+    # from a trusted manifest" idea. Column/kind/dtype come from the committed manifest
+    # (code-controlled), so interpolating them is safe; no row values are ever interpolated.
+    def _bronze_columns(self, con, table):
+        """Lower-cased set of column names present in a table (bronze or silver)."""
+        return {r[0].lower() for r in con.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            [table]).fetchall()}
+
+    def _clean_fragment(self, col, kind, dtype):
+        """SELECT fragment that carries one bronze column into silver, cleaned per kind.
+
+        coded   -> full missing set (codebook is_missing) -> NULL, else INTEGER code kept.
+        numeric -> NUMERIC_SENTINELS/blank/non-numeric -> NULL, else typed to dtype
+                   (this is the path longitude/latitude take, typed to DOUBLE).
+        text    -> carried verbatim (free-text; normalization deferred).
+        other   -> identity/any unrecognised kind carried raw (e.g. a child table's
+                   accident_year/accident_reference, which no bespoke SELECT emits).
+        The cleaned value stays a CODE/NUMBER, never a label; NULL means 'empty cell'.
+        """
+        if kind == "coded":
+            # Null the codebook's is_missing codes, PLUS a bare -1. -1 is DfT's universal
+            # "Data missing or out of range" sentinel, so every codebook-covered variable
+            # already flags it; treating it as missing here too means a codebook gap (e.g.
+            # enhanced_severity_collision, which has no codebook rows and is all -1 in 2023)
+            # can't silently leak a -1 into a cleaned code. It never nulls a real value:
+            # no STATS19 coded field uses -1 as a meaningful category.
+            return (f"CASE WHEN {col} = '-1' OR {col} IN (SELECT code FROM {self.CODEBOOK_TABLE} "
+                    f"WHERE variable = '{col}' AND is_missing) "
+                    f"THEN NULL ELSE TRY_CAST({col} AS INTEGER) END AS {col}")
+        if kind == "numeric":
+            typ = dtype or "INTEGER"
+            sent = ", ".join(f"'{s}'" for s in NUMERIC_SENTINELS)
+            return (f"CASE WHEN {col} IN ({sent}) THEN NULL "
+                    f"ELSE TRY_CAST({col} AS {typ}) END AS {col}")
+        return f"{col} AS {col}"   # text/identity (and any unrecognised kind): carry raw
+
+    def _placeholder_fragment(self, col, kind, dtype):
+        """Typed NULL for a manifest column ABSENT from this bronze (a future-year drop or
+        the pre/post-2024 rename), so silver's schema stays stable across year selections."""
+        typ = "INTEGER" if kind == "coded" else (dtype or "INTEGER") if kind == "numeric" else "VARCHAR"
+        return f"CAST(NULL AS {typ}) AS {col}"
+
+    def _broad_fragments(self, con, bronze_table, table_kind, exclude):
+        """Deterministic list of broad-clean SELECT fragments for one file.
+
+        Reads column_manifest for `table_kind` and skips the columns the bespoke path
+        already emits, listed in `exclude` -- the SINGLE authority for what bespoke owns
+        (renamed or verbatim). Every other manifest column gets a cleaned fragment (or a
+        typed NULL placeholder if absent from this bronze). Invariant: a column reaches
+        silver via exactly ONE path -- bespoke (in `exclude`) OR broad. We do NOT filter
+        by kind: doing so would silently drop columns no bespoke SELECT produces
+        (longitude/latitude, and the child tables' accident_year/accident_reference).
+        ORDER BY col keeps rebuilds structurally identical (spec §2).
+        """
+        present = self._bronze_columns(con, bronze_table)
+        exclude = {c.lower() for c in exclude}
+        rows = con.execute(
+            f"SELECT col, kind, dtype FROM {self.COLUMN_MANIFEST_TABLE} "
+            f"WHERE tbl = ? ORDER BY col", [table_kind]).fetchall()
+        frags = []
+        for col, kind, dtype in rows:
+            if col.lower() in exclude:
+                continue
+            frags.append(self._clean_fragment(col, kind, dtype) if col.lower() in present
+                         else self._placeholder_fragment(col, kind, dtype))
+        return frags
+
     def transform_and_load(self, con, cache_dir):
         years = getattr(self, "_years", None) or []
         if not years:
@@ -225,9 +300,11 @@ class Stats19Transformer(BaseTransformer):
 
     # --- silver derivations (factored so tests can drive them on a synthetic bronze) ---
     def _derive_collision_silver(self, con):
-        """Collision silver: keep-in-place 1:1, with typed coordinates, an EPSG:27700
-        geom point, a naive local datetime, and the ledger rows for missing/invalid
-        values. Bad values are flagged + logged, never dropped (spec §9)."""
+        """Collision silver: FULL keep-in-place. Existing identity/geom/datetime/lad/ctyua
+        logic UNCHANGED (typed coordinates, an EPSG:27700 geom point, a naive local
+        datetime, the ledger rows); PLUS every remaining bronze column carried + cleaned
+        per the column manifest (coded/numeric missing set -> NULL + typed; text raw).
+        Codes kept, never labelled. Bad values are flagged + logged, never dropped (§9)."""
         # accident_reference candidates include collision_ref_no: verified against
         # live 2020-2024 DfT files, whose reference column is named collision_ref_no
         # (not collision_reference as the older accident_* convention would suggest).
@@ -243,6 +320,17 @@ class Stats19Transformer(BaseTransformer):
 
         sentinels_sql = ", ".join(f"'{s}'" for s in COORD_SENTINELS)
 
+        # Columns the bespoke logic consumes -> keep OUT of the broad loop. collision_severity
+        # is broad-cleaned here as an ordinary coded column (Stage 07 promotes it later).
+        # longitude/latitude are NOT here -> they fall to the broad loop and are carried as
+        # DOUBLE (manifest geo->numeric). Only the OSGR easting/northing, which bespoke turns
+        # into easting/northing/geom, are excluded.
+        exclude = {"accident_index", "collision_index", "accident_year", "collision_year",
+                   "accident_reference", "collision_reference", "collision_ref_no",
+                   "location_easting_osgr", "location_northing_osgr", "date", "time"}
+        broad = self._broad_fragments(con, self.COLLISION_BRONZE, "collision", exclude)
+        broad_sql = (", " + ", ".join(broad)) if broad else ""
+
         # Two-level select: the inner CTE types the coordinates and parses dates (SQL
         # cannot reference a sibling alias in the same SELECT list), the outer builds
         # geom / datetime / flags from those typed values. OSGR eastings/northings ARE
@@ -254,7 +342,7 @@ class Stats19Transformer(BaseTransformer):
         con.execute(
             f"CREATE OR REPLACE TABLE {self.COLLISION_SILVER} AS "
             f"WITH typed AS ("
-            f"  SELECT "
+            f"  SELECT *, "                        # expose every raw bronze column to the broad fragments
             f"    ({idx_expr}) AS source_row_key, {acc}, {yr}, {ref}, "
             f"    location_easting_osgr  AS easting_raw, "
             f"    location_northing_osgr AS northing_raw, "
@@ -280,6 +368,7 @@ class Stats19Transformer(BaseTransformer):
             # Filled by the Stage 04 spatial stamp; present now so the schema is stable.
             f"  CAST(NULL AS VARCHAR) AS lad_code, "
             f"  CAST(NULL AS VARCHAR) AS ctyua_code "
+            f"  {broad_sql} "                       # every remaining bronze column, cleaned per manifest
             f"FROM typed"
         )
 
@@ -307,29 +396,46 @@ class Stats19Transformer(BaseTransformer):
                 severity="reject_dimension", raw_value=str(d))
 
     def _derive_vehicle_silver(self, con):
-        """Vehicle silver: keep-in-place 1:1, linked to collisions by accident_index.
-        A vehicle whose accident_index has no matching collision is flagged
-        link_valid = FALSE and logged (orphan), never dropped (spec §9)."""
+        """Vehicle silver: FULL keep-in-place. Existing identity + link_valid UNCHANGED;
+        PLUS every remaining bronze column carried + cleaned per the manifest. A vehicle
+        whose accident_index has no matching collision is flagged link_valid = FALSE and
+        logged (orphan), never dropped (spec §9)."""
         acc = self._coalesce_present(con, self.VEHICLE_BRONZE,
                                      ["collision_index", "accident_index"], "accident_index")
         idx_expr = acc.replace(" AS accident_index", "")
+        # Exclude ONLY the columns the bespoke SELECT below actually emits: accident_index
+        # (coalesced from either name) + vehicle_reference. accident_year/accident_reference
+        # are NOT bespoke-produced here, so they fall to the broad loop and are carried
+        # (carried raw, matching how collision carries them) -- otherwise they'd vanish.
+        exclude = {"accident_index", "collision_index", "vehicle_reference"}
+        broad = self._broad_fragments(con, self.VEHICLE_BRONZE, "vehicle", exclude)
+        broad_sql = (", " + ", ".join(broad)) if broad else ""
         con.execute(
             f"CREATE OR REPLACE TABLE {self.VEHICLE_SILVER} AS "
             f"SELECT ({idx_expr}) || '|' || vehicle_reference AS source_row_key, "
             f"       {acc}, vehicle_reference, "
             f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
             f"         AS link_valid "
+            f"       {broad_sql} "
             f"FROM {self.VEHICLE_BRONZE}"
         )
         self._log_orphans(con, self.VEHICLE_SILVER, self.VEHICLE_SID, self.VEHICLE_LINK_RULE)
 
     def _derive_casualty_silver(self, con):
-        """Casualty silver: keep-in-place 1:1, linked to collisions by accident_index
-        (also carries vehicle_reference for a finer casualty-to-vehicle link). Orphans
-        are flagged link_valid = FALSE and logged, never dropped (spec §9)."""
+        """Casualty silver: FULL keep-in-place. Existing identity + link_valid UNCHANGED;
+        PLUS every remaining bronze column carried + cleaned per the manifest. casualty_severity
+        is cleaned here as an ordinary coded column (Stage 07 promotes it later). Linked to
+        collisions by accident_index (also carries vehicle_reference for a finer
+        casualty-to-vehicle link). Orphans are flagged link_valid = FALSE + logged (spec §9)."""
         acc = self._coalesce_present(con, self.CASUALTY_BRONZE,
                                      ["collision_index", "accident_index"], "accident_index")
         idx_expr = acc.replace(" AS accident_index", "")
+        # As in vehicles: exclude ONLY the bespoke-emitted keys (accident_index +
+        # vehicle_reference + casualty_reference). accident_year/accident_reference fall to
+        # the broad loop and are carried, never dropped.
+        exclude = {"accident_index", "collision_index", "vehicle_reference", "casualty_reference"}
+        broad = self._broad_fragments(con, self.CASUALTY_BRONZE, "casualty", exclude)
+        broad_sql = (", " + ", ".join(broad)) if broad else ""
         con.execute(
             f"CREATE OR REPLACE TABLE {self.CASUALTY_SILVER} AS "
             f"SELECT ({idx_expr}) || '|' || vehicle_reference || '|' || casualty_reference "
@@ -337,6 +443,7 @@ class Stats19Transformer(BaseTransformer):
             f"       {acc}, vehicle_reference, casualty_reference, "
             f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
             f"         AS link_valid "
+            f"       {broad_sql} "
             f"FROM {self.CASUALTY_BRONZE}"
         )
         self._log_orphans(con, self.CASUALTY_SILVER, self.CASUALTY_SID, self.CASUALTY_LINK_RULE)

@@ -31,6 +31,16 @@ def _stats19_client(tmp_path):
     return client
 
 
+def _empty_reference_stubs(con):
+    """Empty codebook + column_manifest so a derivation's broad-clean loop is a no-op
+    (leaving only the bespoke columns a test targets). Real builds load populated tables
+    first; these bespoke-focused unit tests don't exercise the broad clean."""
+    con.execute("CREATE TABLE IF NOT EXISTS codebook"
+                "(variable VARCHAR, code VARCHAR, label VARCHAR, is_missing BOOLEAN)")
+    con.execute("CREATE TABLE IF NOT EXISTS column_manifest"
+                "(tbl VARCHAR, col VARCHAR, kind VARCHAR, dtype VARCHAR)")
+
+
 def test_bronze_and_minimal_silver_end_to_end(tmp_path):
     client = _stats19_client(tmp_path)
     client.build(years=YEARS)     # runs invariants; raises if conservation fails
@@ -93,6 +103,7 @@ def test_collision_reference_alias_branch(con):
     from crossroads.quality import ensure_quality_tables
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
+    _empty_reference_stubs(con)
     con.execute(
         "CREATE TABLE stats19_collision_raw AS "
         "SELECT * FROM (VALUES "
@@ -142,6 +153,7 @@ def test_sentinel_and_bad_date_flagged_and_logged(con):
     from crossroads.quality import ensure_quality_tables
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
+    _empty_reference_stubs(con)
     con.execute(
         "CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
         "  ('c1','2023','r1','530000','180000','05/01/2023','08:30'), "   # valid
@@ -175,6 +187,7 @@ def test_missing_time_falls_back_to_midnight(con):
     from crossroads.quality import ensure_quality_tables
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
+    _empty_reference_stubs(con)
     con.execute(
         "CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
         "  ('c9','2023','r9','530000','180000','07/01/2023','')"
@@ -206,6 +219,7 @@ def test_orphan_vehicle_is_flagged_and_logged(con):
     # collisions has c1 only; a vehicle referencing c1 links, one referencing cX is an orphan.
     from crossroads.quality import ensure_quality_tables
     ensure_quality_tables(con)
+    _empty_reference_stubs(con)
     con.execute("CREATE TABLE collisions AS SELECT * FROM (VALUES ('c1')) AS t(accident_index)")
     con.execute(
         "CREATE TABLE stats19_vehicle_raw AS SELECT * FROM (VALUES "
@@ -416,7 +430,9 @@ def test_column_manifest_covers_every_fixture_column(con):
     assert con.execute("SELECT count(*) FROM column_manifest").fetchone()[0] == 99
     by_kind = {r[0]: r[1] for r in con.execute(
         "SELECT kind, count(*) FROM column_manifest GROUP BY kind").fetchall()}
-    assert by_kind == {"identity": 12, "geo": 4, "datetime": 2, "coded": 60, "numeric": 14, "text": 7}
+    # longitude/latitude are numeric (DOUBLE), not geo — they carry real coordinate numbers
+    # into silver (Stage 06 keep-in-place), so geo is 2 (OSGR easting/northing) and numeric 16.
+    assert by_kind == {"identity": 12, "geo": 2, "datetime": 2, "coded": 60, "numeric": 16, "text": 7}
     # coded/numeric carry a dtype; identity/geo/datetime/text do not.
     assert con.execute("SELECT count(*) FROM column_manifest "
                        "WHERE kind IN ('coded','numeric') AND (dtype IS NULL OR dtype='')"
@@ -432,4 +448,106 @@ def test_build_creates_reference_tables(tmp_path):
     client.build(years=YEARS)
     assert client.con.execute("SELECT count(*) FROM codebook").fetchone()[0] > 0
     assert client.con.execute("SELECT count(*) FROM column_manifest").fetchone()[0] > 0
+    client.close()
+
+
+# --- Stage 06: keep-in-place broad clean (every bronze column reaches silver) ---
+
+def test_collision_broad_clean_keeps_codes_nulls_missing(con):
+    """Coded columns keep their integer code (missing set -> NULL); numeric columns type
+    correctly with sentinels -> NULL (incl. longitude as DOUBLE); text carried raw."""
+    from crossroads.quality import ensure_quality_tables
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('road_type','6','Single carriageway',FALSE),('road_type','-1','Data missing or out of range',TRUE),"
+        "  ('road_type','9','Unknown',TRUE)) AS t(variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('collision','road_type','coded','INTEGER'),"
+        "  ('collision','number_of_vehicles','numeric','INTEGER'),"
+        "  ('collision','longitude','numeric','DOUBLE'),"        # geo->numeric reclassification
+        "  ('collision','lsoa_of_accident_location','text','')) AS t(tbl,col,kind,dtype)")
+    con.execute("CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
+        "  ('c1','2023','r1','530000','180000','05/01/2023','08:30','6','2','E01000001','-0.12'),"
+        "  ('c2','2023','r2','531000','181000','06/01/2023','09:00','9','-1','E01000002','-1'),"
+        "  ('c3','2023','r3','532000','182000','07/01/2023','10:00','x','x','E01000003','x')"
+        ") AS t(accident_index,accident_year,accident_reference,location_easting_osgr,"
+        "location_northing_osgr,date,time,road_type,number_of_vehicles,lsoa_of_accident_location,longitude)")
+    t = Stats19Transformer(); t._derive_collision_silver(con)
+    rows = {r[0]: r for r in con.execute(
+        "SELECT accident_index, road_type, number_of_vehicles, longitude, "
+        "lsoa_of_accident_location FROM collisions").fetchall()}
+    assert rows["c1"][1:] == (6, 2, -0.12, "E01000001")   # codes/number kept; DOUBLE lon; text raw
+    assert rows["c2"][1] is None                        # '9=Unknown' -> NULL
+    assert rows["c2"][2] is None                        # '-1' INTEGER numeric -> NULL
+    assert rows["c2"][3] is None                        # '-1' DOUBLE longitude -> NULL
+    assert rows["c3"][1] is None and rows["c3"][2] is None and rows["c3"][3] is None  # non-numeric -> NULL
+    assert con.execute("SELECT count(*) FROM collisions").fetchone()[0] == 3   # keep-in-place
+    assert con.execute("SELECT count(*) FROM collisions WHERE road_type = -1").fetchone()[0] == 0
+    dt = {r[0]: r[1] for r in con.execute("DESCRIBE collisions").fetchall()}
+    assert dt["road_type"] == "INTEGER" and dt["lsoa_of_accident_location"] == "VARCHAR"
+    assert dt["longitude"] == "DOUBLE"                  # lon/lat carried as real numbers, not dropped/raw
+    # Bespoke geom/datetime still there.
+    assert "geom" in dt and dt["datetime_local"].startswith("TIMESTAMP")
+
+
+def test_casualty_broad_clean(con):
+    """Casualty keep-in-place: a coded column keeps its code, a -1 numeric -> NULL, and
+    link_valid holds (orphan casualty flagged FALSE), driven against a collisions stub."""
+    from crossroads.quality import ensure_quality_tables
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('sex_of_casualty','1','Male',FALSE),"
+        "  ('sex_of_casualty','-1','Data missing or out of range',TRUE)) AS t(variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('casualty','sex_of_casualty','coded','INTEGER'),"
+        "  ('casualty','age_of_casualty','numeric','INTEGER')) AS t(tbl,col,kind,dtype)")
+    # collisions stub: only 'x1' is a real collision, so 'x9' casualties are orphans.
+    con.execute("CREATE TABLE collisions AS SELECT * FROM (VALUES ('x1')) AS t(accident_index)")
+    con.execute("CREATE TABLE stats19_casualty_raw AS SELECT * FROM (VALUES "
+        "  ('x1','1','1','1','30'),"     # linked, sex kept, age kept
+        "  ('x1','1','2','-1','-1'),"    # linked, sex -1 -> NULL, age -1 -> NULL
+        "  ('x9','1','1','1','40')"      # orphan -> link_valid FALSE
+        ") AS t(accident_index,vehicle_reference,casualty_reference,sex_of_casualty,age_of_casualty)")
+    t = Stats19Transformer(); t._derive_casualty_silver(con)
+    rows = {r[0]: r for r in con.execute(
+        "SELECT source_row_key, sex_of_casualty, age_of_casualty, link_valid FROM casualties").fetchall()}
+    assert rows["x1|1|1"][1:] == (1, 30, True)          # code + number kept; linked
+    assert rows["x1|1|2"][1] is None and rows["x1|1|2"][2] is None   # -1 coded + -1 numeric -> NULL
+    assert rows["x9|1|1"][3] is False                   # orphan flagged, not dropped
+    assert con.execute("SELECT count(*) FROM casualties").fetchone()[0] == 3   # keep-in-place
+
+
+def test_all_silver_tables_full_width(tmp_path):
+    """Over the real sample: every bronze column reaches silver (minus the columns bespoke
+    logic transforms in place), no -1 leaks into any cleaned column, lon/lat are DOUBLE."""
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)          # runs all invariants; raises on failure
+    consumed = {"collision": {"location_easting_osgr", "location_northing_osgr", "date", "time"},
+                "vehicle": set(), "casualty": set()}
+    for table_kind, silver in (("collision", "collisions"), ("vehicle", "vehicles"), ("casualty", "casualties")):
+        with open(os.path.join(FIXTURES, f"dft-road-casualty-statistics-{table_kind}-2023.csv")) as f:
+            header = [h.strip().lower() for h in f.readline().strip().split(",")]
+        cols = {r[0].lower() for r in client.con.execute(f"DESCRIBE {silver}").fetchall()}
+        for c in header:
+            if c in consumed[table_kind]:
+                continue
+            assert c in cols, f"{silver}: column '{c}' missing from silver (not keep-in-place)"
+    # No raw '-1' missing marker leaks into ANY cleaned coded/numeric column — every such
+    # column across all three tables, not a spot-check.
+    for table_kind, silver in (("collision", "collisions"), ("vehicle", "vehicles"), ("casualty", "casualties")):
+        cleaned = [r[0] for r in client.con.execute(
+            "SELECT col FROM column_manifest WHERE tbl = ? AND kind IN ('coded','numeric')",
+            [table_kind]).fetchall()]
+        present = {r[0].lower() for r in client.con.execute(f"DESCRIBE {silver}").fetchall()}
+        for c in cleaned:
+            if c.lower() in present:
+                leaked = client.con.execute(f"SELECT count(*) FROM {silver} WHERE {c} = -1").fetchone()[0]
+                assert leaked == 0, f"{silver}.{c} still holds {leaked} raw -1 missing markers"
+    # longitude/latitude are carried as real numbers (DOUBLE), not dropped or left raw text.
+    ctypes = {r[0].lower(): r[1] for r in client.con.execute("DESCRIBE collisions").fetchall()}
+    assert ctypes.get("longitude") == "DOUBLE" and ctypes.get("latitude") == "DOUBLE"
+    # Geom/datetime dimensions still hold; gold views + spatial join unaffected.
+    assert client.con.execute("SELECT count(*) FROM collisions WHERE geom_valid = FALSE").fetchone()[0] == 0
+    assert client.con.execute("SELECT count(*) FROM collisions_spatial").fetchone()[0] > 0
     client.close()
