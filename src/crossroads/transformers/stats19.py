@@ -85,6 +85,10 @@ class Stats19Transformer(BaseTransformer):
     VEHICLE_LINK_RULE = "stats19.link.orphan_vehicle"
     CASUALTY_LINK_RULE = "stats19.link.orphan_casualty"
 
+    # --- ledger rules for the CORE severity dimensions (Stage 07; also in quality_spec) ---
+    COLLISION_SEVERITY_RULE = "stats19.collision_severity.missing"
+    CASUALTY_SEVERITY_RULE = "stats19.casualty_severity.missing"
+
     def is_active(self, **kwargs):
         # Nothing to ingest without years; a no-years build (e.g. boundary-only)
         # simply skips STATS19. A real build passes years (spec §8 target flow).
@@ -254,6 +258,57 @@ class Stats19Transformer(BaseTransformer):
                          else self._placeholder_fragment(col, kind, dtype))
         return frags
 
+    # --- CORE severity audit (Stage 07): promote the two headline severity outcomes out
+    # of the broad loop into the same formal audit geom/datetime/link already have. ---
+    def _core_severity_fragments(self, con, bronze_table, column, aliases):
+        """Return (raw_expr, cleaned_expr, valid_expr) for a CORE severity column.
+
+        Same missing-set semantics as the broad coded clean (_clean_fragment): a bare -1
+        (DfT's universal "missing" sentinel, guarded even when the codebook omits it for
+        this variable) OR any codebook is_missing code -> NULL, else the code kept as
+        INTEGER. Keeping the -1 guard means a codebook gap can never leak a raw -1 into the
+        cleaned severity. PLUS a <col>_raw twin (the raw code inline, for the ledger) and a
+        <col>_valid flag. `aliases` coalesces the pre/post-2024 rename over the present
+        columns (e.g. legacy accident_severity -> collision_severity). column/aliases are
+        trusted constants (interpolated); no row values are interpolated.
+
+        Graceful degradation: if NO alias is present (the tranche dropped the column
+        entirely), carry stable typed NULLs with <col>_valid = TRUE — an absent column is
+        not a per-row rejection, so the reject gate and ledger stay clean, matching how the
+        broad placeholder and _coalesce_present treat an absent column. Real STATS19 always
+        carries both severities, so this branch only guards synthetic/future-drop inputs.
+        """
+        present = [a for a in aliases if a.lower() in self._bronze_columns(con, bronze_table)]
+        if not present:
+            warnings.warn(
+                f"stats19: {column} absent from {bronze_table}; carried as NULL with "
+                f"{column}_valid = TRUE (no rejections logged).", stacklevel=2)
+            return (f"CAST(NULL AS VARCHAR) AS {column}_raw",
+                    f"CAST(NULL AS INTEGER) AS {column}",
+                    f"TRUE AS {column}_valid")
+        raw = self._coalesce_present(con, bronze_table, present, f"{column}_raw")
+        raw_ex = raw.replace(f" AS {column}_raw", "")        # bare expression, no alias
+        cleaned = (f"CASE WHEN ({raw_ex}) = '-1' OR ({raw_ex}) IN (SELECT code FROM {self.CODEBOOK_TABLE} "
+                   f"WHERE variable = '{column}' AND is_missing) "
+                   f"THEN NULL ELSE TRY_CAST(({raw_ex}) AS INTEGER) END")
+        return (f"({raw_ex}) AS {column}_raw",
+                f"{cleaned} AS {column}",
+                f"({cleaned}) IS NOT NULL AS {column}_valid")
+
+    def _log_missing_codes(self, con, silver_table, source_id, column, rule_id):
+        """One reject_dimension ledger row per <column>_valid = FALSE row, so flag/ledger
+        agreement holds for the CORE severity field. Aggregate scan + a bounded Python loop
+        over the FALSE set (mirrors _log_orphans and the geom/datetime ledger writes)."""
+        bad = con.execute(
+            f"SELECT source_row_key, {column}_raw FROM {silver_table} "
+            f"WHERE {column}_valid = FALSE").fetchall()
+        for key, raw in bad:
+            log_exclusion(
+                con, source_id=source_id, source_row_key=key,
+                column_name=column, rule_id=rule_id,
+                rule_desc="severity code is a missing/unknown sentinel or unparseable",
+                severity="reject_dimension", raw_value=str(raw))
+
     def transform_and_load(self, con, cache_dir):
         years = getattr(self, "_years", None) or []
         if not years:
@@ -321,13 +376,19 @@ class Stats19Transformer(BaseTransformer):
         sentinels_sql = ", ".join(f"'{s}'" for s in COORD_SENTINELS)
 
         # Columns the bespoke logic consumes -> keep OUT of the broad loop. collision_severity
-        # is broad-cleaned here as an ordinary coded column (Stage 07 promotes it later).
+        # (and its legacy name accident_severity) is now CORE-audited below, so it is excluded
+        # here too — otherwise it would be defined twice (SQL duplicate column).
         # longitude/latitude are NOT here -> they fall to the broad loop and are carried as
         # DOUBLE (manifest geo->numeric). Only the OSGR easting/northing, which bespoke turns
         # into easting/northing/geom, are excluded.
         exclude = {"accident_index", "collision_index", "accident_year", "collision_year",
                    "accident_reference", "collision_reference", "collision_ref_no",
-                   "location_easting_osgr", "location_northing_osgr", "date", "time"}
+                   "location_easting_osgr", "location_northing_osgr", "date", "time",
+                   "collision_severity", "accident_severity"}
+        # CORE severity audit: raw twin + cleaned INTEGER + valid flag (Stage 07).
+        sev_raw, sev_clean, sev_valid = self._core_severity_fragments(
+            con, self.COLLISION_BRONZE, "collision_severity",
+            ["collision_severity", "accident_severity"])
         broad = self._broad_fragments(con, self.COLLISION_BRONZE, "collision", exclude)
         broad_sql = (", " + ", ".join(broad)) if broad else ""
 
@@ -367,7 +428,9 @@ class Stats19Transformer(BaseTransformer):
             f"  (date_parsed IS NOT NULL) AS datetime_valid, "
             # Filled by the Stage 04 spatial stamp; present now so the schema is stable.
             f"  CAST(NULL AS VARCHAR) AS lad_code, "
-            f"  CAST(NULL AS VARCHAR) AS ctyua_code "
+            f"  CAST(NULL AS VARCHAR) AS ctyua_code, "
+            # CORE severity audit (Stage 07): raw twin, cleaned INTEGER, valid flag.
+            f"  {sev_raw}, {sev_clean}, {sev_valid} "
             f"  {broad_sql} "                       # every remaining bronze column, cleaned per manifest
             f"FROM typed"
         )
@@ -394,6 +457,10 @@ class Stats19Transformer(BaseTransformer):
                 column_name="datetime_local", rule_id=self.DATETIME_RULE,
                 rule_desc="collision date is missing or unparseable",
                 severity="reject_dimension", raw_value=str(d))
+
+        # CORE severity ledger: one row per collision_severity_valid = FALSE (Stage 07).
+        self._log_missing_codes(con, self.COLLISION_SILVER, self.COLLISION_SID,
+                                "collision_severity", self.COLLISION_SEVERITY_RULE)
 
     def _derive_vehicle_silver(self, con):
         """Vehicle silver: FULL keep-in-place. Existing identity + link_valid UNCHANGED;
@@ -424,16 +491,22 @@ class Stats19Transformer(BaseTransformer):
     def _derive_casualty_silver(self, con):
         """Casualty silver: FULL keep-in-place. Existing identity + link_valid UNCHANGED;
         PLUS every remaining bronze column carried + cleaned per the manifest. casualty_severity
-        is cleaned here as an ordinary coded column (Stage 07 promotes it later). Linked to
-        collisions by accident_index (also carries vehicle_reference for a finer
-        casualty-to-vehicle link). Orphans are flagged link_valid = FALSE + logged (spec §9)."""
+        is CORE-audited (raw twin + cleaned INTEGER + valid flag + ledger, Stage 07), so it is
+        carved out of the broad loop. Linked to collisions by accident_index (also carries
+        vehicle_reference for a finer casualty-to-vehicle link). Orphans are flagged
+        link_valid = FALSE + logged (spec §9)."""
         acc = self._coalesce_present(con, self.CASUALTY_BRONZE,
                                      ["collision_index", "accident_index"], "accident_index")
         idx_expr = acc.replace(" AS accident_index", "")
-        # As in vehicles: exclude ONLY the bespoke-emitted keys (accident_index +
-        # vehicle_reference + casualty_reference). accident_year/accident_reference fall to
-        # the broad loop and are carried, never dropped.
-        exclude = {"accident_index", "collision_index", "vehicle_reference", "casualty_reference"}
+        # As in vehicles: exclude the bespoke-emitted keys (accident_index +
+        # vehicle_reference + casualty_reference), PLUS casualty_severity (now CORE-audited
+        # below, so it must not also be defined by the broad loop). accident_year/
+        # accident_reference fall to the broad loop and are carried, never dropped.
+        exclude = {"accident_index", "collision_index", "vehicle_reference",
+                   "casualty_reference", "casualty_severity"}
+        # CORE severity audit: raw twin + cleaned INTEGER + valid flag (Stage 07).
+        sev_raw, sev_clean, sev_valid = self._core_severity_fragments(
+            con, self.CASUALTY_BRONZE, "casualty_severity", ["casualty_severity"])
         broad = self._broad_fragments(con, self.CASUALTY_BRONZE, "casualty", exclude)
         broad_sql = (", " + ", ".join(broad)) if broad else ""
         con.execute(
@@ -442,11 +515,16 @@ class Stats19Transformer(BaseTransformer):
             f"         AS source_row_key, "
             f"       {acc}, vehicle_reference, casualty_reference, "
             f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
-            f"         AS link_valid "
+            f"         AS link_valid, "
+            # CORE severity audit (Stage 07): raw twin, cleaned INTEGER, valid flag.
+            f"       {sev_raw}, {sev_clean}, {sev_valid} "
             f"       {broad_sql} "
             f"FROM {self.CASUALTY_BRONZE}"
         )
         self._log_orphans(con, self.CASUALTY_SILVER, self.CASUALTY_SID, self.CASUALTY_LINK_RULE)
+        # CORE severity ledger: one row per casualty_severity_valid = FALSE (Stage 07).
+        self._log_missing_codes(con, self.CASUALTY_SILVER, self.CASUALTY_SID,
+                                "casualty_severity", self.CASUALTY_SEVERITY_RULE)
 
     def _log_orphans(self, con, silver_table, source_id, rule_id):
         """Write one reject_dimension ledger row per link_valid = FALSE row in
@@ -509,14 +587,17 @@ class Stats19Transformer(BaseTransformer):
             )
 
     def quality_spec(self):
-        # Three audit units. Collision declares its geom/datetime dimensions
-        # (Stage 02); vehicle/casualty declare their link dimension (Stage 03).
+        # Three audit units. Collision declares geom/datetime (Stage 02) + severity
+        # (Stage 07); vehicle declares link (Stage 03); casualty declares link (Stage 03)
+        # + severity (Stage 07). Vehicle has no severity field, so it is unchanged.
         return (
             SourceQuality(
                 self.COLLISION_SID, self.COLLISION_BRONZE, self.COLLISION_SILVER,
                 dimensions=(
                     Dimension("geom", "geom_valid", (self.COORD_RULE,)),
                     Dimension("datetime", "datetime_valid", (self.DATETIME_RULE,)),
+                    Dimension("severity", "collision_severity_valid",
+                              (self.COLLISION_SEVERITY_RULE,)),
                 ),
                 key_column="source_row_key"),
             SourceQuality(
@@ -525,6 +606,10 @@ class Stats19Transformer(BaseTransformer):
                 key_column="source_row_key"),
             SourceQuality(
                 self.CASUALTY_SID, self.CASUALTY_BRONZE, self.CASUALTY_SILVER,
-                dimensions=(Dimension("link", "link_valid", (self.CASUALTY_LINK_RULE,)),),
+                dimensions=(
+                    Dimension("link", "link_valid", (self.CASUALTY_LINK_RULE,)),
+                    Dimension("severity", "casualty_severity_valid",
+                              (self.CASUALTY_SEVERITY_RULE,)),
+                ),
                 key_column="source_row_key"),
         )

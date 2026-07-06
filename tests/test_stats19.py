@@ -551,3 +551,144 @@ def test_all_silver_tables_full_width(tmp_path):
     assert client.con.execute("SELECT count(*) FROM collisions WHERE geom_valid = FALSE").fetchone()[0] == 0
     assert client.con.execute("SELECT count(*) FROM collisions_spatial").fetchone()[0] > 0
     client.close()
+
+
+# --- Stage 07: core severity audit (collision_severity + casualty_severity) -----
+
+def test_collision_severity_core_audit(con):
+    """collision_severity is promoted to the formal audit: a raw twin, a cleaned INTEGER
+    (missing set -> NULL), a valid flag, and one ledger row per FALSE. The stub codebook
+    injects -1/9 missing codes to exercise the FALSE branch (a mechanism test — the real
+    guide lists no sentinel for severity)."""
+    from crossroads.quality import ensure_quality_tables
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('collision_severity','1','Fatal',FALSE),('collision_severity','2','Serious',FALSE),"
+        "  ('collision_severity','3','Slight',FALSE),('collision_severity','-1','Data missing or out of range',TRUE),"
+        "  ('collision_severity','9','Unknown',TRUE)) AS t(variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('collision','collision_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
+    con.execute("CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
+        "  ('c1','2023','r1','530000','180000','05/01/2023','08:30','2'),"
+        "  ('c2','2023','r2','531000','181000','06/01/2023','09:00','-1'),"
+        "  ('c3','2023','r3','532000','182000','07/01/2023','10:00','9'),"
+        "  ('c4','2023','r4','533000','183000','08/01/2023','11:00','x')"
+        ") AS t(accident_index,accident_year,accident_reference,location_easting_osgr,"
+        "location_northing_osgr,date,time,collision_severity)")
+    t = Stats19Transformer(); t._derive_collision_silver(con)
+    rows = {r[0]: r for r in con.execute(
+        "SELECT accident_index, collision_severity, collision_severity_valid, collision_severity_raw "
+        "FROM collisions").fetchall()}
+    assert rows["c1"][1:] == (2, True, "2")
+    assert rows["c2"][1:] == (None, False, "-1")
+    assert rows["c3"][1:] == (None, False, "9")
+    assert rows["c4"][1:] == (None, False, "x")
+    assert con.execute("SELECT count(*) FROM collisions").fetchone()[0] == 4   # keep-in-place
+    ledger = con.execute("SELECT source_row_key, rule_id FROM data_quality_log "
+        "WHERE rule_id='stats19.collision_severity.missing' ORDER BY source_row_key").fetchall()
+    assert ledger == [("c2", "stats19.collision_severity.missing"),
+                      ("c3", "stats19.collision_severity.missing"),
+                      ("c4", "stats19.collision_severity.missing")]
+    dt = {r[0]: r[1] for r in con.execute("DESCRIBE collisions").fetchall()}
+    assert dt["collision_severity"] == "INTEGER" and dt["collision_severity_raw"] == "VARCHAR"
+    assert dt["collision_severity_valid"] == "BOOLEAN"
+
+
+def test_collision_severity_guards_bare_minus_one_without_codebook(con):
+    """Regression pin: the codebook lists ONLY the real severity codes (1/2/3, no -1 row,
+    matching the real 2024 guide). A raw -1 must still clean to NULL + valid = FALSE + a
+    ledger row via the bare -1 guard, NOT via the codebook. Fails iff the guard is removed."""
+    from crossroads.quality import ensure_quality_tables
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('collision_severity','1','Fatal',FALSE),('collision_severity','2','Serious',FALSE),"
+        "  ('collision_severity','3','Slight',FALSE)) AS t(variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('collision','collision_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
+    con.execute("CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
+        "  ('c1','2023','r1','530000','180000','05/01/2023','08:30','2'),"
+        "  ('c2','2023','r2','531000','181000','06/01/2023','09:00','-1')"
+        ") AS t(accident_index,accident_year,accident_reference,location_easting_osgr,"
+        "location_northing_osgr,date,time,collision_severity)")
+    t = Stats19Transformer(); t._derive_collision_silver(con)
+    rows = {r[0]: r for r in con.execute(
+        "SELECT accident_index, collision_severity, collision_severity_valid, collision_severity_raw "
+        "FROM collisions").fetchall()}
+    assert rows["c1"][1:] == (2, True, "2")
+    assert rows["c2"][1:] == (None, False, "-1")   # nulled by the -1 guard, NOT the codebook
+    ledger = con.execute("SELECT source_row_key FROM data_quality_log "
+        "WHERE rule_id='stats19.collision_severity.missing'").fetchall()
+    assert ledger == [("c2",)]
+
+
+def test_collision_severity_reads_legacy_accident_severity(con):
+    """A pre-2024 tranche names the column accident_severity; the CORE clean coalesces the
+    aliases so it still populates the canonical collision_severity."""
+    from crossroads.quality import ensure_quality_tables
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('collision_severity','1','Fatal',FALSE),('collision_severity','2','Serious',FALSE),"
+        "  ('collision_severity','3','Slight',FALSE)) AS t(variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('collision','collision_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
+    # Bronze carries accident_severity (legacy name), NOT collision_severity.
+    con.execute("CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
+        "  ('c1','2023','r1','530000','180000','05/01/2023','08:30','2')"
+        ") AS t(accident_index,accident_year,accident_reference,location_easting_osgr,"
+        "location_northing_osgr,date,time,accident_severity)")
+    t = Stats19Transformer(); t._derive_collision_silver(con)
+    row = con.execute(
+        "SELECT collision_severity, collision_severity_valid, collision_severity_raw "
+        "FROM collisions").fetchone()
+    assert row == (2, True, "2")   # legacy accident_severity coalesced into collision_severity
+
+
+def test_casualty_severity_core_audit(con):
+    """Mirror of the collision audit for casualty_severity, driven against a collisions
+    stub. The stub codebook injects a -1 missing code to exercise the FALSE branch."""
+    from crossroads.quality import ensure_quality_tables
+    ensure_quality_tables(con)
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('casualty_severity','1','Fatal',FALSE),('casualty_severity','2','Serious',FALSE),"
+        "  ('casualty_severity','3','Slight',FALSE),('casualty_severity','-1','Data missing or out of range',TRUE)"
+        ") AS t(variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('casualty','casualty_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
+    con.execute("CREATE TABLE collisions AS SELECT * FROM (VALUES ('x1')) AS t(accident_index)")
+    con.execute("CREATE TABLE stats19_casualty_raw AS SELECT * FROM (VALUES "
+        "  ('x1','1','1','2'),"      # valid severity, linked
+        "  ('x1','1','2','-1'),"     # -1 -> NULL, valid FALSE
+        "  ('x1','2','1','x')"       # non-numeric -> NULL, valid FALSE
+        ") AS t(accident_index,vehicle_reference,casualty_reference,casualty_severity)")
+    t = Stats19Transformer(); t._derive_casualty_silver(con)
+    rows = {r[0]: r for r in con.execute(
+        "SELECT source_row_key, casualty_severity, casualty_severity_valid, casualty_severity_raw "
+        "FROM casualties").fetchall()}
+    assert rows["x1|1|1"][1:] == (2, True, "2")
+    assert rows["x1|1|2"][1:] == (None, False, "-1")
+    assert rows["x1|2|1"][1:] == (None, False, "x")
+    assert con.execute("SELECT count(*) FROM casualties").fetchone()[0] == 3   # keep-in-place
+    ledger = con.execute("SELECT source_row_key FROM data_quality_log "
+        "WHERE rule_id='stats19.casualty_severity.missing' ORDER BY source_row_key").fetchall()
+    assert ledger == [("x1|1|2",), ("x1|2|1",)]
+    dt = {r[0]: r[1] for r in con.execute("DESCRIBE casualties").fetchall()}
+    assert dt["casualty_severity"] == "INTEGER" and dt["casualty_severity_raw"] == "VARCHAR"
+    assert dt["casualty_severity_valid"] == "BOOLEAN"
+
+
+def test_severities_audited_end_to_end(tmp_path):
+    """Over the real sample: both severities carry raw/clean/valid columns of the right
+    types, every row is valid (severity is mandatory), and no raw -1 survives as a code."""
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)          # runs all invariants; raises on failure
+    for tbl, col in (("collisions", "collision_severity"), ("casualties", "casualty_severity")):
+        dt = {r[0]: r[1] for r in client.con.execute(f"DESCRIBE {tbl}").fetchall()}
+        assert dt[col] == "INTEGER" and dt[f"{col}_raw"] == "VARCHAR" and dt[f"{col}_valid"] == "BOOLEAN"
+        assert client.con.execute(
+            f"SELECT count(*) FROM {tbl} WHERE {col}_valid = FALSE").fetchone()[0] == 0
+        assert client.con.execute(
+            f"SELECT count(*) FROM {tbl} WHERE {col} = -1").fetchone()[0] == 0
+    client.close()
