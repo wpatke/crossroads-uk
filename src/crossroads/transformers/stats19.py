@@ -77,6 +77,9 @@ class Stats19Transformer(BaseTransformer):
     CODEBOOK_TABLE = "codebook"
     COLUMN_MANIFEST_TABLE = "column_manifest"
 
+    # --- completeness report (stats19-owned report table, not an audited source) ---
+    COMPLETENESS_TABLE = "stats19_completeness"
+
     # --- ledger rules for the collision dimensions (also referenced by quality_spec) ---
     COORD_RULE = "stats19.coord.sentinel"
     DATETIME_RULE = "stats19.datetime.invalid"
@@ -309,6 +312,49 @@ class Stats19Transformer(BaseTransformer):
                 rule_desc="severity code is a missing/unknown sentinel or unparseable",
                 severity="reject_dimension", raw_value=str(raw))
 
+    # --- completeness report (broad "how complete is column X?" per cleaned column) ---
+    def _ensure_completeness_table(self, con):
+        """Create the completeness report table if absent (idempotent). stats19-owned
+        report table, NOT an audited source. One row per cleaned column per source.
+        missing_rate is n_missing/n_total (0..1)."""
+        con.execute(
+            f"CREATE TABLE IF NOT EXISTS {self.COMPLETENESS_TABLE} ("
+            f"  source_id VARCHAR, column_name VARCHAR, kind VARCHAR, "
+            f"  n_total BIGINT, n_present BIGINT, n_missing BIGINT, missing_rate DOUBLE)")
+
+    def _write_completeness(self, con, silver_table, source_id, table_kind):
+        """Write one completeness row per cleaned column (kind coded|numeric) of one file.
+
+        A cleaned coded/numeric column is NULL exactly for its missing/unparseable values,
+        so count(col) (which ignores NULL) is the present count and count(*) - count(col)
+        is the missing count. Reads column_manifest for the cleaned columns present in the
+        silver table, runs a SINGLE aggregate scan (count(*) + count(col) per column), then
+        a bounded Python loop inserts ~one row per column. Idempotent per source: existing
+        rows for this source_id are cleared first. Column identifiers come from the trusted
+        manifest (interpolated); counts/values are bound with ?."""
+        silver_cols = self._bronze_columns(con, silver_table)   # reuse the info_schema helper
+        cols = [(c, k) for c, k in con.execute(
+            f"SELECT col, kind FROM {self.COLUMN_MANIFEST_TABLE} "
+            f"WHERE tbl = ? AND kind IN ('coded','numeric') ORDER BY col", [table_kind]).fetchall()
+            if c.lower() in silver_cols]
+        con.execute(f"DELETE FROM {self.COMPLETENESS_TABLE} WHERE source_id = ?", [source_id])
+        if not cols:
+            return
+        # One scan: total row count plus a NULL-ignoring count per cleaned column.
+        selects = ["count(*) AS n_total"] + [f"count({c}) AS present_{i}"
+                                             for i, (c, _) in enumerate(cols)]
+        agg = con.execute(f"SELECT {', '.join(selects)} FROM {silver_table}").fetchone()
+        n_total = agg[0]
+        for i, (col, kind) in enumerate(cols):
+            n_present = agg[i + 1]
+            n_missing = n_total - n_present
+            rate = (n_missing / n_total) if n_total else 0.0
+            con.execute(
+                f"INSERT INTO {self.COMPLETENESS_TABLE} "
+                f"(source_id, column_name, kind, n_total, n_present, n_missing, missing_rate) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [source_id, col, kind, n_total, n_present, n_missing, rate])
+
     def transform_and_load(self, con, cache_dir):
         years = getattr(self, "_years", None) or []
         if not years:
@@ -334,6 +380,16 @@ class Stats19Transformer(BaseTransformer):
         self._derive_collision_silver(con)
         self._derive_vehicle_silver(con)
         self._derive_casualty_silver(con)
+
+        # --- COMPLETENESS: one queryable row per cleaned column per source. Rigour lives in
+        # the formal dimensions; this is the broad "how complete is column X?" report. ---
+        self._ensure_completeness_table(con)
+        for silver, sid, kind in (
+            (self.COLLISION_SILVER, self.COLLISION_SID, "collision"),
+            (self.VEHICLE_SILVER,   self.VEHICLE_SID,   "vehicle"),
+            (self.CASUALTY_SILVER,  self.CASUALTY_SID,  "casualty"),
+        ):
+            self._write_completeness(con, silver, sid, kind)
 
         # --- GOLD: valid-link projections (spec §9 clean views). ---
         create_clean_view(con, "vehicles_clean", self.VEHICLE_SILVER, ["link_valid"])

@@ -692,3 +692,62 @@ def test_severities_audited_end_to_end(tmp_path):
         assert client.con.execute(
             f"SELECT count(*) FROM {tbl} WHERE {col} = -1").fetchone()[0] == 0
     client.close()
+
+
+def test_completeness_counts(con):
+    """Counts are correct on synthetic silver: present = count(col), missing = the rest,
+    text columns are not reported, and missing_rate is the missing fraction."""
+    t = Stats19Transformer()
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('casualty','casualty_severity','coded','INTEGER'),"
+        "  ('casualty','age_of_casualty','numeric','INTEGER'),"
+        "  ('casualty','lsoa_of_casualty','text','')) AS t(tbl,col,kind,dtype)")   # text -> NOT reported
+    con.execute("CREATE TABLE casualties AS SELECT * FROM (VALUES "
+        "  (2,    34,   'E01'),(3, NULL, 'E02'),(NULL, NULL, 'E03')"
+        ") AS t(casualty_severity, age_of_casualty, lsoa_of_casualty)")
+    t._ensure_completeness_table(con)
+    t._write_completeness(con, "casualties", "stats19_casualty", "casualty")
+    rows = {r[0]: r[1:] for r in con.execute(
+        "SELECT column_name, kind, n_total, n_present, n_missing, missing_rate "
+        "FROM stats19_completeness WHERE source_id='stats19_casualty' ORDER BY column_name").fetchall()}
+    assert rows["casualty_severity"] == ("coded", 3, 2, 1, 1/3)
+    assert rows["age_of_casualty"]   == ("numeric", 3, 1, 2, 2/3)
+    assert "lsoa_of_casualty" not in rows        # text columns are not reported
+
+
+def test_completeness_idempotent(con):
+    """Re-running the writer for one source clears its prior rows first (no doubling)."""
+    t = Stats19Transformer()
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('casualty','casualty_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
+    con.execute("CREATE TABLE casualties AS SELECT * FROM (VALUES (2)) AS t(casualty_severity)")
+    t._ensure_completeness_table(con)
+    t._write_completeness(con, "casualties", "stats19_casualty", "casualty")
+    t._write_completeness(con, "casualties", "stats19_casualty", "casualty")
+    assert con.execute("SELECT count(*) FROM stats19_completeness "
+                       "WHERE source_id='stats19_casualty'").fetchone()[0] == 1
+
+
+def test_completeness_report_end_to_end(tmp_path):
+    """Over the real sample: one row per cleaned coded/numeric column per source (count
+    derived from the manifest so it self-corrects), every rate in [0,1]."""
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)
+    for sid, kind in (("stats19_collision","collision"),("stats19_vehicle","vehicle"),
+                      ("stats19_casualty","casualty")):
+        expected = client.con.execute(
+            "SELECT count(*) FROM column_manifest WHERE tbl=? AND kind IN ('coded','numeric')",
+            [kind]).fetchone()[0]
+        got = client.con.execute(
+            "SELECT count(*) FROM stats19_completeness WHERE source_id=?", [sid]).fetchone()[0]
+        assert got == expected and got > 0, f"{sid}: {got} rows, expected {expected}"
+    assert client.con.execute(
+        "SELECT count(*) FROM stats19_completeness WHERE missing_rate < 0 OR missing_rate > 1").fetchone()[0] == 0
+    # Fixture-coupled: this holds only because the committed casualty sample has no missing
+    # casualty_severity. If that fixture is ever edited to include a missing severity (e.g. to
+    # exercise the Stage 07 ledger), update this expectation — the rate is not a bug then.
+    sev = client.con.execute(
+        "SELECT missing_rate FROM stats19_completeness "
+        "WHERE source_id='stats19_casualty' AND column_name='casualty_severity'").fetchone()[0]
+    assert sev == 0.0        # mandatory field, clean sample
+    client.close()
