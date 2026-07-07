@@ -5,6 +5,8 @@ files and performs no network download.
 """
 import os
 import shutil
+import urllib.request
+import urllib.error
 
 import pytest
 import crossroads
@@ -244,6 +246,79 @@ def test_download_real_dft_sample(tmp_path):
     t.extract(cache, years=[2023])
     assert os.path.exists(os.path.join(
         cache, "dft-road-casualty-statistics-collision-2023.csv"))
+
+
+# --- fetch hardening (offline: the downloader is monkeypatched, no network) ---
+
+def test_looks_like_stats19_csv_recognises_both_headers(tmp_path):
+    """Unit: the header sniff accepts historical + modern headers, rejects HTML."""
+    t = Stats19Transformer()
+    historical = tmp_path / "hist.csv"
+    historical.write_text("accident_index,accident_year\n123,2019\n")
+    modern = tmp_path / "modern.csv"
+    modern.write_text("collision_index,collision_year\n123,2023\n")
+    html = tmp_path / "bad.html"
+    html.write_text("<!DOCTYPE html><html><body>Not found</body></html>")
+    assert t._looks_like_stats19_csv(str(historical)) is True
+    assert t._looks_like_stats19_csv(str(modern)) is True
+    assert t._looks_like_stats19_csv(str(html)) is False
+
+
+def test_fetch_missing_year_raises_friendly_error(tmp_path, monkeypatch):
+    """A 404 (unpublished year) -> ValueError, and nothing is cached."""
+    cache = str(tmp_path / "cache")
+
+    def fake_urlretrieve(url, filename):
+        # Simulate DfT returning 404 for a not-yet-published year.
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+    t = Stats19Transformer()
+    with pytest.raises(ValueError) as exc:
+        t.extract(cache, years=[2999])
+    msg = str(exc.value)
+    assert "404" in msg and "earlier year" in msg
+    # Clean cache: no partial (.part) and no final (.csv) files left behind.
+    assert os.listdir(cache) == []
+
+
+def test_fetch_html_error_page_is_rejected(tmp_path, monkeypatch):
+    """A 200-OK response whose body is an HTML error page -> ValueError, nothing cached."""
+    cache = str(tmp_path / "cache")
+
+    def fake_urlretrieve(url, filename):
+        # Simulate a server that answers a missing file with 200 OK + an HTML page.
+        with open(filename, "w") as f:
+            f.write("<!DOCTYPE html><html><body>File not found</body></html>")
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+    t = Stats19Transformer()
+    with pytest.raises(ValueError) as exc:
+        t.extract(cache, years=[2999])
+    assert "not a STATS19 CSV" in str(exc.value)
+    assert os.listdir(cache) == []   # .part removed, nothing promoted to the cache
+
+
+def test_fetch_valid_csv_is_cached_atomically(tmp_path, monkeypatch):
+    """A valid STATS19 CSV lands at its final path with no leftover .part file."""
+    cache = str(tmp_path / "cache")
+
+    def fake_urlretrieve(url, filename):
+        # A minimal but valid-looking STATS19 CSV (header names the index column).
+        with open(filename, "w") as f:
+            f.write("collision_index,collision_year,collision_severity\n"
+                    "2999010000001,2999,3\n")
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+    t = Stats19Transformer()
+    t.extract(cache, years=[2999])   # loops collision/vehicle/casualty -> three files
+    files = sorted(os.listdir(cache))
+    assert files == [
+        "dft-road-casualty-statistics-casualty-2999.csv",
+        "dft-road-casualty-statistics-collision-2999.csv",
+        "dft-road-casualty-statistics-vehicle-2999.csv",
+    ]
+    assert not any(f.endswith(".part") for f in files), "no temporary .part file should remain"
 
 
 # --- Stage 04: spatial join -------------------------------------------------

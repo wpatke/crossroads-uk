@@ -15,6 +15,7 @@ committed sample CSVs, so no network access occurs.
 
 import os
 import urllib.request
+import urllib.error
 import warnings
 
 from crossroads.transformers.base import BaseTransformer
@@ -100,6 +101,50 @@ class Stats19Transformer(BaseTransformer):
     def _filename(self, ftype, year):
         return _FILE_TEMPLATE.format(ftype=ftype, year=year)
 
+    def _looks_like_stats19_csv(self, path):
+        """Cheap content check: a real STATS19 file's header row names the index column.
+
+        Catches a 200-OK HTML error page, a truncated download, or a login redirect that a
+        status-code check alone would miss. Historical files use 'accident_index'; 2020+
+        files use 'collision_index' -- accept either. This is a smoke detector, not full
+        schema validation (read_csv + the row-conservation invariants are the deeper check).
+        """
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            first = f.readline().lstrip("﻿").lower()   # lstrip tolerates a UTF-8 BOM
+        return "accident_index" in first or "collision_index" in first
+
+    def _fetch(self, url, dest):
+        """Download `url` to `dest` safely, then validate before it reaches the cache.
+
+        Fetch to a temporary sibling ('<dest>.part'), confirm it looks like a STATS19 CSV,
+        then atomically move it into place. A missing year (HTTP 404) or any other HTTP error
+        becomes a researcher-friendly ValueError; a non-CSV body (e.g. an error page returned
+        as 200 OK) is rejected. In every failure case the partial file is removed, so a bad
+        response can never poison the cache for a later run (extract() skips re-downloading
+        any file that already exists).
+        """
+        tmp = dest + ".part"
+        try:
+            urllib.request.urlretrieve(url, tmp)
+        except urllib.error.HTTPError as exc:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            if exc.code == 404:
+                raise ValueError(
+                    f"No STATS19 data found at {url} (HTTP 404). DfT usually publishes a "
+                    f"year's data partway through the following year, so this year may not "
+                    f"be available yet -- try an earlier year."
+                ) from exc
+            raise ValueError(f"Failed to download {url} (HTTP {exc.code}).") from exc
+        # Validate the bytes we actually got, not just the HTTP status.
+        if not self._looks_like_stats19_csv(tmp):
+            os.remove(tmp)
+            raise ValueError(
+                f"Downloaded file from {url} is not a STATS19 CSV (the server may have "
+                f"returned an error page instead of data). Nothing was cached."
+            )
+        os.replace(tmp, dest)   # atomic within the same directory; cache holds only valid files
+
     def extract(self, cache_dir, **kwargs):
         os.makedirs(cache_dir, exist_ok=True)
         self._years = [int(y) for y in (kwargs.get("years") or [])]
@@ -110,7 +155,7 @@ class Stats19Transformer(BaseTransformer):
                 # Offline-friendly: if already cached (or test-seeded), skip download.
                 if not os.path.exists(path):
                     url = f"{DFT_BASE_URL}/{self._filename(ftype, year)}"
-                    urllib.request.urlretrieve(url, path)
+                    self._fetch(url, path)   # validates + atomic-moves; raises ValueError if unavailable
 
     def _cached_files(self, cache_dir, ftype):
         """Cached CSV paths for one file type across the resolved years (existing only)."""
