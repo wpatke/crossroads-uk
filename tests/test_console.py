@@ -4,7 +4,17 @@ Fast, offline, deterministic. A scripted-I/O harness replaces stdin/stdout so no
 real input/print or network is involved: `reader` replays a list of answers and
 `writer` collects the emitted lines.
 """
+import importlib.metadata as md
+import os
+import shutil
+
+import pytest
+
 from crossroads import console
+from crossroads.transformers.spatial import LADBoundaryTransformer, CTYUABoundaryTransformer
+
+STATS19_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "stats19")
+ONS_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "ons")
 
 
 def scripted(answers):
@@ -91,3 +101,100 @@ def test_boundary_mode_numeric_and_case():
 def test_database_path_allows_memory():
     reader, writer, _ = scripted([":memory:"])
     assert console.prompt_database_path(reader, writer) == ":memory:"
+
+
+# --- Stage 02: build wiring, orchestration, and the entry point -------------
+
+
+class _FakeClient:
+    """Recording fake so functional tests can prove the exact build invocation
+    without doing any real work (no engine, no network)."""
+    def __init__(self, **kwargs):
+        self.init_kwargs = kwargs
+        self.build_kwargs = None
+        self.closed = False
+
+    def build(self, **kwargs):
+        self.build_kwargs = kwargs
+        return self
+
+    def close(self):
+        self.closed = True
+
+
+def test_wizard_produces_correct_build_invocation():
+    reader, writer, _ = scripted(["mydb.duckdb", "2022 2023", "temporal", "y"])
+    captured = {}
+    def factory(**kwargs):
+        client = _FakeClient(**kwargs)
+        captured["client"] = client
+        return client
+    result = console.run_wizard(reader, writer, engine_factory=factory)
+    assert result is captured["client"]
+    assert captured["client"].init_kwargs == {"database_path": "mydb.duckdb"}
+    assert captured["client"].build_kwargs == {"years": [2022, 2023],
+                                               "boundary_mode": "temporal"}
+
+
+def test_decline_does_not_build():
+    reader, writer, output = scripted([":memory:", "2023", "snapshot", "n"])
+    calls = []
+    def factory(**kwargs):
+        calls.append(kwargs); return _FakeClient(**kwargs)
+    result = console.run_wizard(reader, writer, engine_factory=factory)
+    assert result is None
+    assert calls == []            # build path never entered
+    assert any("Aborted" in line for line in output)
+
+
+def test_main_abort_path_returns_zero(monkeypatch, capsys):
+    # Exercise the real entry point offline. Declining means no build, no network.
+    answers = iter([":memory:", "2023", "snapshot", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    assert console.main() == 0
+    assert "Aborted" in capsys.readouterr().out
+
+
+def _seed_full_cache(cache_dir):
+    """Seed the cache with committed STATS19 + ONS fixtures so a real build runs
+    offline. Mirrors tests/test_stats19.py's _seed_cache / _seed_ons_cache."""
+    os.makedirs(cache_dir, exist_ok=True)
+    # STATS19 CSVs (2023 sample).
+    for ftype in ("collision", "vehicle", "casualty"):
+        name = f"dft-road-casualty-statistics-{ftype}-2023.csv"
+        shutil.copy(os.path.join(STATS19_FIXTURES, name), os.path.join(cache_dir, name))
+    # ONS boundary GeoJSON, copied to the filename each newest vintage expects.
+    for prefix, cls in (("lad", LADBoundaryTransformer), ("ctyua", CTYUABoundaryTransformer)):
+        newest = cls().vintages[-1]
+        year = newest.valid_from[:4]
+        src = os.path.join(ONS_FIXTURES, f"{prefix}_{year}", f"{prefix}_sample.geojson")
+        shutil.copy(src, os.path.join(cache_dir, newest.source_file))
+
+
+@pytest.mark.integration
+def test_wizard_builds_populated_database_offline(tmp_path):
+    cache = str(tmp_path / "cache")
+    _seed_full_cache(cache)
+    db_path = str(tmp_path / "wizard.duckdb")
+    # Scripted answers: db path, one year (matches the fixture), snapshot, confirm.
+    reader, writer, _ = scripted([db_path, "2023", "snapshot", "y"])
+    client = console.run_wizard(reader, writer, cache_dir=cache)  # real init_engine
+    try:
+        assert client is not None
+        assert os.path.exists(db_path)                            # file written
+        n = client.con.execute("SELECT count(*) FROM collisions").fetchone()[0]
+        assert n > 0                                              # silver populated
+        # gold view exists and is queryable
+        client.con.execute("SELECT count(*) FROM collisions_spatial").fetchone()
+    finally:
+        client.close()
+
+
+def test_console_script_registered():
+    # Tolerate a not-yet-reinstalled package: skip rather than fail so a fresh
+    # checkout stays green until `pip install -e .` registers the script.
+    scripts = md.entry_points(group="console_scripts")
+    match = [e for e in scripts if e.name == "crossroads"]
+    if not match:
+        pytest.skip("run `pip install -e .` to register the console script")
+    assert match[0].value == "crossroads.console:main"

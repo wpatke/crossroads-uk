@@ -121,3 +121,91 @@ def gather_parameters(reader, writer):
         "years": prompt_years(reader, writer),
         "boundary_mode": prompt_boundary_mode(reader, writer),
     }
+
+
+# --- Stage 02: confirmation, build wiring, and the entry point --------------
+
+
+def _parse_yes_no(raw):
+    value = raw.strip().lower()
+    if value in ("y", "yes"):
+        return True
+    if value in ("n", "no"):
+        return False
+    raise ValueError("answer 'y' or 'n'")
+
+
+def prompt_confirm(reader, writer, *, default=True):
+    """Ask the user to confirm before the (possibly long) build runs."""
+    # Show which answer an empty line selects: "Y/n" means yes is the default.
+    shown = "Y/n" if default else "y/N"
+    return _prompt(reader, writer, f"Proceed with the build? ({shown})",
+                   parse=_parse_yes_no, default=("y" if default else "n"))
+
+
+def format_summary(params):
+    """Human-readable recap of the gathered parameters, shown before confirmation."""
+    years = ", ".join(str(y) for y in params["years"])
+    return (
+        "\nBuild summary:\n"
+        f"  Database file : {params['database_path']}\n"
+        f"  Years         : {years}\n"
+        f"  Boundary mode : {params['boundary_mode']}\n"
+    )
+
+
+def run_build(params, *, engine_factory=init_engine, cache_dir=None, writer=None):
+    """Open the engine and run the build for the gathered parameters.
+
+    ``engine_factory`` defaults to ``crossroads.init_engine`` and is injectable so
+    tests can (a) record the exact call without doing work, or (b) point a real
+    build at a fixture-seeded ``cache_dir`` and run offline. Returns the Client.
+    """
+    # No-op writer when the caller doesn't supply one (e.g. a test recording calls).
+    say = writer or (lambda _line: None)
+    # cache_dir is threaded through only when the caller overrides it (tests);
+    # production leaves it None so init_engine uses its default cache location.
+    engine_kwargs = {"database_path": params["database_path"]}
+    if cache_dir is not None:
+        engine_kwargs["cache_dir"] = cache_dir
+
+    client = engine_factory(**engine_kwargs)
+    say("\nBuilding database — this may take a while for large year ranges...")
+    client.build(years=params["years"], boundary_mode=params["boundary_mode"])
+    say(f"Done. Database written to {params['database_path']}")
+    return client
+
+
+def run_wizard(reader, writer, *, engine_factory=init_engine, cache_dir=None):
+    """Drive the full wizard. Returns the built Client, or None if the user declined.
+
+    All I/O is injected so this is fully testable with scripted input.
+    """
+    params = gather_parameters(reader, writer)
+    writer(format_summary(params))
+    if not prompt_confirm(reader, writer, default=True):
+        writer("Aborted — no database was built.")
+        return None
+    return run_build(params, engine_factory=engine_factory,
+                     cache_dir=cache_dir, writer=writer)
+
+
+def main(argv=None):
+    """Console entry point. Wires stdin/stdout, returns a process exit code.
+
+    ``argv`` is accepted for signature stability but currently unused (the wizard
+    takes all parameters interactively). Ctrl-C / EOF abort cleanly without a
+    traceback.
+    """
+    reader = lambda: input()   # prompt text is emitted via writer, so input() gets no prompt
+    writer = print
+    try:
+        client = run_wizard(reader, writer)
+    except (KeyboardInterrupt, EOFError):
+        writer("\nCancelled.")
+        return 130   # conventional exit code for SIGINT
+    # Close the client so DuckDB releases the file handle (build already wrote it).
+    # On the decline/abort path client is None, so there is nothing to close.
+    if client is not None:
+        client.close()
+    return 0

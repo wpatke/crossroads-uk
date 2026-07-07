@@ -29,6 +29,9 @@ dev = [
   "pytest>=7.0",
 ]
 
+[project.scripts]
+crossroads = "crossroads.console:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/crossroads"]
 
