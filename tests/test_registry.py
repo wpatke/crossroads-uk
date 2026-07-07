@@ -50,6 +50,26 @@ def test_default_registry_discovers_at_least_one_transformer():
     assert len(registry.get_active()) >= 1
 
 
+def test_selectable_excludes_spatial_infrastructure():
+    ids = {t.source_id for t in Registry().selectable()}
+    assert "stats19" in ids
+    assert "ons_lad" not in ids and "ons_ctyua" not in ids
+
+
+def test_get_active_dataset_selection_gate():
+    reg = Registry()
+    # Explicit selection: stats19 chosen -> runs; spatial always runs.
+    chosen = {t.source_id for t in reg.get_active(years=[2023], datasets=["stats19"])}
+    assert {"stats19", "ons_lad", "ons_ctyua"} <= chosen
+    # Empty selection: stats19 dropped; spatial still runs.
+    none_chosen = {t.source_id for t in reg.get_active(years=[2023], datasets=[])}
+    assert "stats19" not in none_chosen
+    assert {"ons_lad", "ons_ctyua"} <= none_chosen
+    # No datasets kwarg: backward-compatible pass-through (all active as before).
+    legacy = {t.source_id for t in reg.get_active(years=[2023])}
+    assert {"stats19", "ons_lad", "ons_ctyua"} <= legacy
+
+
 def test_discovers_a_concrete_transformer(make_transformer_package):
     pkg = make_transformer_package(
         "mockpkg_discovery",

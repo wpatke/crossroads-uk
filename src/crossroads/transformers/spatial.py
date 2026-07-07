@@ -107,6 +107,11 @@ class _BoundaryTransformer(BaseTransformer):
     does NOT discover it directly — only the concrete subclasses are discovered.
     """
 
+    # Spatial boundaries are always-on infrastructure that other datasets join
+    # against — never a dataset the researcher selects on its own. Keep them out of
+    # the wizard menu and always active regardless of the user's dataset picks.
+    user_selectable = False
+
     # --- identity, supplied by concrete subclasses ---
     @property
     @abstractmethod

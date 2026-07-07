@@ -28,21 +28,28 @@ def scripted(answers):
     return reader, writer, output
 
 
+# A fixed one-dataset menu so the full-flow tests don't depend on live discovery.
+MENU = [("stats19", "stats19")]
+
+
 def test_gather_parameters_happy_path():
-    reader, writer, _ = scripted(["mydb.duckdb", "2021 2022", "temporal"])
-    params = console.gather_parameters(reader, writer)
+    # Answers: db path, datasets (menu index), years, boundary mode.
+    reader, writer, _ = scripted(["mydb.duckdb", "1", "2021 2022", "temporal"])
+    params = console.gather_parameters(reader, writer, available=MENU)
     assert params == {
         "database_path": "mydb.duckdb",
+        "datasets": ["stats19"],
         "years": [2021, 2022],
         "boundary_mode": "temporal",
     }
 
 
 def test_defaults_via_empty_lines():
-    # Blank lines fall back to defaults, except years (no default) which is answered.
-    reader, writer, _ = scripted(["", "2023", ""])
-    params = console.gather_parameters(reader, writer)
+    # Blank lines fall back to defaults, except datasets/years (no default) which are answered.
+    reader, writer, _ = scripted(["", "1", "2023", ""])
+    params = console.gather_parameters(reader, writer, available=MENU)
     assert params["database_path"] == "crossroads.db"
+    assert params["datasets"] == ["stats19"]
     assert params["years"] == [2023]
     assert params["boundary_mode"] == "snapshot"
 
@@ -103,6 +110,60 @@ def test_database_path_allows_memory():
     assert console.prompt_database_path(reader, writer) == ":memory:"
 
 
+# --- Dataset selection prompt ------------------------------------------------
+
+
+def test_prompt_datasets_single_selection():
+    reader, writer, output = scripted(["1"])
+    result = console.prompt_datasets(reader, writer, [("stats19", "stats19")])
+    assert result == ["stats19"]
+    assert any("1. stats19" in line for line in output)   # menu was shown
+
+
+def test_prompt_datasets_uses_display_name():
+    reader, writer, output = scripted(["1"])
+    console.prompt_datasets(reader, writer, [("era5_weather", "weather")])
+    assert any("1. weather" in line for line in output)   # friendly label, not source_id
+
+
+def test_prompt_datasets_range_and_list_dedup_sort():
+    menu = [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")]
+    reader, writer, _ = scripted(["1-3, 4"])
+    assert console.prompt_datasets(reader, writer, menu) == ["a", "b", "c", "d"]
+    # Overlapping selections collapse.
+    reader, writer, _ = scripted(["2-3 3-4"])
+    assert console.prompt_datasets(reader, writer, menu) == ["b", "c", "d"]
+
+
+def test_prompt_datasets_rejects_out_of_range_then_accepts():
+    reader, writer, output = scripted(["9", "1"])   # 9 > count(1), re-ask, then valid
+    result = console.prompt_datasets(reader, writer, [("stats19", "stats19")])
+    assert result == ["stats19"]
+    assert sum("Invalid input" in line for line in output) == 1
+
+
+def test_prompt_datasets_rejects_backwards_range():
+    menu = [("a", "A"), ("b", "B"), ("c", "C")]
+    reader, writer, output = scripted(["3-1", "1-2"])
+    assert console.prompt_datasets(reader, writer, menu) == ["a", "b"]
+    assert any("backwards" in line for line in output)
+
+
+def test_prompt_datasets_requires_at_least_one():
+    reader, writer, output = scripted(["", "1"])   # empty rejected, then valid
+    result = console.prompt_datasets(reader, writer, [("stats19", "stats19")])
+    assert result == ["stats19"]
+    assert sum("Invalid input" in line for line in output) == 1
+
+
+def test_format_summary_includes_datasets():
+    summary = console.format_summary({
+        "database_path": "x.db", "datasets": ["stats19"],
+        "years": [2023], "boundary_mode": "snapshot",
+    })
+    assert "Datasets" in summary and "stats19" in summary
+
+
 # --- Stage 02: build wiring, orchestration, and the entry point -------------
 
 
@@ -123,25 +184,27 @@ class _FakeClient:
 
 
 def test_wizard_produces_correct_build_invocation():
-    reader, writer, _ = scripted(["mydb.duckdb", "2022 2023", "temporal", "y"])
+    # Answers: db path, datasets (menu index), years, boundary mode, confirm.
+    reader, writer, _ = scripted(["mydb.duckdb", "1", "2022 2023", "temporal", "y"])
     captured = {}
     def factory(**kwargs):
         client = _FakeClient(**kwargs)
         captured["client"] = client
         return client
-    result = console.run_wizard(reader, writer, engine_factory=factory)
+    result = console.run_wizard(reader, writer, engine_factory=factory, available=MENU)
     assert result is captured["client"]
     assert captured["client"].init_kwargs == {"database_path": "mydb.duckdb"}
-    assert captured["client"].build_kwargs == {"years": [2022, 2023],
+    assert captured["client"].build_kwargs == {"datasets": ["stats19"],
+                                               "years": [2022, 2023],
                                                "boundary_mode": "temporal"}
 
 
 def test_decline_does_not_build():
-    reader, writer, output = scripted([":memory:", "2023", "snapshot", "n"])
+    reader, writer, output = scripted([":memory:", "1", "2023", "snapshot", "n"])
     calls = []
     def factory(**kwargs):
         calls.append(kwargs); return _FakeClient(**kwargs)
-    result = console.run_wizard(reader, writer, engine_factory=factory)
+    result = console.run_wizard(reader, writer, engine_factory=factory, available=MENU)
     assert result is None
     assert calls == []            # build path never entered
     assert any("Aborted" in line for line in output)
@@ -149,7 +212,8 @@ def test_decline_does_not_build():
 
 def test_main_abort_path_returns_zero(monkeypatch, capsys):
     # Exercise the real entry point offline. Declining means no build, no network.
-    answers = iter([":memory:", "2023", "snapshot", "n"])
+    # main() uses live discovery, so "1" selects the first discovered dataset.
+    answers = iter([":memory:", "1", "2023", "snapshot", "n"])
     monkeypatch.setattr("builtins.input", lambda *a: next(answers))
     assert console.main() == 0
     assert "Aborted" in capsys.readouterr().out
@@ -176,8 +240,9 @@ def test_wizard_builds_populated_database_offline(tmp_path):
     cache = str(tmp_path / "cache")
     _seed_full_cache(cache)
     db_path = str(tmp_path / "wizard.duckdb")
-    # Scripted answers: db path, one year (matches the fixture), snapshot, confirm.
-    reader, writer, _ = scripted([db_path, "2023", "snapshot", "y"])
+    # Scripted answers: db path, datasets (live menu — stats19 is first), one year
+    # (matches the fixture), snapshot, confirm.
+    reader, writer, _ = scripted([db_path, "1", "2023", "snapshot", "y"])
     client = console.run_wizard(reader, writer, cache_dir=cache)  # real init_engine
     try:
         assert client is not None

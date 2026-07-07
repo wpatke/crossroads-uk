@@ -12,6 +12,16 @@ from datetime import date
 from crossroads import init_engine  # used in Stage 02; harmless to import now
 
 
+def available_datasets():
+    """Discover the user-selectable datasets for the wizard menu.
+
+    Returns a list of ``(source_id, display_name)`` in the registry's stable order.
+    Imported lazily so importing the console module stays cheap.
+    """
+    from crossroads.registry import Registry
+    return [(t.source_id, t.display_name) for t in Registry().selectable()]
+
+
 def _prompt(reader, writer, message, *, parse, default=None):
     """Ask, validate, and re-ask until ``parse`` accepts the input.
 
@@ -44,6 +54,64 @@ def prompt_database_path(reader, writer):
     return _prompt(reader, writer,
                    "Database file path", parse=_parse_database_path,
                    default="crossroads.db")
+
+
+def _parse_one_index(token, count):
+    """Parse a single menu index token to an int and range-check it (1..count)."""
+    try:
+        i = int(token)
+    except ValueError:
+        raise ValueError(f"'{token}' is not a whole number")
+    if not (1 <= i <= count):
+        raise ValueError(f"{i} is not between 1 and {count}")
+    return i
+
+
+def _parse_selection(raw, count):
+    """Parse a '1-3, 5' style menu selection into a sorted list of 1-based indices.
+
+    Same comma/space/range grammar as the years prompt: singles and tight-hyphen
+    ranges, deduped and sorted. Requires at least one index.
+    """
+    tokens = [t for t in raw.replace(",", " ").split() if t]
+    if not tokens:
+        raise ValueError("select at least one dataset, e.g. 1 or 1-3")
+    picked = set()
+    for t in tokens:
+        if "-" in t:
+            # A closed range like "1-3" (tight hyphen, no surrounding spaces).
+            start, _, end = t.partition("-")
+            lo = _parse_one_index(start, count)
+            hi = _parse_one_index(end, count)
+            if lo > hi:
+                raise ValueError(f"range '{t}' is backwards (start after end)")
+            picked.update(range(lo, hi + 1))
+        else:
+            picked.add(_parse_one_index(t, count))
+    return sorted(picked)
+
+
+def prompt_datasets(reader, writer, available):
+    """Multi-select which datasets to build.
+
+    ``available`` is a list of ``(source_id, display_name)`` in stable order (from
+    ``available_datasets()``). Presents them numbered and returns the selected
+    ``source_id`` list, using the same range grammar as the years prompt.
+    """
+    if not available:
+        # Defensive: there is always at least one selectable dataset in practice.
+        raise ValueError("no selectable datasets are available")
+    writer("Which datasets would you like?")
+    for i, (_source_id, label) in enumerate(available, start=1):
+        writer(f"  {i}. {label}")
+
+    def parse(raw):
+        indices = _parse_selection(raw, len(available))
+        # Map 1-based menu indices back to source_ids.
+        return [available[i - 1][0] for i in indices]
+
+    return _prompt(reader, writer,
+                   "Datasets (e.g. 1 or 1-3, 5)", parse=parse, default=None)
 
 
 _EARLIEST_STATS19_YEAR = 1979
@@ -107,17 +175,22 @@ def prompt_boundary_mode(reader, writer):
                    "Boundary mode", parse=_parse_boundary_mode, default="snapshot")
 
 
-def gather_parameters(reader, writer):
+def gather_parameters(reader, writer, *, available=None):
     """Run the parameter prompts and return the build-parameter dict.
 
-    Keys map 1:1 onto the build surface: ``database_path`` feeds
-    ``init_engine(database_path=...)``; ``years`` and ``boundary_mode`` feed
-    ``client.build(...)``.
+    Keys map onto the build surface: ``database_path`` feeds
+    ``init_engine(database_path=...)``; ``datasets``, ``years`` and
+    ``boundary_mode`` feed ``client.build(...)``. ``available`` is the dataset menu
+    (list of ``(source_id, display_name)``); defaults to live discovery and is
+    injectable so tests supply a fixed menu.
     """
+    if available is None:
+        available = available_datasets()
     writer("Crossroads-UK — data compilation wizard")
     writer("")  # blank spacer line
     return {
         "database_path": prompt_database_path(reader, writer),
+        "datasets": prompt_datasets(reader, writer, available),
         "years": prompt_years(reader, writer),
         "boundary_mode": prompt_boundary_mode(reader, writer),
     }
@@ -137,18 +210,20 @@ def _parse_yes_no(raw):
 
 def prompt_confirm(reader, writer, *, default=True):
     """Ask the user to confirm before the (possibly long) build runs."""
-    # Show which answer an empty line selects: "Y/n" means yes is the default.
-    shown = "Y/n" if default else "y/N"
-    return _prompt(reader, writer, f"Proceed with the build? ({shown})",
+    # Options are shown lowercase; the default is indicated by the "[y]"/"[n]"
+    # suffix that _prompt appends from the default value below.
+    return _prompt(reader, writer, "Proceed with the build? (y/n)",
                    parse=_parse_yes_no, default=("y" if default else "n"))
 
 
 def format_summary(params):
     """Human-readable recap of the gathered parameters, shown before confirmation."""
     years = ", ".join(str(y) for y in params["years"])
+    datasets = ", ".join(params["datasets"])
     return (
         "\nBuild summary:\n"
         f"  Database file : {params['database_path']}\n"
+        f"  Datasets      : {datasets}\n"
         f"  Years         : {years}\n"
         f"  Boundary mode : {params['boundary_mode']}\n"
     )
@@ -171,17 +246,20 @@ def run_build(params, *, engine_factory=init_engine, cache_dir=None, writer=None
 
     client = engine_factory(**engine_kwargs)
     say("\nBuilding database — this may take a while for large year ranges...")
-    client.build(years=params["years"], boundary_mode=params["boundary_mode"])
+    client.build(datasets=params["datasets"],
+                 years=params["years"],
+                 boundary_mode=params["boundary_mode"])
     say(f"Done. Database written to {params['database_path']}")
     return client
 
 
-def run_wizard(reader, writer, *, engine_factory=init_engine, cache_dir=None):
+def run_wizard(reader, writer, *, engine_factory=init_engine, cache_dir=None, available=None):
     """Drive the full wizard. Returns the built Client, or None if the user declined.
 
-    All I/O is injected so this is fully testable with scripted input.
+    All I/O is injected so this is fully testable with scripted input. ``available``
+    overrides the dataset menu for deterministic tests.
     """
-    params = gather_parameters(reader, writer)
+    params = gather_parameters(reader, writer, available=available)
     writer(format_summary(params))
     if not prompt_confirm(reader, writer, default=True):
         writer("Aborted — no database was built.")

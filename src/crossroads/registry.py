@@ -46,6 +46,35 @@ class Registry:
         """Every discovered transformer instance."""
         return list(self._transformers)
 
+    def selectable(self):
+        """Discovered transformers a researcher can pick in the wizard menu.
+
+        Excludes always-on infrastructure (``user_selectable=False``, e.g. spatial
+        boundary tables). Order follows the deterministic source_id sort from _discover.
+        """
+        return [t for t in self._transformers if getattr(t, "user_selectable", True)]
+
     def get_active(self, **kwargs):
-        """Discovered transformers whose ``is_active(**kwargs)`` returns True."""
-        return [t for t in self._transformers if t.is_active(**kwargs)]
+        """Discovered transformers that should run for this build.
+
+        A transformer runs when its ``is_active(**kwargs)`` is True AND it passes the
+        dataset-selection gate:
+          • When the caller supplies an explicit ``datasets`` list (the wizard does),
+            a user-selectable source runs only if its ``source_id`` is in that list.
+          • Infrastructure sources (``user_selectable=False``) always run.
+          • With no ``datasets`` kwarg (the programmatic build flow), the gate is a
+            pass-through, so behavior is unchanged.
+        """
+        datasets = kwargs.get("datasets")
+        active = []
+        for t in self._transformers:
+            if not t.is_active(**kwargs):
+                continue
+            if (
+                datasets is not None
+                and getattr(t, "user_selectable", True)
+                and t.source_id not in datasets
+            ):
+                continue  # selectable but not chosen by the user
+            active.append(t)
+        return active

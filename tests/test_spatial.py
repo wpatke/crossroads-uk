@@ -20,6 +20,12 @@ from crossroads.transformers.spatial import (
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "ons")
 
 
+def test_boundary_transformers_are_not_user_selectable():
+    # Spatial boundaries are always-on infrastructure, kept out of the wizard menu.
+    assert LADBoundaryTransformer().user_selectable is False
+    assert CTYUABoundaryTransformer().user_selectable is False
+
+
 def _seed_cache(cache_dir):
     """Copy each committed GeoJSON fixture into the build cache under the name the
     newest vintage expects, so the snapshot build runs fully offline regardless of

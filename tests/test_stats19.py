@@ -18,6 +18,13 @@ ONS_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "ons")
 YEARS = [2023]
 
 
+def test_stats19_is_user_selectable_with_default_display_name():
+    # STATS19 is a queryable dataset the researcher picks; label defaults to source_id.
+    t = Stats19Transformer()
+    assert t.user_selectable is True
+    assert t.display_name == "stats19"
+
+
 def _seed_cache(cache_dir):
     os.makedirs(cache_dir, exist_ok=True)
     for ftype in ("collision", "vehicle", "casualty"):

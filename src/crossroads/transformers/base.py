@@ -19,6 +19,22 @@ class BaseTransformer(ABC):
         """Unique identifier for the datasource (e.g. 'stats19', 'era5_weather')."""
         raise NotImplementedError
 
+    # Whether this source appears in the interactive wizard's dataset menu and
+    # obeys the user's dataset selection. True = a queryable dataset a researcher
+    # picks. False = always-on infrastructure (e.g. spatial boundary tables that
+    # other sources join against, never selected on their own). Default True so a
+    # newly added transformer is selectable automatically — no console/registry edit.
+    user_selectable = True
+
+    @property
+    def display_name(self) -> str:
+        """Human-friendly label shown in the wizard's dataset menu.
+
+        Defaults to ``source_id``. A source overrides it for a friendlier name by
+        setting a plain class attribute, e.g. ``display_name = "weather"``.
+        """
+        return self.source_id
+
     def quality_spec(self) -> "SourceQuality | QualityExemption | None":
         """Declare this source's audit surface for the quality engine
         (conservation, flag/ledger agreement, reject-rate invariants).
