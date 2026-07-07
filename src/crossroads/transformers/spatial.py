@@ -33,9 +33,12 @@ from crossroads.quality import (
 BNG_MIN_E, BNG_MAX_E = 0, 700_000
 BNG_MIN_N, BNG_MAX_N = 0, 1_300_000
 
-# The vintage registry lives in a committed JSON manifest next to this module,
-# so adding a new ONS edition is a data change, not a code change.
-_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "ons_boundaries.json")
+# The vintage registry lives in a committed JSON manifest alongside the other
+# static reference data (src/crossroads/reference/), so adding a new ONS edition
+# is a data change, not a code change.
+_MANIFEST_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "reference", "ons_boundaries.json"
+)
 
 
 def _build_query_url(feature_server, code_col, name_col):

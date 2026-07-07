@@ -3,7 +3,7 @@
 Two committed lookup files that drive the descriptive-layer clean (plan stages 05–09 in
 `docs/plans/004_stats19_ingestion/`). Both are **static reference tables, not audited sources**: no
 `source_id`, no bronze/silver pair, no conservation obligation — the same status as
-`transformers/ons_boundaries.json`. They ship inside the package and load into the `codebook` and
+`ons_boundaries.json` in this directory. They ship inside the package and load into the `codebook` and
 `column_manifest` tables at the top of `Stats19Transformer.transform_and_load`.
 
 ## Reproducing & verifying these files
@@ -115,5 +115,5 @@ keep-in-place silver (stage 06) treats each column.
 
 ## Packaging
 `[tool.hatch.build.targets.wheel] packages = ["src/crossroads"]` ships everything under the package tree
-(proven by `transformers/ons_boundaries.json`), so these CSVs are included in the wheel with no
+(this `ons_boundaries.json` included), so these CSVs are included in the wheel with no
 `pyproject.toml` change and no new dependency.

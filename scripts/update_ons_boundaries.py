@@ -24,7 +24,7 @@ import urllib.request
 # The manifest the package reads. Resolved relative to this script's location.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST_PATH = os.path.join(
-    REPO_ROOT, "src", "crossroads", "transformers", "ons_boundaries.json"
+    REPO_ROOT, "src", "crossroads", "reference", "ons_boundaries.json"
 )
 
 # ONS ArcGIS Online org that owns the boundary datasets.

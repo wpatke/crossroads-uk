@@ -4,7 +4,7 @@ The LAD and CTYUA boundary transformers in `src/crossroads/transformers/spatial.
 published editions ("vintages") from a JSON manifest:
 
 ```
-src/crossroads/transformers/ons_boundaries.json
+src/crossroads/reference/ons_boundaries.json
 ```
 
 ONS publishes a new BGC ("Generalised, clipped to coastline") boundary edition on the

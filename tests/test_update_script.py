@@ -47,7 +47,7 @@ def test_parse_title_unparseable():
 
 def test_manifest_path_points_at_package():
     assert uob.MANIFEST_PATH.endswith(
-        os.path.join("crossroads", "transformers", "ons_boundaries.json")
+        os.path.join("crossroads", "reference", "ons_boundaries.json")
     )
 
 

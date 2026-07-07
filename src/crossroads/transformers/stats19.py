@@ -47,7 +47,7 @@ BNG_MIN_N, BNG_MAX_N = 0, 1_300_000
 
 # Reference data (shared lookups), derived independently from DfT's published data guide
 # (Road Safety Open Dataset Data Guide, 2024 edition, OGL v3.0) and committed under
-# src/crossroads/reference/. They ship in the wheel like transformers/ons_boundaries.json
+# src/crossroads/reference/. They ship in the wheel like reference/ons_boundaries.json
 # and load once per build. NEITHER is an audited source — they are static lookups.
 _REFERENCE_DIR = os.path.join(os.path.dirname(__file__), "..", "reference")
 _CODEBOOK_PATH = os.path.join(_REFERENCE_DIR, "stats19_codebook.csv")
