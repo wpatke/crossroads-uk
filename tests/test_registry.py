@@ -158,3 +158,68 @@ def test_get_active_filters_on_is_active(make_transformer_package):
 
     assert off == {"always"}
     assert on == {"always", "weatherish"}
+
+
+def test_resolve_order_orders_dependencies_before_dependents():
+    from crossroads.registry import resolve_order
+
+    class Fake:
+        def __init__(self, sid, deps=()):
+            self.source_id = sid
+            self.depends_on = deps
+
+    a = Fake("a")
+    b = Fake("b", deps=("a",))          # b after a
+    c = Fake("c", deps=("b",))          # c after b
+    order = [t.source_id for t in resolve_order([c, b, a])]
+    assert order == ["a", "b", "c"]
+
+
+def test_resolve_order_is_deterministic_with_no_edges():
+    from crossroads.registry import resolve_order
+
+    class Fake:
+        def __init__(self, sid):
+            self.source_id = sid
+            self.depends_on = ()
+
+    order = [t.source_id for t in resolve_order([Fake("stats19"), Fake("ons_lad"),
+                                                 Fake("ons_ctyua"), Fake("era5_weather")])]
+    # No edges -> pure source_id sort (the previous behaviour).
+    assert order == ["era5_weather", "ons_ctyua", "ons_lad", "stats19"]
+
+
+def test_resolve_order_drops_inactive_dependency_edges():
+    from crossroads.registry import resolve_order
+
+    class Fake:
+        def __init__(self, sid, deps=()):
+            self.source_id = sid
+            self.depends_on = deps
+
+    # stats19 depends on era5_weather, but weather is NOT in the active set -> edge dropped.
+    only = resolve_order([Fake("stats19", deps=("era5_weather", "ons_lad")), Fake("ons_lad")])
+    order = [t.source_id for t in only]
+    assert order == ["ons_lad", "stats19"]   # weather absent, no error, correct order
+
+
+def test_resolve_order_raises_on_cycle():
+    from crossroads.registry import resolve_order, DependencyCycleError
+
+    class Fake:
+        def __init__(self, sid, deps=()):
+            self.source_id = sid
+            self.depends_on = deps
+
+    a = Fake("a", deps=("b",))
+    b = Fake("b", deps=("a",))
+    with pytest.raises(DependencyCycleError):
+        resolve_order([b, a])
+
+
+def test_get_active_real_order_unchanged_by_declaration():
+    # Boundaries + stats19 active; weather source does not exist yet, so stats19's
+    # era5_weather edge is inert. Order must match the historical source_id order.
+    reg = Registry()
+    order = [t.source_id for t in reg.get_active(years=[2023])]
+    assert order == ["ons_ctyua", "ons_lad", "stats19"]

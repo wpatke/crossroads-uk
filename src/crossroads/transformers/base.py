@@ -26,6 +26,16 @@ class BaseTransformer(ABC):
     # newly added transformer is selectable automatically — no console/registry edit.
     user_selectable = True
 
+    # Optional ordering dependencies: source_ids this transformer should run AFTER
+    # when they are also active in the same build. "Optional" means an edge to a
+    # source that is not active (not selected, or is_active() False) is simply
+    # dropped — the dependent still runs, and guards at ETL time (e.g. by checking
+    # whether the table it wants exists). This is ordering only; it never forces an
+    # unselected source to run. A source declares it with a plain class attribute,
+    # e.g. ``depends_on = ("era5_weather",)``. The registry topologically sorts the
+    # active set by these edges (see registry.resolve_order).
+    depends_on = ()
+
     @property
     def display_name(self) -> str:
         """Human-friendly label shown in the wizard's dataset menu.

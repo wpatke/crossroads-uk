@@ -64,6 +64,14 @@ class Stats19Transformer(BaseTransformer):
 
     source_id = "stats19"          # registry identity; audit units are the three below
 
+    # STATS19 stamps codes from the boundary tables (and, once weather is built,
+    # weather metrics) onto its own collisions table, so those sources must import
+    # first. Declared explicitly rather than relying on source_id alphabetical order.
+    # Optional: any of these not selected this build is skipped (guarded at ETL time).
+    # "era5_weather" is included now so the ordering is correct the moment the weather
+    # source exists; until then the edge is inert (era5_weather simply isn't active).
+    depends_on = ("era5_weather", "ons_lad", "ons_ctyua")
+
     # --- audit source_ids (one per bronze/silver pair) ---
     COLLISION_SID = "stats19_collision"
     VEHICLE_SID = "stats19_vehicle"

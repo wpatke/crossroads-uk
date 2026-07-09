@@ -25,6 +25,10 @@ def test_stats19_is_user_selectable_with_default_display_name():
     assert t.display_name == "stats19"
 
 
+def test_stats19_declares_optional_dependencies():
+    deps = Stats19Transformer().depends_on
+    assert "era5_weather" in deps and "ons_lad" in deps and "ons_ctyua" in deps
+
 def _seed_cache(cache_dir):
     os.makedirs(cache_dir, exist_ok=True)
     for ftype in ("collision", "vehicle", "casualty"):
