@@ -67,8 +67,8 @@ class BaseTransformer(ABC):
     def is_active(self, **kwargs) -> bool:
         """Whether this source should run for a given ``build(**kwargs)`` call.
 
-        Defaults to ``True`` (always run). A source gated behind a build flag overrides
-        this, e.g. a weather source returns ``kwargs.get("include_weather", False)``.
+        Defaults to ``True`` (always run). A source gated behind a build parameter
+        overrides this (e.g. ``return bool(kwargs.get("years"))``).
         """
         return True
 

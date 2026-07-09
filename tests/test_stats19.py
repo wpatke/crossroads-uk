@@ -911,3 +911,113 @@ def test_labelled_views_end_to_end(tmp_path):
                 f"WHERE {c} IS NOT NULL AND {c}_label IS NULL").fetchone()[0]
             assert undecoded == 0, f"{view}.{c} has {undecoded} undecoded codes"
     client.close()
+
+
+# --- Weather stamping (Stage 03) ---------------------------------------------
+
+def _stub_weather(con):
+    # One weather cell (54.7,-1.2) at 14:00 LOCAL (13:00 UTC in BST).
+    con.execute("INSTALL icu"); con.execute("LOAD icu")
+    con.execute(
+        "CREATE TABLE weather AS SELECT "
+        "  CAST(round(54.7*10) AS INTEGER) AS grid_i, "
+        "  CAST(round(-1.2*10) AS INTEGER) AS grid_j, "
+        "  ((TIMESTAMP '2023-06-15 13:00:00') AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London' AS valid_time_local, "
+        "  15.0 AS temperature_c, 1.0 AS precipitation_mm")
+
+
+def _stub_collisions_geo(con, rows):
+    # rows: (key, lon, lat, iso_local_dt). Build 27700 geom via reprojection so the
+    # stamp's inverse reprojection lands back on the same grid cell.
+    vals = ", ".join(
+        f"('{k}', ST_Transform(ST_Point({lon},{lat}),'EPSG:4326','EPSG:27700',always_xy:=true)::GEOMETRY, "
+        f" TRUE, TIMESTAMP '{dt}', NULL, NULL, CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE))"
+        for k, lon, lat, dt in rows)
+    con.execute(
+        f"CREATE TABLE collisions AS SELECT * FROM (VALUES {vals}) AS "
+        f"t(source_row_key, geom, geom_valid, datetime_local, lad_code, ctyua_code, "
+        f"  temperature_c, precipitation_mm)")
+
+
+def test_weather_stamp_matches_cell_and_hour(con):
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    _stub_weather(con)
+    _stub_collisions_geo(con, [
+        ("k_in",  -1.2, 54.7, "2023-06-15 14:30:00"),   # same cell + hour -> stamped
+        ("k_hour", -1.2, 54.7, "2023-06-15 16:30:00"),  # same cell, wrong hour -> NULL
+        ("k_cell", 0.0, 52.0, "2023-06-15 14:30:00"),   # wrong cell -> NULL
+    ])
+    Stats19Transformer()._weather_stamp(con)
+    res = {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT source_row_key, temperature_c, precipitation_mm FROM collisions").fetchall()}
+    assert res["k_in"] == (15.0, 1.0)
+    assert res["k_hour"] == (None, None)
+    assert res["k_cell"] == (None, None)
+
+
+def test_weather_stamp_tolerates_missing_weather_table(con):
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    _stub_collisions_geo(con, [("k1", -1.2, 54.7, "2023-06-15 14:30:00")])
+    with pytest.warns(UserWarning, match="weather table"):
+        Stats19Transformer()._weather_stamp(con)          # no weather table -> warn, skip
+    assert con.execute("SELECT temperature_c FROM collisions").fetchone()[0] is None
+
+
+def test_collisions_has_weather_columns_even_without_weather(tmp_path):
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)          # no weather in this build
+    dt = {r[0].lower(): r[1] for r in client.con.execute("DESCRIBE collisions").fetchall()}
+    assert dt["temperature_c"] == "DOUBLE" and dt["precipitation_mm"] == "DOUBLE"
+    # All NULL (no weather table existed).
+    assert client.con.execute(
+        "SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL").fetchone()[0] == 0
+    client.close()
+
+
+@pytest.mark.integration
+def test_stats19_plus_weather_stamps_collisions_offline(tmp_path):
+    pytest.importorskip("xarray")
+    from crossroads.transformers.weather import Era5WeatherTransformer
+    cache = str(tmp_path / "cache")
+    _seed_cache(cache); _seed_ons_cache(cache)             # existing stats19 + ONS seeders
+    weather_nc = os.path.join(os.path.dirname(__file__), "fixtures", "weather", "era5_land_sample.nc")
+    shutil.copy(weather_nc, os.path.join(cache, "era5_land_2023.nc"))
+
+    client = crossroads.init_engine(cache_dir=cache)
+    client.registry._transformers = [
+        CTYUABoundaryTransformer(), LADBoundaryTransformer(),
+        Stats19Transformer(), Era5WeatherTransformer()]    # get_active resolves weather-first
+    client.build(datasets=["stats19", "era5_weather"], years=YEARS)   # runs §9 invariants
+    try:
+        # Weather grid built.
+        assert client.con.execute("SELECT count(*) FROM weather").fetchone()[0] > 0
+        # At least one collision stamped (fixtures are aligned by construction — Stage 02).
+        stamped = client.con.execute(
+            "SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL").fetchone()[0]
+        assert stamped >= 1, ("No collisions stamped — regenerate the weather fixture with "
+                              "scripts/build_weather_fixture.py so its cells/hours cover the "
+                              "committed collision fixture.")
+        # Row count unchanged (stamp is an UPDATE, not a join that fans out).
+        assert client.con.execute("SELECT count(*) FROM collisions").fetchone()[0] > 0
+    finally:
+        client.close()
+
+
+@pytest.mark.integration
+def test_weather_build_is_idempotent(tmp_path):
+    pytest.importorskip("xarray")
+    from crossroads.transformers.weather import Era5WeatherTransformer
+    db = str(tmp_path / "w.db"); cache = str(tmp_path / "cache")
+    _seed_cache(cache); _seed_ons_cache(cache)
+    shutil.copy(os.path.join(os.path.dirname(__file__), "fixtures", "weather", "era5_land_sample.nc"),
+                os.path.join(cache, "era5_land_2023.nc"))
+
+    def run():
+        cl = crossroads.init_engine(database_path=db, cache_dir=cache)
+        cl.registry._transformers = [CTYUABoundaryTransformer(), LADBoundaryTransformer(),
+                                     Stats19Transformer(), Era5WeatherTransformer()]
+        cl.build(datasets=["stats19", "era5_weather"], years=YEARS); return cl
+    a = run(); n1 = a.con.execute("SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL").fetchone()[0]; a.close()
+    b = run(); n2 = b.con.execute("SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL").fetchone()[0]
+    assert n1 == n2 and n2 >= 1
+    b.close()

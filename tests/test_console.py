@@ -264,3 +264,22 @@ def test_console_script_registered():
     if not match:
         pytest.skip("run `pip install -e .` to register the console script")
     assert match[0].value == "crossroads.console:main"
+
+
+@pytest.mark.integration
+def test_wizard_builds_weather_offline(tmp_path):
+    pytest.importorskip("xarray")
+    cache = str(tmp_path / "cache"); _seed_full_cache(cache)
+    shutil.copy(os.path.join(os.path.dirname(__file__), "fixtures", "weather", "era5_land_sample.nc"),
+                os.path.join(cache, "era5_land_2023.nc"))
+    db_path = str(tmp_path / "wiz.duckdb")
+    # Menu order is source_id: 1=weather (era5_weather), 2=stats19. Pick both with "1-2".
+    reader, writer, _ = scripted([db_path, "1-2", "2023", "snapshot", "y"])
+    client = console.run_wizard(reader, writer, cache_dir=cache)
+    try:
+        assert client is not None and os.path.exists(db_path)
+        assert client.con.execute("SELECT count(*) FROM weather").fetchone()[0] > 0
+        assert client.con.execute(
+            "SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL").fetchone()[0] >= 1
+    finally:
+        client.close()

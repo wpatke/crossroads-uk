@@ -451,6 +451,10 @@ class Stats19Transformer(BaseTransformer):
         # --- SPATIAL STAMP: valid collision points -> LAD/CTYUA codes. ---
         self._spatial_stamp(con)
 
+        # --- WEATHER STAMP (optional): fill temperature_c/precipitation_mm from the
+        # weather grid if it was built this run (the registry orders weather first).
+        self._weather_stamp(con)
+
         # --- GOLD: the valid-geometry collision projection (spec §9 worked example). ---
         create_clean_view(con, "collisions_spatial", self.COLLISION_SILVER, ["geom_valid"])
 
@@ -541,6 +545,11 @@ class Stats19Transformer(BaseTransformer):
             # Filled by the Stage 04 spatial stamp; present now so the schema is stable.
             f"  CAST(NULL AS VARCHAR) AS lad_code, "
             f"  CAST(NULL AS VARCHAR) AS ctyua_code, "
+            # Filled by _weather_stamp when a weather table exists; NULL otherwise
+            # (mirrors lad_code — collisions always carry these columns). DOUBLE:
+            # Celsius and millimetres.
+            f"  CAST(NULL AS DOUBLE) AS temperature_c, "
+            f"  CAST(NULL AS DOUBLE) AS precipitation_mm, "
             # CORE severity audit (Stage 07): raw twin, cleaned INTEGER, valid flag.
             f"  {sev_raw}, {sev_clean}, {sev_valid} "
             f"  {broad_sql} "                       # every remaining bronze column, cleaned per manifest
@@ -697,6 +706,47 @@ class Stats19Transformer(BaseTransformer):
                 f"  GROUP BY c2.source_row_key"
                 f") m WHERE c.source_row_key = m.k"
             )
+
+    def _weather_stamp(self, con):
+        """Optionally stamp temperature_c/precipitation_mm onto valid collisions from an
+        already-built weather grid. The exact shape of _spatial_stamp: if the weather
+        table is absent (weather not selected/built this run), warn and leave the columns
+        NULL — collisions still build. This is the 'optional dependency' guard at ETL time
+        (the registry has already ordered weather before stats19 when both are active).
+
+        Match (spec §3A/§3B): reproject each collision point back to lon/lat, round to the
+        0.1° ERA5-Land grid index (grid_i, grid_j), and match the weather cell with the same
+        index AND the same UK-local hour (weather.valid_time_local is pre-materialised, so
+        no ICU is needed here). weather is unique per (cell, hour), so min() aggregates over
+        at most one row — the same defensive GROUP BY _spatial_stamp uses for area_code."""
+        if not self._table_exists(con, "weather"):
+            warnings.warn(
+                "stats19: weather table not found; temperature_c/precipitation_mm left NULL "
+                "(build the weather dataset alongside stats19 to enable weather stamping).",
+                stacklevel=2)
+            return
+        con.execute(
+            f"UPDATE {self.COLLISION_SILVER} AS c "
+            f"SET temperature_c = m.temperature_c, precipitation_mm = m.precipitation_mm "
+            f"FROM ("
+            f"  SELECT k, min(temperature_c) AS temperature_c, "
+            f"         min(precipitation_mm) AS precipitation_mm "
+            f"  FROM ("
+            f"    SELECT c2.source_row_key AS k, w.temperature_c, w.precipitation_mm "
+            f"    FROM ("
+            f"      SELECT source_row_key, datetime_local, "
+            f"             ST_Transform(geom, 'EPSG:27700', 'EPSG:4326', always_xy := true) AS ll "
+            f"      FROM {self.COLLISION_SILVER} "
+            f"      WHERE geom IS NOT NULL AND datetime_local IS NOT NULL"
+            f"    ) c2 "
+            f"    JOIN weather w "
+            f"      ON w.grid_i = CAST(round(ST_Y(c2.ll) * 10) AS INTEGER) "
+            f"     AND w.grid_j = CAST(round(ST_X(c2.ll) * 10) AS INTEGER) "
+            f"     AND date_trunc('hour', w.valid_time_local) = date_trunc('hour', c2.datetime_local)"
+            f"  ) j "
+            f"  GROUP BY k"
+            f") m WHERE c.source_row_key = m.k"
+        )
 
     def _create_labelled_views(self, con):
         """Opt-in code->label translation, at full breadth. Labels are NEVER stored: each
