@@ -240,9 +240,10 @@ def test_wizard_builds_populated_database_offline(tmp_path):
     cache = str(tmp_path / "cache")
     _seed_full_cache(cache)
     db_path = str(tmp_path / "wizard.duckdb")
-    # Scripted answers: db path, datasets (live menu — stats19 is first), one year
-    # (matches the fixture), snapshot, confirm.
-    reader, writer, _ = scripted([db_path, "1", "2023", "snapshot", "y"])
+    # Scripted answers: db path, datasets (live menu — selectable() is source_id order,
+    # so "1"=era5_weather, "2"=stats19; this build seeds only stats19+ONS, so pick "2"),
+    # one year (matches the fixture), snapshot, confirm.
+    reader, writer, _ = scripted([db_path, "2", "2023", "snapshot", "y"])
     client = console.run_wizard(reader, writer, cache_dir=cache)  # real init_engine
     try:
         assert client is not None

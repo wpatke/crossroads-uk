@@ -28,6 +28,14 @@ dependencies = [
 dev = [
   "pytest>=7.0",
 ]
+# Heavy, opt-in dependencies for the ERA5-Land weather source. These are imported
+# lazily inside crossroads.transformers.weather, so the module (and the default
+# test suite) load fine without them installed.
+weather = [
+  "cdsapi>=0.7",     # Copernicus Climate Data Store API client (real downloads only)
+  "xarray>=2023.1",  # NetCDF -> DataFrame parsing
+  "netCDF4>=1.6",    # NetCDF file backend for xarray
+]
 
 [project.scripts]
 crossroads = "crossroads.console:main"
