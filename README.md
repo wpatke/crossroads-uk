@@ -52,6 +52,8 @@ Copernicus CDS API key — the build prints setup steps if it is missing.
 - Snapshot or temporally-sliced boundary joins.
 - Build-time conservation invariants that halt the build if any row goes unaccounted for.
 
+The full table/column data dictionary is in **[docs/schema.md](docs/schema.md)**.
+
 See **[docs/methodology.md](docs/methodology.md)** for how the data is joined, converted, and
 quality-flagged, and **[docs/spec.md](docs/spec.md)** for the full product definition.
 

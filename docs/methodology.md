@@ -3,6 +3,8 @@
 How Crossroads-UK turns raw public datasets into a single analysable database. This is a
 summary for researchers; the authoritative detail lives in [spec.md](spec.md).
 
+See [schema.md](schema.md) for the table-and-column data dictionary.
+
 ## Sources
 
 | Source | Publisher | Native format | Native CRS / time |
