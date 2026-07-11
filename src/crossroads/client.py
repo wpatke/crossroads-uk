@@ -62,6 +62,8 @@ class Client:
         specs = quality.resolve_quality_specs(self.con, active)
         default_ceiling = kwargs.get("reject_ceiling") or quality.DEFAULT_REJECT_CEILING
         quality.run_invariants(self.con, specs, default_ceiling=default_ceiling)
+        # Stamp build provenance LAST, so only a database that passed the invariants is recorded.
+        quality.write_build_metadata(self.con, parameters=kwargs)
         return self
 
     def close(self) -> None:

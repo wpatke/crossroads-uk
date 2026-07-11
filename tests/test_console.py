@@ -10,6 +10,7 @@ import shutil
 
 import pytest
 
+import crossroads
 from crossroads import console
 from crossroads.transformers.spatial import LADBoundaryTransformer, CTYUABoundaryTransformer
 
@@ -270,6 +271,11 @@ def test_wizard_builds_populated_database_offline(tmp_path):
         assert n > 0                                              # silver populated
         # gold view exists and is queryable
         client.con.execute("SELECT count(*) FROM collisions_spatial").fetchone()
+        # crossroads_meta stamped by the real build
+        row = client.con.execute(
+            "SELECT crossroads_version, schema_version FROM crossroads_meta"
+        ).fetchone()
+        assert row == (crossroads.__version__, crossroads.SCHEMA_VERSION)
     finally:
         client.close()
 

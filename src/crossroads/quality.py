@@ -134,6 +134,34 @@ def ensure_quality_tables(con):
     )
 
 
+def write_build_metadata(con, *, parameters):
+    """Stamp a single-row crossroads_meta table describing what built this database.
+
+    Provenance only — like the reference tables (codebook, manifest, boundaries), it has no
+    source_id, no bronze/silver pair, and is NOT part of the conservation invariant. Re-running
+    build() replaces the row (CREATE OR REPLACE), so the table always reflects the latest build.
+
+    built_at_utc differs run-to-run by design, so it is a provenance field explicitly excluded
+    from spec §2's "structurally identical database" guarantee (which already carves out
+    machine-stamped provenance timestamps). It does not weaken reproducibility; it records it.
+    """
+    import json
+    import crossroads  # lazy import: avoids a circular import at module load time
+
+    con.execute(
+        "CREATE OR REPLACE TABLE crossroads_meta ("
+        " crossroads_version VARCHAR,"
+        " schema_version INTEGER,"
+        " built_at_utc TIMESTAMP,"
+        " parameters VARCHAR)"
+    )
+    con.execute(
+        "INSERT INTO crossroads_meta VALUES (?, ?, now() AT TIME ZONE 'UTC', ?)",
+        [crossroads.__version__, crossroads.SCHEMA_VERSION,
+         json.dumps(parameters, default=str, sort_keys=True)],
+    )
+
+
 def record_source_rows(con, source_id, source_rows):
     """Record the number of rows a source READ from its source files.
 
