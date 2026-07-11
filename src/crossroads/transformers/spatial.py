@@ -227,8 +227,8 @@ class _BoundaryTransformer(BaseTransformer):
         create_clean_view(con, self.clean_view, self.silver_table, ["geom_valid"])
 
         # --- INDEX: bounding-box R-Tree over the silver geometry. This is what
-        # makes Step 4's point-in-polygon joins fast (spec §5: avoids an unindexed
-        # spatial cross-join). The silver table was just (re)created via
+        # makes the spatial-stamping point-in-polygon joins fast (spec §5: avoids
+        # an unindexed spatial cross-join). The silver table was just (re)created via
         # CREATE OR REPLACE, which drops any prior index with it, so we create a
         # fresh one with a deterministic name. The DROP is belt-and-suspenders
         # (DuckDB has no CREATE INDEX IF NOT EXISTS for custom indexes).

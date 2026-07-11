@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "crossroads-uk"
-version = "0.0.1"
+dynamic = ["version"]
 description = "A reproducible pipeline for unifying UK road-safety, weather, and boundary data into a single local DuckDB database."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "wpatke" }]
 keywords = ["uk", "road-safety", "stats19", "duckdb", "etl", "reproducible-research"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -27,6 +27,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=7.0",
+  "pyyaml>=6.0",  # Parses CITATION.cff in the release validation test
 ]
 # Heavy, opt-in dependencies for the ERA5-Land weather source. These are imported
 # lazily inside crossroads.transformers.weather, so the module (and the default
@@ -40,8 +41,28 @@ weather = [
 [project.scripts]
 crossroads = "crossroads.console:main"
 
+[project.urls]
+Homepage = "https://github.com/wpatke/crossroads-uk"
+Repository = "https://github.com/wpatke/crossroads-uk"
+Issues = "https://github.com/wpatke/crossroads-uk/issues"
+Changelog = "https://github.com/wpatke/crossroads-uk/blob/main/CHANGELOG.md"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/crossroads"]
+
+# Derive the version from git via hatch-vcs (the Hatchling wrapper around the
+# standard setuptools-scm engine). The maintainer owns MAJOR.MINOR by cutting a
+# GitHub Release (which creates a tag like v1.1.0); everything else is automatic:
+#   - On the exact release tag the version is clean, e.g. "1.1.0".
+#   - Between releases it uses setuptools-scm's default scheme, which appends the
+#     commit distance AND the exact git commit hash, e.g. "1.1.1.dev3+g1a2b3c4"
+#     (3 commits after v1.1.0, at commit 1a2b3c4). Every dev build therefore pins
+#     its exact source, which is what makes a result reproducible.
+#   - fallback_version: used only when there is no git at all (e.g. building from a
+#     source archive with no history), so a build never fails.
+[tool.hatch.version]
+source = "vcs"
+raw-options = { fallback_version = "0.0.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

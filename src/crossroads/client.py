@@ -23,8 +23,8 @@ class Client:
     def build(self, **kwargs) -> "Client":
         """Open the database and run the extract/transform_and_load loop.
 
-        ``**kwargs`` (e.g. ``years=[...]``, ``include_weather=True``,
-        ``spatial_grain="local_authority"``) are forwarded to each transformer's
+        ``**kwargs`` (e.g. ``datasets=["stats19", "era5_weather"]``, ``years=[...]``,
+        ``boundary_mode="snapshot"``) are forwarded to each transformer's
         ``is_active`` and ``extract`` methods. An optional ``reject_ceiling``
         kwarg overrides the global default reject-rate ceiling. Returns ``self``.
 

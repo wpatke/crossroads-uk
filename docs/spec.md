@@ -6,7 +6,7 @@ The project is an open-source, Python orchestration pipeline merging all data in
 
 This project was inspired by a suggestion from Dr. Robin Lovelace at [ropensci/stats19](https://github.com/ropensci/stats19/issues/230). Crossroads-UK intends to expand on this core idea.
 
-AI usage and development workflows are detailed in [AI_DISCLOSURE.md](../AI_DISCLOSURE.md).
+AI usage and development workflows are detailed in [AI_DISCLOSURE.md](ai-disclosure.md).
 
 ---
 
@@ -16,7 +16,7 @@ Crossroads-UK rejects the pattern of distributing heavy, pre-baked, multi-gigaby
 
 Upon execution, the framework builds and compiles the analytical database on the fly using the host machine's hardware resources. This ensures complete parameter flexibility, data freshness, and a variable analytical scope.
 
-- **Dynamic Extraction**: The runtime engine accepts structural execution arguments (e.g., `years: list[int]`, `regions: list[str]`) from the user environment.
+- **Dynamic Extraction**: The runtime engine accepts structural execution arguments (e.g., `years: list[int]`, `datasets: list[str]`) from the user environment. (A future `regions: list[str]` filter is illustrative only — not yet implemented.)
 - **Decoupled Ingestion**: Isolated data transformers fetch raw public domain source files (CSVs, ZIPs, Shapefiles) directly to a local hardware cache, streaming them directly into an in-process columnar database.
 
 ---
@@ -159,6 +159,11 @@ Crossroads-UK provides an interactive, terminal-native console application that 
 crossroads-uk/
 │
 ├── docs/
+│   ├── ai-disclosure.md
+│   ├── data-sources.md
+│   ├── methodology.md
+│   ├── schema.md
+│   ├── spec.md
 │   └── plans/                              # Implementation plans — subdirectories named sequentially (examples below)
 │       ├── 001_spatial_infrastructure/     # Phase 1: ONS boundaries & DuckDB spatial
 │       ├── 002_stats19_ingestion/          # Phase 2: collision/vehicle/casualty pipeline
@@ -204,10 +209,11 @@ client = cr.init_engine(database_path="local_analytics.db")
 
 # 2. Compile database via modular registry
 client.build(
+    datasets=["stats19", "era5_weather"],   # weather is a selectable dataset, not a flag
     years=[2022, 2023, 2024],
-    include_weather=True,
-    spatial_grain="local_authority"
+    boundary_mode="snapshot",               # or "temporal"
 )
+client.close()
 ```
 
 ---
@@ -266,4 +272,4 @@ This model follows established conventions rather than inventing one: **raw-data
 ---
 
 ## 10. AI & Engineering Governance
-Crossroads-UK embraces AI as a core efficiency asset of modern systems engineering. The full development loop is explicitly detailed in [AI_DISCLOSURE.md](../AI_DISCLOSURE.md).
+Crossroads-UK embraces AI as a core efficiency asset of modern systems engineering. The full development loop is explicitly detailed in [AI_DISCLOSURE.md](ai-disclosure.md).

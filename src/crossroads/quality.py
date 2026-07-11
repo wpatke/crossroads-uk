@@ -2,8 +2,8 @@
 
 This module owns the SHARED audit machinery that every data source reuses:
 the manifest dataclasses a source uses to declare what should be audited,
-the shared audit tables and their writers (Stage 02), and the build-end
-invariant checks (Stage 03). It deliberately does NOT generate bronze/silver
+the shared audit tables and their writers, and the build-end invariant
+checks. It deliberately does NOT generate bronze/silver
 table DDL — column shapes differ per source, so each transformer writes its
 own bronze/silver tables and simply describes them with a SourceQuality.
 """
@@ -53,7 +53,7 @@ class QualityExemption:
     fit the keep-in-place invariants — e.g. it aggregates many bronze rows into
     one silver row (so count(bronze) == count(silver) is false by design), or it
     loads a static reference/lookup table. The reason is recorded in the
-    quality_exemptions table (Stage 02) so the opt-out is auditable, not silent.
+    quality_exemptions table so the opt-out is auditable, not silent.
     """
 
     reason: str  # e.g. "aggregates many bronze rows into one silver row; conservation N/A"
@@ -79,7 +79,7 @@ def create_clean_view(con, view_name, silver_table, flag_columns):
 
 
 # ---------------------------------------------------------------------------
-# Stage 02 — Shared audit tables and their writer helpers
+# Shared audit tables and their writer helpers
 # ---------------------------------------------------------------------------
 
 
@@ -95,8 +95,8 @@ def ensure_quality_tables(con):
     excluded from the structural-reproducibility guarantee (spec §2) — never
     assert on its value in tests.
     """
-    # How many rows each source READ from its source files. The conservation
-    # invariant (Stage 03) compares this against bronze + quarantine counts.
+    # How many rows each source READ from its source files. The build-end
+    # conservation invariant compares this against bronze + quarantine counts.
     con.execute(
         "CREATE TABLE IF NOT EXISTS source_ingest_log ("
         " source_id VARCHAR,"
@@ -178,7 +178,7 @@ def record_exemption(con, source_id, reason):
     """Record a source's deliberate opt-out from the quality invariants.
 
     Idempotent per source: any existing exemption for this source_id is removed
-    first, so re-running build() does not accumulate duplicate rows. The Stage 03
+    first, so re-running build() does not accumulate duplicate rows. The
     coverage gate calls this whenever a transformer's quality_spec() returns a
     QualityExemption. Values are bound parameters.
     """
@@ -201,8 +201,8 @@ _SOURCE_AUDIT_TABLES = (
 def reset_source_audit(con, source_id):
     """Clear all shared-audit rows for one source before it is (re)built.
 
-    The engine calls this at the top of the build loop for each active source
-    (Stage 03). It makes a re-build of the same on-disk database idempotent per
+    The engine calls this at the top of the build loop for each active source.
+    It makes a re-build of the same on-disk database idempotent per
     source: log_exclusion / quarantine_row are plain appends, so without this
     reset they would accumulate across builds and break the invariants.
 
@@ -216,14 +216,14 @@ def reset_source_audit(con, source_id):
 
 
 # ---------------------------------------------------------------------------
-# Stage 03 — Invariants, coverage gate, and exception hierarchy
+# Invariants, coverage gate, and exception hierarchy
 # ---------------------------------------------------------------------------
 
 # Coverage-gate escalation flag (see resolve_quality_specs). Every active
 # transformer must return SourceQuality or QualityExemption from quality_spec().
-# Escalation landed in Step 3 (spatial.py): spatial.py proves the SourceQuality
-# shape end-to-end, so None ("undecided") is now fatal.
-UNDECIDED_QUALITY_SPEC_IS_FATAL = True    # enforced from Step 3 onward
+# spatial.py proves the SourceQuality shape end-to-end, so None ("undecided")
+# is fatal.
+UNDECIDED_QUALITY_SPEC_IS_FATAL = True    # always enforced
 
 
 class QualityInvariantError(Exception):

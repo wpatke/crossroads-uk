@@ -1,15 +1,22 @@
-"""Interactive data-compilation wizard (spec §6, master-plan Step 5).
+"""Interactive data-compilation wizard (spec §6).
 
 A terminal wizard that gathers build parameters, confirms them, and drives
 ``crossroads.init_engine(...).build(...)``. All input/output is injected
 (``reader``/``writer``) so the wizard is driven by scripted input in tests with
 no real stdin/stdout and no network. Production wires ``reader = lambda: input()``
-and ``writer = print`` (see Stage 02's ``main``).
+and ``writer = print`` (see ``main`` below).
 """
 
 from datetime import date
 
-from crossroads import init_engine  # used in Stage 02; harmless to import now
+from crossroads import init_engine  # used by run_build below
+
+# One-line, non-blocking pointer shown before the build. Crossroads does not gate on
+# data licences (see docs/data-sources.md for why); it only reminds the user they exist.
+LICENCE_NOTICE = (
+    "Data licences & required attribution: see docs/data-sources.md "
+    "(you must attribute DfT/ONS/Copernicus sources when you publish)."
+)
 
 
 def available_datasets():
@@ -196,7 +203,7 @@ def gather_parameters(reader, writer, *, available=None):
     }
 
 
-# --- Stage 02: confirmation, build wiring, and the entry point --------------
+# --- Confirmation, build wiring, and the entry point ------------------------
 
 
 def _parse_yes_no(raw):
@@ -261,6 +268,7 @@ def run_wizard(reader, writer, *, engine_factory=init_engine, cache_dir=None, av
     """
     params = gather_parameters(reader, writer, available=available)
     writer(format_summary(params))
+    writer(LICENCE_NOTICE)          # non-blocking reminder; not a prompt
     if not prompt_confirm(reader, writer, default=True):
         writer("Aborted — no database was built.")
         return None
@@ -271,10 +279,20 @@ def run_wizard(reader, writer, *, engine_factory=init_engine, cache_dir=None, av
 def main(argv=None):
     """Console entry point. Wires stdin/stdout, returns a process exit code.
 
-    ``argv`` is accepted for signature stability but currently unused (the wizard
-    takes all parameters interactively). Ctrl-C / EOF abort cleanly without a
-    traceback.
+    Handles ``--version``/``-V`` and ``--help``/``-h`` before starting the wizard,
+    so a researcher can check the version without triggering the interactive flow.
+    Ctrl-C / EOF abort cleanly without a traceback.
     """
+    import sys
+    from crossroads import __version__
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args and args[0] in ("--version", "-V"):
+        print(f"crossroads {__version__}")
+        return 0
+    if args and args[0] in ("--help", "-h"):
+        print("Usage: crossroads            # run the interactive build wizard\n"
+              "       crossroads --version  # print the version and exit")
+        return 0
     reader = lambda: input()   # prompt text is emitted via writer, so input() gets no prompt
     writer = print
     try:

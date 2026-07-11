@@ -29,3 +29,6 @@ venv/
 *.duckdb
 .crossroads_cache/
 /htmlcov/
+
+# Extensionless database copies produced during ad-hoc testing
+weather_test

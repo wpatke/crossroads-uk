@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Crossroads-UK in your research, please cite it as below."
+title: "Crossroads-UK: A Reproducible Pipeline for Unifying UK Road-Safety, Weather, and Boundary Data"
+abstract: >-
+  Crossroads-UK is an open-source Python pipeline that downloads, cleanses, and unifies
+  UK road-safety (DfT STATS19), meteorological (Copernicus ERA5-Land), and ONS boundary
+  data into a single reproducible local DuckDB database.
+type: software
+authors:
+  - given-names: Will
+    family-names: Patke
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # add if available
+version: "0.9.0"
+date-released: "2026-07-10"
+license: MIT
+repository-code: "https://github.com/wpatke/crossroads-uk"
+url: "https://github.com/wpatke/crossroads-uk"
+keywords:
+  - UK road safety
+  - STATS19
+  - DuckDB
+  - reproducible research
+  - ETL

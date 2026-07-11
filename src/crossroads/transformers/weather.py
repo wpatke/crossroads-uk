@@ -39,6 +39,53 @@ BNG_MIN_N, BNG_MAX_N = 0, 1_300_000
 # UK bounding box for the real cdsapi request [North, West, South, East].
 UK_AREA = [61.0, -8.5, 49.5, 2.0]
 
+# Copernicus CDS pointers, surfaced in the friendly errors below when a download
+# fails for a setup reason (no API key, or the dataset licence not yet accepted).
+CDS_HOME_URL = "https://cds.climate.copernicus.eu"
+ERA5_LAND_URL = "https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land"
+
+
+def _missing_key_message(exc):
+    """Actionable setup steps for when cdsapi can't find a ~/.cdsapirc / API key.
+
+    cdsapi raises a bare, cryptic exception in this case; we replace it with the
+    exact file contents to create and where to get the token.
+    """
+    return (
+        "Weather data needs a free Copernicus CDS API key, which was not found.\n\n"
+        "Create the file ~/.cdsapirc containing these two lines:\n\n"
+        f"    url: {CDS_HOME_URL}/api\n"
+        "    key: <your-personal-access-token>\n\n"
+        f"Get the token from your CDS profile ({CDS_HOME_URL} → log in → your\n"
+        "profile → 'Personal Access Token'), then accept the ERA5-Land licence once at\n"
+        f"    {ERA5_LAND_URL}  (Download tab → Terms of use → Accept)\n"
+        "and re-run the build.\n\n"
+        f"(underlying cdsapi error: {exc})"
+    )
+
+
+def _licence_message(exc):
+    """Actionable steps for a download rejected because the licence isn't accepted."""
+    return (
+        "Copernicus rejected the ERA5-Land download. This almost always means the\n"
+        "dataset licence has not been accepted for your account yet.\n\n"
+        "Accept it once (free) at:\n"
+        f"    {ERA5_LAND_URL}  (Download tab → Terms of use → Accept)\n"
+        "then re-run the build.\n\n"
+        f"(underlying cdsapi error: {exc})"
+    )
+
+
+def _looks_like_licence_error(exc):
+    """Heuristic: does this cdsapi failure look like an unaccepted-licence 403?
+
+    cdsapi surfaces this as an HTTP 403 whose text mentions the licence; we match
+    on the tell-tale words rather than a specific exception type (which varies
+    across cdsapi versions).
+    """
+    text = str(exc).lower()
+    return any(word in text for word in ("licence", "license", "403", "forbidden", "not accepted"))
+
 
 class Era5WeatherTransformer(BaseTransformer):
     """Ingests ERA5-Land NetCDF into a weather grid (bronze/silver/gold), audited
@@ -75,20 +122,35 @@ class Era5WeatherTransformer(BaseTransformer):
         the module and the offline tests do not require the [weather] extra. The file
         is large; it is cached, so a re-run does not re-download."""
         import cdsapi                           # lazy: real download only
-        client = cdsapi.Client()
-        client.retrieve(
-            "reanalysis-era5-land",
-            {
-                "variable": ["2m_temperature", "total_precipitation"],
-                "year": str(year),
-                "month": [f"{m:02d}" for m in range(1, 13)],
-                "day": [f"{d:02d}" for d in range(1, 32)],
-                "time": [f"{h:02d}:00" for h in range(24)],
-                "area": UK_AREA,
-                "data_format": "netcdf",
-            },
-            dest,
-        )
+
+        # cdsapi raises a bare, cryptic exception when it can't find the API key
+        # (no ~/.cdsapirc and no CDSAPI_* env vars). Translate it into setup steps.
+        try:
+            client = cdsapi.Client()
+        except Exception as exc:
+            raise RuntimeError(_missing_key_message(exc)) from exc
+
+        try:
+            client.retrieve(
+                "reanalysis-era5-land",
+                {
+                    "variable": ["2m_temperature", "total_precipitation"],
+                    "year": str(year),
+                    "month": [f"{m:02d}" for m in range(1, 13)],
+                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "time": [f"{h:02d}:00" for h in range(24)],
+                    "area": UK_AREA,
+                    "data_format": "netcdf",
+                },
+                dest,
+            )
+        except Exception as exc:
+            # The common post-auth failure is not having accepted the ERA5-Land
+            # licence (a 403). Give targeted help for that; otherwise let the real
+            # error through unchanged (network, disk, etc. are self-explanatory).
+            if _looks_like_licence_error(exc):
+                raise RuntimeError(_licence_message(exc)) from exc
+            raise
 
     # --- transform_and_load ------------------------------------------------
     def transform_and_load(self, con, cache_dir):

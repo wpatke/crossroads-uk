@@ -199,6 +199,24 @@ def test_wizard_produces_correct_build_invocation():
                                                "boundary_mode": "temporal"}
 
 
+def test_wizard_shows_licence_notice_without_extra_prompt():
+    # Exactly the same 5 answers as the happy-path build test. If the notice had become
+    # a prompt, these answers would desync and the build kwargs would be wrong.
+    reader, writer, output = scripted(["mydb.duckdb", "1", "2022 2023", "temporal", "y"])
+    captured = {}
+    def factory(**kwargs):
+        c = _FakeClient(**kwargs); captured["client"] = c; return c
+    result = console.run_wizard(reader, writer, engine_factory=factory, available=MENU)
+
+    # The pointer appeared in the output...
+    assert any("docs/data-sources.md" in line for line in output)
+    # ...and the build still ran with the correct params (proving no prompt was added).
+    assert result is captured["client"]
+    assert captured["client"].build_kwargs == {"datasets": ["stats19"],
+                                               "years": [2022, 2023],
+                                               "boundary_mode": "temporal"}
+
+
 def test_decline_does_not_build():
     reader, writer, output = scripted([":memory:", "1", "2023", "snapshot", "n"])
     calls = []

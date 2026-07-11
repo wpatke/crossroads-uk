@@ -109,9 +109,9 @@ keep-in-place silver (stage 06) treats each column.
 - The newer `enhanced_casualty_severity`, `collision_injury_based`/`casualty_injury_based`, `escooter_flag`,
   `*_distance_banding` are `coded` (integer categories in the guide).
 - **`enhanced_severity_collision` is `coded` but has NO codebook coverage** — its code list is absent from the
-  2024 guide (only `enhanced_casualty_severity` is published). It cleans/types correctly, but its stage-09
-  label column is NULL until DfT publishes the list. Stage 09 decodes by intersect, so this is expected, not
-  an error.
+  2024 guide (only `enhanced_casualty_severity` is published). It cleans/types correctly, but its
+  label column is NULL until DfT publishes the list. Decoding works by intersecting codes against the
+  codebook, so this is expected, not an error.
 
 ## Packaging
 `[tool.hatch.build.targets.wheel] packages = ["src/crossroads"]` ships everything under the package tree

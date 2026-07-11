@@ -31,11 +31,11 @@ _FILE_TEMPLATE = "dft-road-casualty-statistics-{ftype}-{year}.csv"
 
 # Missing/out-of-range coordinate sentinels (spec §9). A coordinate equal to any of
 # these — or blank / non-numeric — is treated as missing: typed value NULL, geom NULL,
-# geom_valid FALSE, logged, and the row is retained (never deleted). Used from
-# Stage 02 onward; declared here as the shared constant.
+# geom_valid FALSE, logged, and the row is retained (never deleted). Declared here as
+# the shared constant.
 COORD_SENTINELS = ("-1", "0")
 
-# Sentinels for the broad numeric clean (Stage 06). A numeric column equal to any of
+# Sentinels for the broad numeric clean. A numeric column equal to any of
 # these — or blank / non-numeric — becomes NULL. A coded column uses the codebook's
 # is_missing set instead. (Note: DfT leaves missing longitude/latitude blank, so '' is
 # the sentinel that fires in practice; '-1' is inert for those but harmless.)
@@ -97,7 +97,7 @@ class Stats19Transformer(BaseTransformer):
     VEHICLE_LINK_RULE = "stats19.link.orphan_vehicle"
     CASUALTY_LINK_RULE = "stats19.link.orphan_casualty"
 
-    # --- ledger rules for the CORE severity dimensions (Stage 07; also in quality_spec) ---
+    # --- ledger rules for the CORE severity dimensions (also in quality_spec) ---
     COLLISION_SEVERITY_RULE = "stats19.collision_severity.missing"
     CASUALTY_SEVERITY_RULE = "stats19.casualty_severity.missing"
 
@@ -215,7 +215,7 @@ class Stats19Transformer(BaseTransformer):
         column_manifest(tbl, col, kind, dtype) classifies EVERY column of every file:
         kind in {identity, geo, datetime, coded, numeric, text}; dtype is the target
         type for numeric/coded. Single source of truth for how the keep-in-place silver
-        (Stage 06) treats each column. Reference data, NOT an audited source. The CSV
+        clean treats each column. Reference data, NOT an audited source. The CSV
         headers are `table,column,...`; alias them to tbl/col (both reserved-ish).
         """
         if not os.path.exists(_COLUMN_MANIFEST_PATH):
@@ -245,7 +245,7 @@ class Stats19Transformer(BaseTransformer):
             return f"{present[0]} AS {alias}"
         return "COALESCE(" + ", ".join(present) + f") AS {alias}"
 
-    # --- broad keep-in-place clean (Stage 06): carry EVERY bronze column into silver ---
+    # --- broad keep-in-place clean: carry EVERY bronze column into silver ---
     # These sit next to _coalesce_present because they share the "only touch what's present,
     # from a trusted manifest" idea. Column/kind/dtype come from the committed manifest
     # (code-controlled), so interpolating them is safe; no row values are ever interpolated.
@@ -314,7 +314,7 @@ class Stats19Transformer(BaseTransformer):
                          else self._placeholder_fragment(col, kind, dtype))
         return frags
 
-    # --- CORE severity audit (Stage 07): promote the two headline severity outcomes out
+    # --- CORE severity audit: promote the two headline severity outcomes out
     # of the broad loop into the same formal audit geom/datetime/link already have. ---
     def _core_severity_fragments(self, con, bronze_table, column, aliases):
         """Return (raw_expr, cleaned_expr, valid_expr) for a CORE severity column.
@@ -501,7 +501,7 @@ class Stats19Transformer(BaseTransformer):
                    "accident_reference", "collision_reference", "collision_ref_no",
                    "location_easting_osgr", "location_northing_osgr", "date", "time",
                    "collision_severity", "accident_severity"}
-        # CORE severity audit: raw twin + cleaned INTEGER + valid flag (Stage 07).
+        # CORE severity audit: raw twin + cleaned INTEGER + valid flag.
         sev_raw, sev_clean, sev_valid = self._core_severity_fragments(
             con, self.COLLISION_BRONZE, "collision_severity",
             ["collision_severity", "accident_severity"])
@@ -542,7 +542,7 @@ class Stats19Transformer(BaseTransformer):
             # Prefer the full datetime; fall back to midnight when only the date parsed.
             f"  COALESCE(datetime_parsed, date_parsed) AS datetime_local, "
             f"  (date_parsed IS NOT NULL) AS datetime_valid, "
-            # Filled by the Stage 04 spatial stamp; present now so the schema is stable.
+            # Filled by the spatial stamp; present now so the schema is stable.
             f"  CAST(NULL AS VARCHAR) AS lad_code, "
             f"  CAST(NULL AS VARCHAR) AS ctyua_code, "
             # Filled by _weather_stamp when a weather table exists; NULL otherwise
@@ -550,7 +550,7 @@ class Stats19Transformer(BaseTransformer):
             # Celsius and millimetres.
             f"  CAST(NULL AS DOUBLE) AS temperature_c, "
             f"  CAST(NULL AS DOUBLE) AS precipitation_mm, "
-            # CORE severity audit (Stage 07): raw twin, cleaned INTEGER, valid flag.
+            # CORE severity audit: raw twin, cleaned INTEGER, valid flag.
             f"  {sev_raw}, {sev_clean}, {sev_valid} "
             f"  {broad_sql} "                       # every remaining bronze column, cleaned per manifest
             f"FROM typed"
@@ -579,7 +579,7 @@ class Stats19Transformer(BaseTransformer):
                 rule_desc="collision date is missing or unparseable",
                 severity="reject_dimension", raw_value=str(d))
 
-        # CORE severity ledger: one row per collision_severity_valid = FALSE (Stage 07).
+        # CORE severity ledger: one row per collision_severity_valid = FALSE.
         self._log_missing_codes(con, self.COLLISION_SILVER, self.COLLISION_SID,
                                 "collision_severity", self.COLLISION_SEVERITY_RULE)
 
@@ -612,7 +612,7 @@ class Stats19Transformer(BaseTransformer):
     def _derive_casualty_silver(self, con):
         """Casualty silver: FULL keep-in-place. Existing identity + link_valid UNCHANGED;
         PLUS every remaining bronze column carried + cleaned per the manifest. casualty_severity
-        is CORE-audited (raw twin + cleaned INTEGER + valid flag + ledger, Stage 07), so it is
+        is CORE-audited (raw twin + cleaned INTEGER + valid flag + ledger), so it is
         carved out of the broad loop. Linked to collisions by accident_index (also carries
         vehicle_reference for a finer casualty-to-vehicle link). Orphans are flagged
         link_valid = FALSE + logged (spec §9)."""
@@ -625,7 +625,7 @@ class Stats19Transformer(BaseTransformer):
         # accident_reference fall to the broad loop and are carried, never dropped.
         exclude = {"accident_index", "collision_index", "vehicle_reference",
                    "casualty_reference", "casualty_severity"}
-        # CORE severity audit: raw twin + cleaned INTEGER + valid flag (Stage 07).
+        # CORE severity audit: raw twin + cleaned INTEGER + valid flag.
         sev_raw, sev_clean, sev_valid = self._core_severity_fragments(
             con, self.CASUALTY_BRONZE, "casualty_severity", ["casualty_severity"])
         broad = self._broad_fragments(con, self.CASUALTY_BRONZE, "casualty", exclude)
@@ -637,13 +637,13 @@ class Stats19Transformer(BaseTransformer):
             f"       {acc}, vehicle_reference, casualty_reference, "
             f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
             f"         AS link_valid, "
-            # CORE severity audit (Stage 07): raw twin, cleaned INTEGER, valid flag.
+            # CORE severity audit: raw twin, cleaned INTEGER, valid flag.
             f"       {sev_raw}, {sev_clean}, {sev_valid} "
             f"       {broad_sql} "
             f"FROM {self.CASUALTY_BRONZE}"
         )
         self._log_orphans(con, self.CASUALTY_SILVER, self.CASUALTY_SID, self.CASUALTY_LINK_RULE)
-        # CORE severity ledger: one row per casualty_severity_valid = FALSE (Stage 07).
+        # CORE severity ledger: one row per casualty_severity_valid = FALSE.
         self._log_missing_codes(con, self.CASUALTY_SILVER, self.CASUALTY_SID,
                                 "casualty_severity", self.CASUALTY_SEVERITY_RULE)
 
@@ -681,10 +681,10 @@ class Stats19Transformer(BaseTransformer):
 
     def _spatial_stamp(self, con):
         """Stamp lad_code/ctyua_code onto valid collision points via point-in-polygon
-        against the Step 3 boundary silver tables. Defensive: if a boundary table is
+        against the boundary silver tables. Defensive: if a boundary table is
         absent (e.g. a stats19-only build/test), leave that code NULL and warn — the
-        pipeline still succeeds. ST_Contains needs the boundary R-Tree (built in Step 3)
-        to stay fast (spec §5). area_code is aggregated with min() for a deterministic
+        pipeline still succeeds. ST_Contains needs the boundary R-Tree (built alongside
+        the boundary silver tables) to stay fast (spec §5). area_code is aggregated with min() for a deterministic
         result even if polygons were to overlap (they should not within one vintage)."""
         mode = getattr(self, "_boundary_mode", "snapshot")
         pred = self._boundary_predicate(mode)
@@ -813,9 +813,9 @@ class Stats19Transformer(BaseTransformer):
                         f"code in use (e.g. a new or zero-padded code).", stacklevel=2)
 
     def quality_spec(self):
-        # Three audit units. Collision declares geom/datetime (Stage 02) + severity
-        # (Stage 07); vehicle declares link (Stage 03); casualty declares link (Stage 03)
-        # + severity (Stage 07). Vehicle has no severity field, so it is unchanged.
+        # Three audit units. Collision declares geom/datetime + severity;
+        # vehicle declares link; casualty declares link + severity.
+        # Vehicle has no severity field, so it is unchanged.
         return (
             SourceQuality(
                 self.COLLISION_SID, self.COLLISION_BRONZE, self.COLLISION_SILVER,
