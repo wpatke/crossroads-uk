@@ -4,6 +4,8 @@
 
 # Crossroads-UK
 
+[![tests](https://github.com/wpatke/crossroads-uk/actions/workflows/tests.yml/badge.svg)](https://github.com/wpatke/crossroads-uk/actions/workflows/tests.yml)
+
 A reproducible Python pipeline that downloads, cleanses, and unifies UK road-safety
 (DfT STATS19), meteorological (Copernicus ERA5-Land), and ONS boundary data into a
 single local DuckDB database — built on the fly from version-controlled code.
