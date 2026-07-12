@@ -23,6 +23,7 @@ a documented simplification.
 """
 
 import os
+import zipfile
 
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
@@ -76,15 +77,64 @@ def _licence_message(exc):
     )
 
 
-def _looks_like_licence_error(exc):
-    """Heuristic: does this cdsapi failure look like an unaccepted-licence 403?
+def _too_large_message(exc):
+    """Actionable steps when CDS rejects a request as too large (cost limit exceeded)."""
+    return (
+        "Copernicus rejected the request because it is too large (cost limit exceeded).\n\n"
+        "Crossroads already downloads ERA5-Land one month at a time to stay under this\n"
+        "limit, so this usually means the requested area or variable list was widened.\n"
+        "Reduce the request size and re-run the build.\n\n"
+        f"(underlying cdsapi error: {exc})"
+    )
 
-    cdsapi surfaces this as an HTTP 403 whose text mentions the licence; we match
-    on the tell-tale words rather than a specific exception type (which varies
-    across cdsapi versions).
-    """
+
+def _looks_like_too_large_error(exc):
+    """Heuristic: is this CDS failure a cost/size rejection (a 403 that is NOT a licence
+    problem)? CDS phrases it as 'cost limits exceeded' / 'request is too large' /
+    'reduce your selection'."""
     text = str(exc).lower()
-    return any(word in text for word in ("licence", "license", "403", "forbidden", "not accepted"))
+    return any(word in text for word in ("cost limit", "too large", "reduce your selection"))
+
+
+def _looks_like_licence_error(exc):
+    """Heuristic: does this cdsapi failure look like an unaccepted-licence rejection?
+
+    Match on licence wording ONLY. The previous version also matched bare '403' /
+    'forbidden', but a 'request too large' rejection is also a 403 — that made this
+    function swallow cost/size errors and report them as a licence problem. A cost/size
+    error is explicitly excluded here.
+    """
+    if _looks_like_too_large_error(exc):
+        return False
+    text = str(exc).lower()
+    return any(word in text for word in
+               ("licence", "license", "not accepted", "terms of use"))
+
+
+def _normalize_to_netcdf(path):
+    """Ensure `path` is a plain NetCDF file, unwrapping the CDS zip envelope if present.
+
+    The new Copernicus CADS backend delivers ERA5-Land as a ZIP that wraps a single
+    NetCDF member (e.g. 'data_0.nc'), even when data_format='netcdf' was requested. Our
+    xarray parse path expects a raw .nc, so if `path` is such a zip we replace it in
+    place with its inner NetCDF. A genuine .nc (offline test stubs, or a future CADS that
+    returns raw netcdf) is not a zip, so this is a no-op for it — and idempotent, so it is
+    safe to run again on an already-unwrapped file.
+
+    The replacement is atomic (write a temp, then os.replace), so a crash mid-unwrap
+    leaves the original file intact rather than a half-written one."""
+    if not zipfile.is_zipfile(path):
+        return                                        # already a plain .nc — nothing to do
+    with zipfile.ZipFile(path) as zf:
+        members = [n for n in zf.namelist() if n.endswith(".nc")]
+        if len(members) != 1:
+            raise RuntimeError(
+                f"expected exactly one .nc inside the CDS zip {path}, found {members}")
+        data = zf.read(members[0])
+    tmp = path + ".ncpart"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, path)                             # atomic overwrite: path is now real .nc
 
 
 class Era5WeatherTransformer(BaseTransformer):
@@ -107,6 +157,24 @@ class Era5WeatherTransformer(BaseTransformer):
     def _filename(self, year):
         return f"era5_land_{year}.nc"
 
+    def _month_filename(self, year, month):
+        return f"era5_land_{year}_{month:02d}.nc"
+
+    @staticmethod
+    def _build_request(year, month):
+        """The cdsapi request dict for ONE month of ERA5-Land over the UK. Days 1-31 and
+        all 24 hours are always requested; CDS returns only the timestamps that exist for
+        the month (e.g. February yields 28/29 days), so month length needs no special case."""
+        return {
+            "variable": ["2m_temperature", "total_precipitation"],
+            "year": str(year),
+            "month": [f"{month:02d}"],
+            "day": [f"{d:02d}" for d in range(1, 32)],
+            "time": [f"{h:02d}:00" for h in range(24)],
+            "area": UK_AREA,
+            "data_format": "netcdf",
+        }
+
     def extract(self, cache_dir, **kwargs):
         os.makedirs(cache_dir, exist_ok=True)
         self._years = [int(y) for y in (kwargs.get("years") or [])]
@@ -116,12 +184,16 @@ class Era5WeatherTransformer(BaseTransformer):
                 self._download(year, path)
 
     def _download(self, year, dest):
-        """Download one year of ERA5-Land hourly t2m + tp over the UK as NetCDF.
+        """Download one year of ERA5-Land as twelve per-month NetCDF files, then merge
+        them into `dest` (era5_land_{year}.nc).
 
-        Real path only (needs a Copernicus ~/.cdsapirc). cdsapi is imported lazily so
-        the module and the offline tests do not require the [weather] extra. The file
-        is large; it is cached, so a re-run does not re-download."""
-        import cdsapi                           # lazy: real download only
+        A whole-year request is rejected by CDS as too large (cost limit), so we request
+        one month at a time. Each month is cached and written atomically, so an
+        interrupted build resumes without re-fetching completed months. cdsapi and xarray
+        are imported lazily so the module and the offline tests do not require the
+        [weather] extra."""
+        import cdsapi                                   # lazy: real download only
+        cache_dir = os.path.dirname(dest)
 
         # cdsapi raises a bare, cryptic exception when it can't find the API key
         # (no ~/.cdsapirc and no CDSAPI_* env vars). Translate it into setup steps.
@@ -130,27 +202,63 @@ class Era5WeatherTransformer(BaseTransformer):
         except Exception as exc:
             raise RuntimeError(_missing_key_message(exc)) from exc
 
+        month_paths = []
+        for month in range(1, 13):
+            mpath = os.path.join(cache_dir, self._month_filename(year, month))
+            if not os.path.exists(mpath):               # RESUME: skip completed months
+                self._download_month(client, year, month, mpath)
+            month_paths.append(mpath)
+
+        self._merge_months(month_paths, dest)           # writes dest atomically
+        for mpath in month_paths:                        # cleanup: yearly file is the cache key now
+            os.remove(mpath)
+
+    def _download_month(self, client, year, month, dest):
+        """Retrieve ONE month to `dest`, written atomically: download to a '.part' temp
+        file and rename to the final name only on success. A killed download therefore
+        never leaves a partial .nc that the resume check (os.path.exists) would mistake
+        for a complete month."""
+        tmp = dest + ".part"
         try:
-            client.retrieve(
-                "reanalysis-era5-land",
-                {
-                    "variable": ["2m_temperature", "total_precipitation"],
-                    "year": str(year),
-                    "month": [f"{m:02d}" for m in range(1, 13)],
-                    "day": [f"{d:02d}" for d in range(1, 32)],
-                    "time": [f"{h:02d}:00" for h in range(24)],
-                    "area": UK_AREA,
-                    "data_format": "netcdf",
-                },
-                dest,
-            )
+            client.retrieve("reanalysis-era5-land", self._build_request(year, month), tmp)
         except Exception as exc:
-            # The common post-auth failure is not having accepted the ERA5-Land
-            # licence (a 403). Give targeted help for that; otherwise let the real
-            # error through unchanged (network, disk, etc. are self-explanatory).
+            if os.path.exists(tmp):
+                os.remove(tmp)                       # never leave a partial temp behind
+            # Give targeted help for the two common post-auth failures; otherwise let the
+            # real error through unchanged (network, disk, etc. are self-explanatory).
             if _looks_like_licence_error(exc):
                 raise RuntimeError(_licence_message(exc)) from exc
+            if _looks_like_too_large_error(exc):
+                raise RuntimeError(_too_large_message(exc)) from exc
             raise
+        _normalize_to_netcdf(tmp)                     # unwrap the CDS zip envelope if present
+        os.rename(tmp, dest)                          # atomic promote on success
+
+    def _merge_months(self, month_paths, dest):
+        """Concatenate the monthly NetCDF files into a single yearly file at `dest`,
+        sorted on the time axis, written atomically. Eager xarray only (no dask, so no
+        open_mfdataset). Tolerates the 'valid_time' or 'time' coordinate name across CDS
+        vintages, the same way _load_bronze does."""
+        import xarray as xr                            # lazy: real download/merge only
+        datasets = [xr.open_dataset(p) for p in sorted(month_paths)]
+        tmp = dest + ".part"
+        try:
+            first = datasets[0]
+            tname = "valid_time" if ("valid_time" in first.variables
+                                     or "valid_time" in first.coords) else "time"
+            combined = xr.concat(datasets, dim=tname).sortby(tname)
+            try:
+                combined.to_netcdf(tmp)
+            finally:
+                combined.close()
+        except Exception:
+            if os.path.exists(tmp):
+                os.remove(tmp)                          # do not leave a partial merge
+            raise
+        finally:
+            for ds in datasets:
+                ds.close()
+        os.rename(tmp, dest)                            # atomic promote on success
 
     # --- transform_and_load ------------------------------------------------
     def transform_and_load(self, con, cache_dir):

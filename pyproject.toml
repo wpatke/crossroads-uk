@@ -73,4 +73,5 @@ testpaths = ["tests"]
 addopts = "-m 'not integration'"
 markers = [
   "integration: end-to-end tests against real components or live services (may be slow or reach the internet); deselected by default, run with -m integration",
+  "live: opt-in tests that hit the real Copernicus CDS (needs ~/.cdsapirc and CROSSROADS_RUN_LIVE=1); skipped by default",
 ]
