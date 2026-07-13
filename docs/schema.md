@@ -205,6 +205,24 @@ CREATE TABLE weather (
 );
 ```
 
+### `bank_holidays`
+
+One row per bank holiday per UK division (GOV.UK feed). A reference/lookup dimension — it is
+loaded from a *live* feed, so it is **quality-exempt** (recorded in `quality_exemptions`, not
+audited) and not covered by the spec §2 reproducibility guarantee. See
+[transformers/bank_holidays.py](../src/crossroads/transformers/bank_holidays.py).
+
+```sql
+CREATE TABLE bank_holidays (
+    source_row_key         VARCHAR,     -- stable key: division | date | title (unique per event)
+    date                   DATE,        -- the bank-holiday date (UK local calendar date), typed from the feed
+    division               VARCHAR,     -- 'england-and-wales' | 'scotland' | 'northern-ireland'
+    title                  VARCHAR,     -- holiday name as published (e.g. 'Easter Monday')
+    notes                  VARCHAR,     -- feed notes (e.g. 'Substitute day'); '' when none
+    bunting                BOOLEAN      -- feed 'bunting' flag (celebratory-day marker)
+);
+```
+
 ### `lad_boundaries`
 
 One row per ONS Local Authority District boundary per vintage. See
@@ -254,6 +272,8 @@ Filtered projections researchers query by default — no new data, derived from 
 - **`<source>_clean`** (`vehicles_clean`, `casualties_clean`, `weather_clean`,
   `lad_boundaries_clean`, `ctyua_boundaries_clean`) — the silver table filtered to its own
   validity flag (`link_valid` for vehicles/casualties, `geom_valid` for weather/boundaries).
+- **`bank_holidays_clean`** — the `bank_holidays` dimension has no reject flag, so this view is an
+  unfiltered passthrough (every silver row) kept for naming consistency.
 - **`<source>_labelled`** (`collisions_labelled`, `vehicles_labelled`, `casualties_labelled`)
   — the silver table plus an `<column>_label` text twin for every coded column, decoded via
   the `codebook` join. Labels are computed on demand, never stored; query the silver table for

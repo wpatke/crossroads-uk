@@ -1,0 +1,31 @@
+{
+  "england-and-wales": {
+    "division": "england-and-wales",
+    "events": [
+      {"title": "New Year’s Day", "date": "2023-01-02", "notes": "Substitute day", "bunting": true},
+      {"title": "Good Friday", "date": "2023-04-07", "notes": "", "bunting": false},
+      {"title": "Easter Monday", "date": "2023-04-10", "notes": "", "bunting": true},
+      {"title": "Christmas Day", "date": "2023-12-25", "notes": "", "bunting": true},
+      {"title": "Boxing Day", "date": "2023-12-26", "notes": "", "bunting": true}
+    ]
+  },
+  "scotland": {
+    "division": "scotland",
+    "events": [
+      {"title": "New Year’s Day", "date": "2023-01-02", "notes": "Substitute day", "bunting": true},
+      {"title": "2nd January", "date": "2023-01-03", "notes": "Substitute day", "bunting": true},
+      {"title": "Good Friday", "date": "2023-04-07", "notes": "", "bunting": false},
+      {"title": "Christmas Day", "date": "2023-12-25", "notes": "", "bunting": true},
+      {"title": "Boxing Day", "date": "2023-12-26", "notes": "", "bunting": true}
+    ]
+  },
+  "northern-ireland": {
+    "division": "northern-ireland",
+    "events": [
+      {"title": "New Year’s Day", "date": "2023-01-02", "notes": "Substitute day", "bunting": true},
+      {"title": "St Patrick’s Day", "date": "2023-03-17", "notes": "", "bunting": true},
+      {"title": "Christmas Day", "date": "2023-12-25", "notes": "", "bunting": true},
+      {"title": "Boxing Day", "date": "2023-12-26", "notes": "", "bunting": true}
+    ]
+  }
+}

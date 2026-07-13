@@ -46,13 +46,32 @@ Replace `[year]` with the year you downloaded/used the data.
 
 ---
 
+## 4. GOV.UK Bank Holidays
+
+- **Publisher:** Government Digital Service (GDS), GOV.UK.
+- **Dataset:** UK bank holidays as a JSON feed at
+  [https://www.gov.uk/bank-holidays.json](https://www.gov.uk/bank-holidays.json), carrying the
+  three UK divisions — england-and-wales, scotland, northern-ireland — which genuinely differ.
+- **Licence:** [Open Government Licence v3.0](https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/)
+  — attribution, not acceptance (nothing to click); attribute to GOV.UK / GDS when you publish.
+- **Loaded into:** the `bank_holidays` dimension table (see [docs/schema.md](schema.md)), and used to
+  stamp `collisions.is_bank_holiday` per the collision's nation.
+- **Caveat — not reproducible, rolling window:** this feed is *live* and spans only a recent window
+  (roughly 2018 onward, about a year ahead), so this source is **deliberately exempt from the spec §2
+  reproducibility guarantee** (recorded in the `quality_exemptions` table). Collision dates outside
+  the feed's coverage resolve to `is_bank_holiday = NULL` (unknown) — never `FALSE` — so a historical
+  STATS19 collision predating the feed is correctly marked "no data", not "not a holiday".
+
+---
+
 ## Why the build does not gate on licences
 
 - **Copernicus** acceptance is performed on the CDS portal, not in this tool. Possessing a
   valid API key implies acceptance; the un-accepted case already produces an actionable
   error at download time.
-- **OGL** (STATS19, ONS) requires **attribution, not acceptance** — there is nothing to
-  click. The obligation is on you at publication, and is documented above so you can meet it.
+- **OGL** (STATS19, ONS, GOV.UK bank holidays) requires **attribution, not acceptance** — there
+  is nothing to click. The obligation is on you at publication, and is documented above so you can
+  meet it.
 
 Crossroads-UK therefore informs rather than blocks: the wizard points you here, and you
 remain responsible for honouring these licences in any published work.
