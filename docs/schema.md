@@ -60,6 +60,7 @@ CREATE TABLE collisions (
     precipitation_mm       DOUBLE,      -- hourly precipitation (mm) from the ERA5-Land cell; NULL if weather not built / no match
     solar_elevation_deg    DOUBLE,      -- sun's apparent elevation above the horizon (deg, refraction-corrected; negative = below horizon/night); computed mathematically (NOAA) from geom + datetime_local; NULL if geom/datetime invalid
     solar_azimuth_deg      DOUBLE,      -- sun's azimuth (deg clockwise from true north: 0=N/90=E/180=S/270=W) at the collision place/time; NULL if geom/datetime invalid
+    is_bank_holiday        BOOLEAN,     -- TRUE if the collision's date is a bank holiday in its nation (from lad_code prefix); FALSE if a known non-holiday in-coverage; NULL if unknown (no/unknown nation, no date, or date outside the gov.uk feed's coverage)
     collision_severity_raw VARCHAR,     -- raw severity code as published (kept for the ledger)
     collision_severity     INTEGER,     -- cleaned code 1=Fatal 2=Serious 3=Slight (codebook); NULL if a missing sentinel
     collision_severity_valid BOOLEAN,   -- FALSE when the severity code was a missing/unparseable sentinel

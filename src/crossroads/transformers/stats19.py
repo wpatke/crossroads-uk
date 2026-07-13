@@ -64,13 +64,13 @@ class Stats19Transformer(BaseTransformer):
 
     source_id = "stats19"          # registry identity; audit units are the three below
 
-    # STATS19 stamps codes from the boundary tables (and, once weather is built,
-    # weather metrics) onto its own collisions table, so those sources must import
+    # STATS19 stamps codes from the boundary tables, weather metrics, and the
+    # bank-holiday flag onto its own collisions table, so those sources must import
     # first. Declared explicitly rather than relying on source_id alphabetical order.
     # Optional: any of these not selected this build is skipped (guarded at ETL time).
-    # "era5_weather" is included now so the ordering is correct the moment the weather
-    # source exists; until then the edge is inert (era5_weather simply isn't active).
-    depends_on = ("era5_weather", "ons_lad", "ons_ctyua")
+    # "era5_weather"/"bank_holidays" are included so the ordering is correct whenever
+    # each source is active; when one isn't selected, its edge is simply inert.
+    depends_on = ("bank_holidays", "era5_weather", "ons_lad", "ons_ctyua")
 
     # --- audit source_ids (one per bronze/silver pair) ---
     COLLISION_SID = "stats19_collision"
@@ -459,6 +459,10 @@ class Stats19Transformer(BaseTransformer):
         # with a geom + datetime, computed mathematically (NOAA). Always-on, no download.
         self._solar_stamp(con)
 
+        # --- BANK-HOLIDAY STAMP (optional): fill is_bank_holiday from the bank_holidays
+        # dimension if it was built this run. Needs lad_code (set by _spatial_stamp above).
+        self._bank_holiday_stamp(con)
+
         # --- GOLD: the valid-geometry collision projection (spec §9 worked example). ---
         create_clean_view(con, "collisions_spatial", self.COLLISION_SILVER, ["geom_valid"])
 
@@ -561,6 +565,11 @@ class Stats19Transformer(BaseTransformer):
             # azimuth clockwise from true north (0=N/90=E/180=S/270=W).
             f"  CAST(NULL AS DOUBLE) AS solar_elevation_deg, "
             f"  CAST(NULL AS DOUBLE) AS solar_azimuth_deg, "
+            # Filled by _bank_holiday_stamp when a bank_holidays table exists: TRUE if the
+            # collision's date is a bank holiday in its nation, FALSE if a known non-holiday
+            # in-coverage, NULL if unknown (no/unknown nation, no date, or date outside the
+            # feed's coverage for that nation). NULL is a first-class "unknown", not a reject.
+            f"  CAST(NULL AS BOOLEAN) AS is_bank_holiday, "
             # CORE severity audit: raw twin, cleaned INTEGER, valid flag.
             f"  {sev_raw}, {sev_clean}, {sev_valid} "
             f"  {broad_sql} "                       # every remaining bronze column, cleaned per manifest
@@ -756,6 +765,60 @@ class Stats19Transformer(BaseTransformer):
             f"     AND date_trunc('hour', w.valid_time_local) = date_trunc('hour', c2.datetime_local)"
             f"  ) j "
             f"  GROUP BY k"
+            f") m WHERE c.source_row_key = m.k"
+        )
+
+    def _bank_holiday_stamp(self, con):
+        """Stamp is_bank_holiday onto collisions from the bank_holidays dimension.
+
+        Tri-state, per the locked requirement — "known not a holiday" must be distinct
+        from "no data":
+          • NULL  if the nation can't be determined (no/unknown lad_code), the date didn't
+                  parse (datetime_local NULL), or the date is OUTSIDE the feed's coverage
+                  for that nation.
+          • TRUE  if the date is a bank holiday in that nation.
+          • FALSE only if the date is within coverage for that nation and is not a holiday.
+
+        Nation comes from the ONS LAD code prefix (a stable GSS convention):
+          E…/W… -> england-and-wales   S… -> scotland   N… -> northern-ireland   else NULL.
+        Coverage is per division: the [min(year), max(year)] span of that division's events
+        in the feed (the feed publishes contiguous whole years). Set-based UPDATE, no loop.
+
+        Guarded like _weather_stamp: if bank_holidays was not built this run (source not
+        selected), warn and leave the column NULL — collisions still build."""
+        if not self._table_exists(con, "bank_holidays"):
+            warnings.warn(
+                "stats19: bank_holidays table not found; is_bank_holiday left NULL "
+                "(build the bank_holidays dataset alongside stats19 to enable the flag).",
+                stacklevel=2)
+            return
+        con.execute(
+            f"UPDATE {self.COLLISION_SILVER} AS c SET is_bank_holiday = m.val "
+            f"FROM ("
+            f"  WITH cov AS ("                              # per-division coverage years
+            f"    SELECT division, min(year(date)) AS min_y, max(year(date)) AS max_y "
+            f"    FROM bank_holidays GROUP BY division"
+            f"  ), cold AS ("                               # each collision -> its nation + date
+            f"    SELECT source_row_key AS k, "
+            f"           CAST(datetime_local AS DATE) AS cdate, "
+            f"           CASE "
+            f"             WHEN lad_code LIKE 'E%' OR lad_code LIKE 'W%' THEN 'england-and-wales' "
+            f"             WHEN lad_code LIKE 'S%' THEN 'scotland' "
+            f"             WHEN lad_code LIKE 'N%' THEN 'northern-ireland' "
+            f"             ELSE NULL END AS division "
+            f"    FROM {self.COLLISION_SILVER}"
+            f"  ) "
+            f"  SELECT cold.k AS k, "
+            f"    CASE "
+            f"      WHEN cold.division IS NULL THEN NULL "                 # unknown nation
+            f"      WHEN cold.cdate IS NULL THEN NULL "                    # no parsed date
+            f"      WHEN cov.min_y IS NULL THEN NULL "                     # nation absent from feed
+            f"      WHEN year(cold.cdate) NOT BETWEEN cov.min_y AND cov.max_y THEN NULL "  # out of coverage
+            f"      WHEN EXISTS (SELECT 1 FROM bank_holidays bh "
+            f"                   WHERE bh.division = cold.division AND bh.date = cold.cdate) THEN TRUE "
+            f"      ELSE FALSE "                                           # in coverage, not a holiday
+            f"    END AS val "
+            f"  FROM cold LEFT JOIN cov ON cov.division = cold.division"
             f") m WHERE c.source_row_key = m.k"
         )
 

@@ -28,6 +28,7 @@ def test_stats19_is_user_selectable_with_default_display_name():
 def test_stats19_declares_optional_dependencies():
     deps = Stats19Transformer().depends_on
     assert "era5_weather" in deps and "ons_lad" in deps and "ons_ctyua" in deps
+    assert "bank_holidays" in deps          # consumed by the is_bank_holiday stamp
 
 def _seed_cache(cache_dir):
     os.makedirs(cache_dir, exist_ok=True)
@@ -1107,3 +1108,97 @@ def test_solar_stamp_applies_bst_offset_in_summer(tmp_path):
     # Tight azimuth band: a BST-ignoring bug lands ~1h past noon (~197 deg) and fails here.
     assert abs(az - 180) < 6, f"summer-noon (BST) azimuth was {az} — BST offset not applied?"
     con.close()
+
+
+# --- Bank-holiday stamp (is_bank_holiday tri-state) --------------------------
+
+def test_bank_holiday_stamp_tri_state_and_division(con):
+    """Unit: drive _bank_holiday_stamp on synthetic tables and assert every tri-state
+    case + per-nation routing. Deterministic — no dependence on the real calendar."""
+    # Synthetic bank_holidays: coverage = 2023 for both divisions. Deliberate divergence:
+    #   Easter Monday 2023-04-10 -> england-and-wales ONLY
+    #   2nd January  2023-01-03 -> scotland ONLY
+    con.execute(
+        "CREATE TABLE bank_holidays AS SELECT * FROM (VALUES "
+        "  ('england-and-wales', DATE '2023-04-10', 'Easter Monday'), "
+        "  ('england-and-wales', DATE '2023-01-02', 'New Year'), "
+        "  ('scotland',          DATE '2023-01-03', '2nd January'), "
+        "  ('scotland',          DATE '2023-01-02', 'New Year') "
+        ") AS t(division, date, title)")
+    # Synthetic collisions: one row per case. is_bank_holiday starts NULL.
+    con.execute(
+        "CREATE TABLE collisions AS SELECT * FROM (VALUES "
+        "  ('A', 'E06000001', TIMESTAMP '2023-04-10 09:00'), "  # Eng holiday      -> TRUE
+        "  ('B', 'E06000001', TIMESTAMP '2023-06-15 09:00'), "  # Eng non-holiday  -> FALSE
+        "  ('C', 'S12000033', TIMESTAMP '2023-04-10 09:00'), "  # same date, Scot  -> FALSE (routing)
+        "  ('D', 'E06000001', TIMESTAMP '1999-04-10 09:00'), "  # out of coverage  -> NULL
+        "  ('E', NULL,        TIMESTAMP '2023-04-10 09:00'), "  # unknown nation   -> NULL
+        "  ('F', 'S12000033', TIMESTAMP '2023-01-03 09:00'), "  # Scot-only holiday-> TRUE
+        "  ('W', 'W06000001', TIMESTAMP '2023-04-10 09:00')  "  # Wales->eng cal   -> TRUE
+        ") AS t(source_row_key, lad_code, datetime_local) ")
+    con.execute("ALTER TABLE collisions ADD COLUMN is_bank_holiday BOOLEAN")
+
+    Stats19Transformer()._bank_holiday_stamp(con)
+
+    got = dict(con.execute(
+        "SELECT source_row_key, is_bank_holiday FROM collisions").fetchall())
+    assert got["A"] is True
+    assert got["B"] is False
+    assert got["C"] is False        # division routing: an Eng holiday is NOT a Scot holiday
+    assert got["D"] is None         # outside feed coverage -> unknown, not FALSE
+    assert got["E"] is None         # unknown nation -> unknown
+    assert got["F"] is True
+    assert got["W"] is True         # Wales resolves to the england-and-wales calendar
+
+
+def test_stats19_plus_bank_holidays_stamps_collisions_offline(tmp_path):
+    """Combined offline build: the flag column is present, the row count is unchanged by
+    the stamp, and at least one collision resolves to a determinable (non-NULL) value."""
+    from crossroads.transformers.bank_holidays import BankHolidaysTransformer
+    cache = str(tmp_path / "cache")
+    _seed_cache(cache); _seed_ons_cache(cache)
+    shutil.copy(
+        os.path.join(os.path.dirname(__file__), "fixtures", "bank_holidays",
+                     "bank-holidays-sample.json"),
+        os.path.join(cache, "bank-holidays.json"))
+    client = crossroads.init_engine(cache_dir=cache)
+    client.registry._transformers = [
+        CTYUABoundaryTransformer(), LADBoundaryTransformer(),
+        Stats19Transformer(), BankHolidaysTransformer()]      # get_active orders bh first
+    client.build(datasets=["stats19", "bank_holidays"], years=YEARS)
+    try:
+        cols = [r[0] for r in client.con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='collisions'").fetchall()]
+        assert "is_bank_holiday" in cols
+        total = client.con.execute("SELECT count(*) FROM collisions").fetchone()[0]
+        assert total > 0                                        # row count unchanged by an UPDATE
+        # At least one collision resolves to a determinable value: the 2023 GB fixture
+        # collisions have E/S/W lad_codes and 2023 dates within the fixture's 2023 coverage.
+        determinable = client.con.execute(
+            "SELECT count(*) FROM collisions WHERE is_bank_holiday IS NOT NULL").fetchone()[0]
+        assert determinable >= 1, (
+            "No collision resolved to TRUE/FALSE — check that the committed STATS19 collision "
+            "fixture has valid lad_codes (spatial join) and 2023 dates within the bank-holidays "
+            "fixture's coverage.")
+    finally:
+        client.close()
+
+
+def test_bank_holiday_flag_null_without_source(tmp_path):
+    """Guard: a STATS19-only build (no bank_holidays table) leaves is_bank_holiday all
+    NULL and warns."""
+    import warnings
+    client = _stats19_client(tmp_path)                          # registry = [Stats19] only
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        client.build(years=YEARS)
+    cols = [r[0] for r in client.con.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='collisions'").fetchall()]
+    assert "is_bank_holiday" in cols                            # column always present
+    nonnull = client.con.execute(
+        "SELECT count(*) FROM collisions WHERE is_bank_holiday IS NOT NULL").fetchone()[0]
+    assert nonnull == 0                                         # no bank_holidays -> all NULL
+    assert any("bank_holidays table not found" in str(x.message) for x in w)
+    client.close()
