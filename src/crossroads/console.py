@@ -7,6 +7,7 @@ no real stdin/stdout and no network. Production wires ``reader = lambda: input()
 and ``writer = print`` (see ``main`` below).
 """
 
+import os
 from datetime import date
 
 from crossroads import init_engine  # used by run_build below
@@ -48,6 +49,17 @@ def _prompt(reader, writer, message, *, parse, default=None):
             return parse(raw)
         except ValueError as exc:
             writer(f"  Invalid input: {exc}. Please try again.")
+
+
+def _prompt_secret(secret_reader, writer, message):
+    """Show `message` via writer, then read one masked/secret line via secret_reader.
+
+    Same label-then-read shape as _prompt, but the value is read through the
+    injected secret_reader (getpass in production, scripted in tests) so it is
+    never echoed to the terminal.
+    """
+    writer(f"{message}: ")
+    return secret_reader().strip()
 
 
 def _parse_database_path(raw):
@@ -203,6 +215,45 @@ def gather_parameters(reader, writer, *, available=None):
     }
 
 
+# --- Copernicus CDS credential handling (weather dataset) --------------------
+
+
+def _cdsapirc_path():
+    """Location of the cdsapi credentials file in the user's home directory."""
+    return os.path.expanduser("~/.cdsapirc")
+
+
+def _cds_key_present():
+    """True when cdsapi already has credentials, so the wizard should not prompt.
+
+    Matches the sources cdsapi.Client() actually reads: both CDSAPI_* environment
+    variables set, OR a ~/.cdsapirc file already on disk.
+    """
+    if os.environ.get("CDSAPI_URL") and os.environ.get("CDSAPI_KEY"):
+        return True
+    return os.path.exists(_cdsapirc_path())
+
+
+def _write_cdsapirc(token, cds_home_url):
+    """Write ~/.cdsapirc with the fixed CDS url and the user's token.
+
+    Written atomically (temp file + os.replace) so a crash never leaves a half
+    file, and with owner-only permissions because it holds a credential. The
+    format mirrors weather.py's _missing_key_message so cdsapi.Client() reads it
+    unchanged.
+    """
+    path = _cdsapirc_path()
+    content = f"url: {cds_home_url}/api\nkey: {token}\n"
+    tmp = path + ".part"
+    with open(tmp, "w") as fh:
+        fh.write(content)
+    try:
+        os.chmod(tmp, 0o600)   # owner read/write only; POSIX best-effort
+    except OSError:
+        pass                   # platforms without POSIX perms: skip silently
+    os.replace(tmp, path)      # atomic promote
+
+
 # --- Confirmation, build wiring, and the entry point ------------------------
 
 
@@ -215,11 +266,14 @@ def _parse_yes_no(raw):
     raise ValueError("answer 'y' or 'n'")
 
 
-def prompt_confirm(reader, writer, *, default=True):
-    """Ask the user to confirm before the (possibly long) build runs."""
+def prompt_confirm(reader, writer, *, message="Proceed with the build? (y/n)", default=True):
+    """Ask a yes/no question before a (possibly long) action.
+
+    Reused for both the build confirmation and the 'continue without weather' branch.
+    """
     # Options are shown lowercase; the default is indicated by the "[y]"/"[n]"
     # suffix that _prompt appends from the default value below.
-    return _prompt(reader, writer, "Proceed with the build? (y/n)",
+    return _prompt(reader, writer, message,
                    parse=_parse_yes_no, default=("y" if default else "n"))
 
 
@@ -260,13 +314,86 @@ def run_build(params, *, engine_factory=init_engine, cache_dir=None, writer=None
     return client
 
 
-def run_wizard(reader, writer, *, engine_factory=init_engine, cache_dir=None, available=None):
+def ensure_weather_credentials(params, reader, secret_reader, writer):
+    """Make sure a CDS API key exists before a weather build; prompt and save one if not.
+
+    Returns True to proceed with the build, False to abort ('nothing to build').
+    May remove 'era5_weather' from params['datasets'] if the user chooses to
+    continue without weather. A no-op when weather is not selected or a key is
+    already configured — so a returning user never sees a prompt.
+    """
+    # Imported lazily so importing console stays cheap and to reuse the exact
+    # CDS constants/source id from the weather transformer (DRY).
+    from crossroads.transformers.weather import (
+        Era5WeatherTransformer, CDS_HOME_URL, ERA5_LAND_URL)
+    weather_id = Era5WeatherTransformer.source_id
+
+    if weather_id not in params["datasets"]:
+        return True                      # weather not selected: nothing to do
+    if _cds_key_present():
+        return True                      # already configured: no prompt
+
+    writer("")                           # spacer before the credential block
+    writer("Weather data needs a free Copernicus CDS API key, and none was found")
+    writer("on this machine (no ~/.cdsapirc and no CDSAPI_* environment variables).")
+    writer(f"Get your token from {CDS_HOME_URL} (log in -> your profile ->")
+    writer("'Personal Access Token').")
+
+    while True:
+        token = _prompt_secret(secret_reader, writer,
+                               "Personal Access Token (leave blank to skip)")
+        if token:
+            try:
+                _write_cdsapirc(token, CDS_HOME_URL)
+            except OSError as exc:
+                # Rare (e.g. a read-only home directory). Don't crash with a raw
+                # traceback: explain the problem, show the file to create by hand,
+                # then abort cleanly.
+                writer("")
+                writer(f"Could not write {_cdsapirc_path()}: {exc}")
+                writer("Create it by hand with these two lines, then re-run:")
+                writer(f"    url: {CDS_HOME_URL}/api")
+                writer("    key: <your token>")
+                return False
+            writer("Saved ~/.cdsapirc.")
+            writer("")
+            writer("Note: you must also accept the ERA5-Land licence once (free) at")
+            writer(f"  {ERA5_LAND_URL}")
+            writer("  (Download tab -> Terms of use -> Accept)")
+            return True
+
+        # Blank token: offer to continue without weather. Default N re-asks for a key.
+        if prompt_confirm(reader, writer,
+                          message="Continue without weather data? (y/n)",
+                          default=False):
+            params["datasets"] = [d for d in params["datasets"] if d != weather_id]
+            if not params["datasets"]:
+                writer("Nothing to build — aborted.")
+                return False
+            writer("Continuing without weather data.")
+            return True
+        # 'n' or blank: loop back and re-ask for the token.
+
+
+def run_wizard(reader, writer, *, secret_reader=None, engine_factory=init_engine,
+               cache_dir=None, available=None):
     """Drive the full wizard. Returns the built Client, or None if the user declined.
 
-    All I/O is injected so this is fully testable with scripted input. ``available``
-    overrides the dataset menu for deterministic tests.
+    All I/O is injected so this is fully testable with scripted input.
+    ``secret_reader`` reads the (masked) CDS token; it defaults to a getpass-backed
+    reader in production and is injected by tests. ``available`` overrides the
+    dataset menu for deterministic tests.
     """
+    if secret_reader is None:
+        import getpass
+        # Label is printed via writer; pass an empty getpass prompt so nothing
+        # extra is shown, and the typed token is not echoed.
+        secret_reader = lambda: getpass.getpass("")
+
     params = gather_parameters(reader, writer, available=available)
+    if not ensure_weather_credentials(params, reader, secret_reader, writer):
+        writer("Aborted — no database was built.")
+        return None
     writer(format_summary(params))
     writer(LICENCE_NOTICE)          # non-blocking reminder; not a prompt
     if not prompt_confirm(reader, writer, default=True):

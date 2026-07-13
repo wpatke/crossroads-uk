@@ -29,6 +29,32 @@ def scripted(answers):
     return reader, writer, output
 
 
+def scripted_secret(tokens):
+    """Return a secret_reader that replays `tokens` in order (masked-input stand-in)."""
+    tokens = list(tokens)
+    def secret_reader():
+        return tokens.pop(0)
+    return secret_reader
+
+
+def _boom_secret():
+    """A secret_reader that fails if called — proves the prompt was NOT shown."""
+    def secret_reader():
+        raise AssertionError("secret_reader was called but no prompt was expected")
+    return secret_reader
+
+
+def _isolate_cds(monkeypatch, tmp_path):
+    """Point ~/.cdsapirc at an empty tmp home and clear CDSAPI_* env vars.
+
+    os.path.expanduser("~") honors $HOME on Linux/macOS (the dev + CI platforms),
+    so this keeps the credential tests hermetic — they never touch the real file.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CDSAPI_URL", raising=False)
+    monkeypatch.delenv("CDSAPI_KEY", raising=False)
+
+
 # A fixed one-dataset menu so the full-flow tests don't depend on live discovery.
 MENU = [("stats19", "stats19")]
 
@@ -291,8 +317,12 @@ def test_console_script_registered():
 
 
 @pytest.mark.integration
-def test_wizard_builds_weather_offline(tmp_path):
+def test_wizard_builds_weather_offline(tmp_path, monkeypatch):
     pytest.importorskip("xarray")
+    # A configured key bypasses the new credential prompt so this build test stays
+    # focused on the offline weather build (the prompt is covered by its own tests).
+    monkeypatch.setenv("CDSAPI_URL", "https://example.invalid/api")
+    monkeypatch.setenv("CDSAPI_KEY", "test-key")
     cache = str(tmp_path / "cache"); _seed_full_cache(cache)
     shutil.copy(os.path.join(os.path.dirname(__file__), "fixtures", "weather", "era5_land_sample.nc"),
                 os.path.join(cache, "era5_land_2023.nc"))
@@ -305,5 +335,125 @@ def test_wizard_builds_weather_offline(tmp_path):
         assert client.con.execute("SELECT count(*) FROM weather").fetchone()[0] > 0
         assert client.con.execute(
             "SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL").fetchone()[0] >= 1
+    finally:
+        client.close()
+
+
+# --- CDS API key prompt (weather credentials) -------------------------------
+
+
+def test_weather_key_prompt_saves_file(tmp_path, monkeypatch):
+    # First run, no key configured: prompting for a token writes ~/.cdsapirc and proceeds.
+    _isolate_cds(monkeypatch, tmp_path)
+    reader, writer, output = scripted([])                 # y/n reader unused here
+    secret = scripted_secret(["MY-TOKEN-123"])
+    params = {"datasets": ["era5_weather", "stats19"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, secret, writer) is True
+    rc = tmp_path / ".cdsapirc"
+    assert rc.read_text() == "url: https://cds.climate.copernicus.eu/api\nkey: MY-TOKEN-123\n"
+    assert params["datasets"] == ["era5_weather", "stats19"]     # unchanged
+    assert any("Saved ~/.cdsapirc." in line for line in output)
+
+
+def test_weather_key_skipped_when_file_present(tmp_path, monkeypatch):
+    # An existing ~/.cdsapirc means no prompt, and the file is left untouched.
+    _isolate_cds(monkeypatch, tmp_path)
+    rc = tmp_path / ".cdsapirc"
+    rc.write_text("url: x\nkey: y\n")
+    before = rc.read_text()
+    reader, writer, _ = scripted([])
+    params = {"datasets": ["era5_weather"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, _boom_secret(), writer) is True
+    assert rc.read_text() == before                       # not rewritten
+
+
+def test_weather_key_skipped_when_env_present(tmp_path, monkeypatch):
+    # CDSAPI_* env vars count as configured: no prompt, no file written.
+    _isolate_cds(monkeypatch, tmp_path)
+    monkeypatch.setenv("CDSAPI_URL", "https://example.invalid/api")
+    monkeypatch.setenv("CDSAPI_KEY", "abc")
+    reader, writer, _ = scripted([])
+    params = {"datasets": ["era5_weather"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, _boom_secret(), writer) is True
+    assert not (tmp_path / ".cdsapirc").exists()
+
+
+def test_no_prompt_when_weather_not_selected(tmp_path, monkeypatch):
+    # No weather in the build: the credential gate is off entirely.
+    _isolate_cds(monkeypatch, tmp_path)
+    reader, writer, _ = scripted([])
+    params = {"datasets": ["stats19"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, _boom_secret(), writer) is True
+    assert not (tmp_path / ".cdsapirc").exists()
+
+
+def test_blank_token_continue_drops_weather(tmp_path, monkeypatch):
+    # Blank token + "continue without weather? y" drops weather but builds the rest.
+    _isolate_cds(monkeypatch, tmp_path)
+    reader, writer, output = scripted(["y"])              # "Continue without weather?" -> yes
+    secret = scripted_secret([""])                        # blank token
+    params = {"datasets": ["era5_weather", "stats19"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, secret, writer) is True
+    assert params["datasets"] == ["stats19"]              # weather dropped
+    assert not (tmp_path / ".cdsapirc").exists()
+
+
+def test_blank_token_weather_only_aborts(tmp_path, monkeypatch):
+    # Blank token + "continue? y" with weather as the only dataset aborts cleanly.
+    _isolate_cds(monkeypatch, tmp_path)
+    reader, writer, output = scripted(["y"])
+    secret = scripted_secret([""])
+    params = {"datasets": ["era5_weather"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, secret, writer) is False
+    assert any("Nothing to build" in line for line in output)
+
+
+def test_blank_token_then_reenter_saves(tmp_path, monkeypatch):
+    # Blank token, decline continuing, then enter a real token -> saved and proceeds.
+    _isolate_cds(monkeypatch, tmp_path)
+    reader, writer, _ = scripted(["n"])                   # decline "continue without weather"
+    secret = scripted_secret(["", "REAL-TOKEN"])          # blank, then a real token
+    params = {"datasets": ["era5_weather"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, secret, writer) is True
+    assert (tmp_path / ".cdsapirc").read_text().endswith("key: REAL-TOKEN\n")
+    assert params["datasets"] == ["era5_weather"]
+
+
+def test_weather_key_write_failure_is_friendly(tmp_path, monkeypatch):
+    # A failed save gives a friendly message and a clean abort, not a traceback.
+    _isolate_cds(monkeypatch, tmp_path)
+    def boom(*a, **k):
+        raise OSError("read-only file system")
+    monkeypatch.setattr(console, "_write_cdsapirc", boom)
+    reader, writer, output = scripted([])
+    secret = scripted_secret(["TOKEN"])
+    params = {"datasets": ["era5_weather"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, secret, writer) is False
+    assert any("Could not write" in line for line in output)
+    assert any("url: https://cds.climate.copernicus.eu/api" in line for line in output)
+
+
+@pytest.mark.integration
+def test_run_wizard_prompts_and_builds_weather_offline(tmp_path, monkeypatch):
+    # End-to-end: no key configured, the wizard prompts (scripted secret), saves the
+    # file, and the real offline build populates weather + stamps collisions.
+    pytest.importorskip("xarray")
+    _isolate_cds(monkeypatch, tmp_path)
+    cache = str(tmp_path / "cache"); _seed_full_cache(cache)
+    shutil.copy(os.path.join(os.path.dirname(__file__), "fixtures", "weather", "era5_land_sample.nc"),
+                os.path.join(cache, "era5_land_2023.nc"))
+    db_path = str(tmp_path / "wiz.duckdb")
+    # Menu order is source_id: 1=weather (era5_weather), 2=stats19. Pick both with "1-2".
+    reader, writer, _ = scripted([db_path, "1-2", "2023", "snapshot", "y"])
+    secret = scripted_secret(["TOKEN-XYZ"])
+    client = console.run_wizard(reader, writer, secret_reader=secret, cache_dir=cache)
+    try:
+        assert client is not None and os.path.exists(db_path)
+        assert (tmp_path / ".cdsapirc").read_text().endswith("key: TOKEN-XYZ\n")
+        # Same post-build checks the existing weather test uses:
+        assert client.con.execute("SELECT count(*) FROM weather").fetchone()[0] > 0
+        assert client.con.execute(
+            "SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL"
+        ).fetchone()[0] >= 1
     finally:
         client.close()
