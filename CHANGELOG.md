@@ -19,6 +19,17 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
+## [Unreleased]
+
+### Added
+- `solar_elevation_deg` and `solar_azimuth_deg` on the `collisions` table — the sun's apparent
+  elevation and azimuth at each collision's place and time, computed mathematically (NOAA solar
+  position algorithm, in SQL) from `geom` and `datetime_local`, with no external data or new
+  dependency. Enables isolating low-angle solar glare as a casualty factor.
+
+### Changed
+- Database `schema_version` 1 → 2 (additive: the two `collisions` columns above).
+
 ## [0.9.0] - 2026-07-10
 
 First public release. **Pre-1.0 (Beta):** the pipeline is usable and reproducible, but the

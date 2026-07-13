@@ -6,7 +6,7 @@ tables dynamically (`CREATE OR REPLACE ... AS SELECT`), so this file documents t
 it is never executed. Every built database also carries its own machine-readable schema
 marker: `SELECT * FROM crossroads_meta` (see [`crossroads_meta`](#crossroads_meta)).
 
-**Schema version:** 1  ·  See [methodology.md](methodology.md) for how the data is produced
+**Schema version:** 2  ·  See [methodology.md](methodology.md) for how the data is produced
 and [spec.md §9](spec.md) for the keep-in-place quality model.
 
 ## Conventions (keep-in-place model)
@@ -58,6 +58,8 @@ CREATE TABLE collisions (
     ctyua_code             VARCHAR,     -- ONS CTYUA code stamped by point-in-polygon join; NULL if geom invalid / no boundary built
     temperature_c          DOUBLE,      -- 2 m air temperature (°C) from the ERA5-Land cell at the collision hour; NULL if weather not built / no match
     precipitation_mm       DOUBLE,      -- hourly precipitation (mm) from the ERA5-Land cell; NULL if weather not built / no match
+    solar_elevation_deg    DOUBLE,      -- sun's apparent elevation above the horizon (deg, refraction-corrected; negative = below horizon/night); computed mathematically (NOAA) from geom + datetime_local; NULL if geom/datetime invalid
+    solar_azimuth_deg      DOUBLE,      -- sun's azimuth (deg clockwise from true north: 0=N/90=E/180=S/270=W) at the collision place/time; NULL if geom/datetime invalid
     collision_severity_raw VARCHAR,     -- raw severity code as published (kept for the ledger)
     collision_severity     INTEGER,     -- cleaned code 1=Fatal 2=Serious 3=Slight (codebook); NULL if a missing sentinel
     collision_severity_valid BOOLEAN,   -- FALSE when the severity code was a missing/unparseable sentinel

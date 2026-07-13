@@ -455,6 +455,10 @@ class Stats19Transformer(BaseTransformer):
         # weather grid if it was built this run (the registry orders weather first).
         self._weather_stamp(con)
 
+        # --- SOLAR STAMP: fill solar_elevation_deg/solar_azimuth_deg for every collision
+        # with a geom + datetime, computed mathematically (NOAA). Always-on, no download.
+        self._solar_stamp(con)
+
         # --- GOLD: the valid-geometry collision projection (spec §9 worked example). ---
         create_clean_view(con, "collisions_spatial", self.COLLISION_SILVER, ["geom_valid"])
 
@@ -550,6 +554,13 @@ class Stats19Transformer(BaseTransformer):
             # Celsius and millimetres.
             f"  CAST(NULL AS DOUBLE) AS temperature_c, "
             f"  CAST(NULL AS DOUBLE) AS precipitation_mm, "
+            # Filled by _solar_stamp: the sun's apparent elevation and azimuth at the
+            # collision's place/time, computed mathematically (NOAA solar position). NULL
+            # until stamped, and left NULL where geom or datetime_local is missing. DOUBLE
+            # degrees: elevation above horizon (refraction-corrected, negative = night),
+            # azimuth clockwise from true north (0=N/90=E/180=S/270=W).
+            f"  CAST(NULL AS DOUBLE) AS solar_elevation_deg, "
+            f"  CAST(NULL AS DOUBLE) AS solar_azimuth_deg, "
             # CORE severity audit: raw twin, cleaned INTEGER, valid flag.
             f"  {sev_raw}, {sev_clean}, {sev_valid} "
             f"  {broad_sql} "                       # every remaining bronze column, cleaned per manifest
@@ -745,6 +756,111 @@ class Stats19Transformer(BaseTransformer):
             f"     AND date_trunc('hour', w.valid_time_local) = date_trunc('hour', c2.datetime_local)"
             f"  ) j "
             f"  GROUP BY k"
+            f") m WHERE c.source_row_key = m.k"
+        )
+
+    def _solar_stamp(self, con):
+        """Stamp solar_elevation_deg / solar_azimuth_deg onto every collision that has a
+        geometry AND a parsed local datetime, computed mathematically (NOAA solar position
+        algorithm) — no download, no new dependency, all in-database (spec §3A).
+
+        Position: reproject the EPSG:27700 geom back to lon/lat (same call _weather_stamp
+        uses). Instant: epoch(datetime_local AT TIME ZONE 'Europe/London') gives the true
+        UTC instant in seconds — ICU resolves the Europe/London offset (GMT/BST), the same
+        engine the weather source uses for valid_time_local. Only the resulting ANGLES are
+        stored; no *_utc column is ever materialised (spec §2 keeps local-native sources
+        free of reconstructed UTC instants). Rows without geom or datetime_local stay NULL —
+        they inherit the already-audited geom_valid / datetime_valid flags, so this stamp
+        adds no new quality dimension and no ledger rows.
+
+        ICU is loaded here (idempotent) because a STATS19-only build may not have loaded it.
+        acos arguments are clamped to [-1, 1] to absorb floating-point error near the horizon.
+        The UPDATE is set-based over the whole table (no Python row loop).
+
+        The CTE chain implements the standard NOAA solar-position math, split so each SELECT
+        only references the previous CTE's columns (SQL cannot see sibling aliases): Julian
+        century (jc) and UTC minutes-of-day from the instant; the sun's geometric mean
+        longitude/anomaly, equation of centre, apparent longitude and obliquity; then
+        declination + equation of time; then true solar time -> hour angle -> zenith; and
+        finally the refraction-corrected elevation and the azimuth clockwise from north."""
+        con.execute("INSTALL icu"); con.execute("LOAD icu")   # for AT TIME ZONE below
+        con.execute(
+            f"UPDATE {self.COLLISION_SILVER} AS c "
+            f"SET solar_elevation_deg = m.elevation, solar_azimuth_deg = m.azimuth "
+            f"FROM ("
+            f"  WITH base AS ("
+            f"    SELECT source_row_key AS k, "
+            f"           ST_X(ll) AS lon, ST_Y(ll) AS lat, "
+            f"           epoch(datetime_local AT TIME ZONE 'Europe/London') AS es "
+            f"    FROM ("
+            f"      SELECT source_row_key, datetime_local, "
+            f"             ST_Transform(geom, 'EPSG:27700', 'EPSG:4326', always_xy := true) AS ll "
+            f"      FROM {self.COLLISION_SILVER} "
+            f"      WHERE geom IS NOT NULL AND datetime_local IS NOT NULL"
+            f"    )"
+            f"  ), astro AS ("      # date-only astronomical terms (independent of lat/lon)
+            f"    SELECT k, lon, lat, mod(es, 86400) / 60.0 AS utc_min, "
+            f"           (es / 86400.0 + 2440587.5 - 2451545.0) / 36525.0 AS jc "
+            f"    FROM base"
+            f"  ), sun AS ("
+            f"    SELECT k, lon, lat, utc_min, jc, "
+            f"           mod(280.46646 + jc*(36000.76983 + jc*0.0003032), 360) AS l0, "
+            f"           357.52911 + jc*(35999.05029 - 0.0001537*jc) AS m, "
+            f"           0.016708634 - jc*(0.000042037 + 0.0000001267*jc) AS ecc "
+            f"    FROM astro"
+            f"  ), sun2 AS ("
+            f"    SELECT k, lon, lat, utc_min, jc, l0, m, ecc, "
+            f"           sin(radians(m))*(1.914602 - jc*(0.004817 + 0.000014*jc)) "
+            f"           + sin(radians(2*m))*(0.019993 - 0.000101*jc) "
+            f"           + sin(radians(3*m))*0.000289 AS c "
+            f"    FROM sun"
+            f"  ), sun3 AS ("
+            f"    SELECT k, lon, lat, utc_min, jc, l0, m, ecc, "
+            f"           (l0 + c) - 0.00569 - 0.00478*sin(radians(125.04 - 1934.136*jc)) AS app_long, "
+            f"           23 + (26 + (21.448 - jc*(46.815 + jc*(0.00059 - jc*0.001813)))/60)/60 "
+            f"           + 0.00256*cos(radians(125.04 - 1934.136*jc)) AS obliq "
+            f"    FROM sun2"
+            f"  ), terms AS ("
+            f"    SELECT k, lon, lat, utc_min, l0, m, ecc, "
+            f"           degrees(asin(sin(radians(obliq))*sin(radians(app_long)))) AS declin, "
+            f"           tan(radians(obliq/2)) * tan(radians(obliq/2)) AS vy "
+            f"    FROM sun3"
+            f"  ), solartime AS ("
+            f"    SELECT k, lon, lat, declin, "
+            f"           mod(utc_min "
+            f"               + 4*degrees(vy*sin(2*radians(l0)) - 2*ecc*sin(radians(m)) "
+            f"                 + 4*ecc*vy*sin(radians(m))*cos(2*radians(l0)) "
+            f"                 - 0.5*vy*vy*sin(4*radians(l0)) - 1.25*ecc*ecc*sin(2*radians(m))) "
+            f"               + 4*lon, 1440) AS tst "
+            f"    FROM terms"
+            f"  ), angles AS ("
+            f"    SELECT k, lat, declin, "
+            f"           CASE WHEN tst/4 < 0 THEN tst/4 + 180 ELSE tst/4 - 180 END AS ha "
+            f"    FROM solartime"
+            f"  ), zen AS ("
+            f"    SELECT k, lat, declin, ha, "
+            f"           degrees(acos(greatest(-1, least(1, "
+            f"             sin(radians(lat))*sin(radians(declin)) "
+            f"             + cos(radians(lat))*cos(radians(declin))*cos(radians(ha)))))) AS zenith "
+            f"    FROM angles"
+            f"  ) "
+            f"  SELECT k, "
+            f"    (90 - zenith) + CASE "
+            f"       WHEN (90 - zenith) > 85     THEN 0 "
+            f"       WHEN (90 - zenith) > 5      THEN (58.1/tan(radians(90 - zenith)) "
+            f"           - 0.07/pow(tan(radians(90 - zenith)),3) "
+            f"           + 0.000086/pow(tan(radians(90 - zenith)),5))/3600 "
+            f"       WHEN (90 - zenith) > -0.575 THEN (1735 + (90 - zenith)*(-518.2 + (90 - zenith)*(103.4 "
+            f"           + (90 - zenith)*(-12.79 + (90 - zenith)*0.711))))/3600 "
+            f"       ELSE (-20.772/tan(radians(90 - zenith)))/3600 END AS elevation, "
+            f"    CASE WHEN ha > 0 "
+            f"      THEN mod(degrees(acos(greatest(-1, least(1, "
+            f"           (sin(radians(lat))*cos(radians(zenith)) - sin(radians(declin))) "
+            f"           / (cos(radians(lat))*sin(radians(zenith))))))) + 180, 360) "
+            f"      ELSE mod(540 - degrees(acos(greatest(-1, least(1, "
+            f"           (sin(radians(lat))*cos(radians(zenith)) - sin(radians(declin))) "
+            f"           / (cos(radians(lat))*sin(radians(zenith))))))), 360) END AS azimuth "
+            f"  FROM zen"
             f") m WHERE c.source_row_key = m.k"
         )
 

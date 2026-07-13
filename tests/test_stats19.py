@@ -1021,3 +1021,89 @@ def test_weather_build_is_idempotent(tmp_path):
     b = run(); n2 = b.con.execute("SELECT count(*) FROM collisions WHERE temperature_c IS NOT NULL").fetchone()[0]
     assert n1 == n2 and n2 >= 1
     b.close()
+
+
+def test_solar_angles_present_and_ranged(tmp_path):
+    """Every valid collision is stamped with in-range solar angles; invalid rows stay NULL."""
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)
+    con = client.con
+    # Columns exist.
+    cols = [r[0] for r in con.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='collisions'").fetchall()]
+    assert "solar_elevation_deg" in cols and "solar_azimuth_deg" in cols
+    # Non-NULL iff geom AND datetime present.
+    mism = con.execute(
+        "SELECT count(*) FROM collisions "
+        "WHERE (solar_elevation_deg IS NULL) <> "
+        "      (geom IS NULL OR datetime_local IS NULL)").fetchone()[0]
+    assert mism == 0, "angles must be non-NULL exactly when geom AND datetime_local exist"
+    # Ranges hold for the stamped rows.
+    bad = con.execute(
+        "SELECT count(*) FROM collisions WHERE solar_elevation_deg IS NOT NULL AND ("
+        " solar_elevation_deg < -90 OR solar_elevation_deg > 90 "
+        " OR solar_azimuth_deg < 0 OR solar_azimuth_deg >= 360)").fetchone()[0]
+    assert bad == 0, "elevation must be in [-90,90] and azimuth in [0,360)"
+    client.close()
+
+
+def test_solar_stamp_matches_known_noaa_values(tmp_path):
+    """NOAA anchor: London at winter-solstice GMT noon -> elevation ~15.1 deg, azimuth ~180 (due
+    south); midnight -> sun below the horizon. Uses GMT so local time == UTC (no BST offset)."""
+    import duckdb
+    con = duckdb.connect()
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    # Minimal table with the columns _solar_stamp reads + writes. geom is EPSG:27700, built
+    # from London lon/lat (0.13 W, 51.50 N) so the stamp's reprojection round-trips it back.
+    con.execute(
+        "CREATE TABLE collisions AS "
+        "SELECT * FROM (VALUES "
+        "  ('noon', TIMESTAMP '2023-12-22 12:00:00'), "
+        "  ('midnight', TIMESTAMP '2023-12-22 00:00:00') "
+        ") AS t(source_row_key, datetime_local)")
+    con.execute("ALTER TABLE collisions ADD COLUMN geom GEOMETRY")
+    con.execute(
+        "UPDATE collisions SET geom = ST_Transform("
+        "  ST_Point(-0.13, 51.50), 'EPSG:4326', 'EPSG:27700', always_xy := true)")
+    con.execute("ALTER TABLE collisions ADD COLUMN solar_elevation_deg DOUBLE")
+    con.execute("ALTER TABLE collisions ADD COLUMN solar_azimuth_deg DOUBLE")
+    Stats19Transformer()._solar_stamp(con)
+    noon = con.execute("SELECT solar_elevation_deg, solar_azimuth_deg "
+                       "FROM collisions WHERE source_row_key='noon'").fetchone()
+    midnight = con.execute("SELECT solar_elevation_deg "
+                           "FROM collisions WHERE source_row_key='midnight'").fetchone()
+    assert abs(noon[0] - 15.1) < 1.5, f"winter-noon elevation was {noon[0]}"
+    assert abs(noon[1] - 180) < 5,   f"winter-noon azimuth was {noon[1]}"
+    assert midnight[0] < 0,          f"midnight elevation should be < 0, was {midnight[0]}"
+    con.close()
+
+
+def test_solar_stamp_applies_bst_offset_in_summer(tmp_path):
+    """BST anchor (complements the winter/GMT anchor): London at the summer solstice, 13:00
+    BST -> elevation ~61.9 deg, azimuth ~180 (due south). This ONLY holds if the Europe/London
+    offset is applied: 13:00 BST == 12:00 UTC ~ solar noon. If the code wrongly treated local
+    time as UTC, the sun would read ~1 hour past noon (azimuth well west of 180), so this
+    catches a daylight-saving handling bug the winter anchor cannot."""
+    import duckdb
+    con = duckdb.connect()
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    con.execute(
+        "CREATE TABLE collisions AS "
+        "SELECT * FROM (VALUES "
+        "  ('summer_noon_bst', TIMESTAMP '2023-06-21 13:00:00') "
+        ") AS t(source_row_key, datetime_local)")
+    con.execute("ALTER TABLE collisions ADD COLUMN geom GEOMETRY")
+    con.execute(
+        "UPDATE collisions SET geom = ST_Transform("
+        "  ST_Point(-0.13, 51.50), 'EPSG:4326', 'EPSG:27700', always_xy := true)")
+    con.execute("ALTER TABLE collisions ADD COLUMN solar_elevation_deg DOUBLE")
+    con.execute("ALTER TABLE collisions ADD COLUMN solar_azimuth_deg DOUBLE")
+    Stats19Transformer()._solar_stamp(con)
+    elev, az = con.execute(
+        "SELECT solar_elevation_deg, solar_azimuth_deg "
+        "FROM collisions WHERE source_row_key='summer_noon_bst'").fetchone()
+    assert abs(elev - 61.9) < 1.5, f"summer-noon (BST) elevation was {elev}"
+    # Tight azimuth band: a BST-ignoring bug lands ~1h past noon (~197 deg) and fails here.
+    assert abs(az - 180) < 6, f"summer-noon (BST) azimuth was {az} — BST offset not applied?"
+    con.close()

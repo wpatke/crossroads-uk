@@ -28,6 +28,31 @@ natively record a true instant (ERA5-Land, UTC) also carry `*_utc`; a `*_utc` is
 reconstructed from local time. Weather is matched to collisions at the hourly grain.
 Detail: [spec.md §3B](spec.md).
 
+## Solar geometry (the glare vector)
+
+Every collision is stamped with the sun's position at its exact place and time:
+`solar_elevation_deg` (apparent elevation above the horizon, refraction-corrected; negative
+means the sun is below the horizon) and `solar_azimuth_deg` (clockwise from true north:
+0 = N, 90 = E, 180 = S, 270 = W). Both are computed **mathematically** with the standard NOAA
+solar-position algorithm implemented in SQL — no download and no new dependency. The inputs are
+the collision's `geom` (reprojected to lon/lat) and the instant derived from `datetime_local`
+(the `Europe/London` civil time interpreted via ICU). Consistent with [spec.md §2](spec.md), only
+the resulting angles are stored — no `*_utc` column is reconstructed for this local-native source;
+the single autumn DST fall-back hour is resolved deterministically by ICU (and the sun is below
+the horizon during it anyway). Angles are `NULL` exactly when `geom` or `datetime_local` is
+missing, inheriting the existing `geom_valid` / `datetime_valid` audit flags.
+
+This surfaces a lethal lighting condition DfT's subjective "Light Conditions" field misses —
+direct low-angle solar glare. Example: blinding low morning sun on (roughly) east-facing travel,
+in clear weather:
+
+```sql
+SELECT count(*) FROM collisions_spatial
+WHERE solar_elevation_deg BETWEEN 0 AND 15      -- low sun, above the horizon
+  AND solar_azimuth_deg   BETWEEN 45 AND 135     -- sun in the eastern sky (morning)
+  AND weather_conditions = 1;                    -- DfT "Fine no high winds" (clear)
+```
+
 ## Weather value handling
 
 ERA5-Land 2 m temperature (Kelvin) and total precipitation (metres, an hourly
