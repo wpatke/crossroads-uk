@@ -16,6 +16,8 @@ from crossroads.transformers.spatial import LADBoundaryTransformer, CTYUABoundar
 
 STATS19_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "stats19")
 ONS_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "ons")
+BANK_HOLIDAYS_FIXTURE = os.path.join(
+    os.path.dirname(__file__), "fixtures", "bank_holidays", "bank-holidays-sample.json")
 
 
 def scripted(answers):
@@ -273,8 +275,11 @@ def test_main_abort_path_returns_zero(monkeypatch, capsys):
 
 
 def _seed_full_cache(cache_dir):
-    """Seed the cache with committed STATS19 + ONS fixtures so a real build runs
-    offline. Mirrors tests/test_stats19.py's _seed_cache / _seed_ons_cache."""
+    """Seed the cache with committed STATS19 + ONS + bank-holidays fixtures so a real
+    build runs offline. Mirrors tests/test_stats19.py's _seed_cache / _seed_ons_cache.
+
+    bank_holidays is an always-discovered source whose extract() fetches gov.uk, so its
+    fixture is seeded too — otherwise any build that activates it would hit the network."""
     os.makedirs(cache_dir, exist_ok=True)
     # STATS19 CSVs (2023 sample).
     for ftype in ("collision", "vehicle", "casualty"):
@@ -286,6 +291,8 @@ def _seed_full_cache(cache_dir):
         year = newest.valid_from[:4]
         src = os.path.join(ONS_FIXTURES, f"{prefix}_{year}", f"{prefix}_sample.geojson")
         shutil.copy(src, os.path.join(cache_dir, newest.source_file))
+    # GOV.UK bank-holidays feed (cache filename the transformer expects).
+    shutil.copy(BANK_HOLIDAYS_FIXTURE, os.path.join(cache_dir, "bank-holidays.json"))
 
 
 @pytest.mark.integration
@@ -294,9 +301,9 @@ def test_wizard_builds_populated_database_offline(tmp_path):
     _seed_full_cache(cache)
     db_path = str(tmp_path / "wizard.duckdb")
     # Scripted answers: db path, datasets (live menu — selectable() is source_id order,
-    # so "1"=era5_weather, "2"=stats19; this build seeds only stats19+ONS, so pick "2"),
-    # one year (matches the fixture), snapshot, confirm.
-    reader, writer, _ = scripted([db_path, "2", "2023", "snapshot", "y"])
+    # so "1"=bank_holidays, "2"=era5_weather, "3"=stats19; this test targets the collision
+    # build, so pick "3"=stats19), one year (matches the fixture), snapshot, confirm.
+    reader, writer, _ = scripted([db_path, "3", "2023", "snapshot", "y"])
     client = console.run_wizard(reader, writer, cache_dir=cache)  # real init_engine
     try:
         assert client is not None
@@ -335,8 +342,9 @@ def test_wizard_builds_weather_offline(tmp_path, monkeypatch):
     shutil.copy(os.path.join(os.path.dirname(__file__), "fixtures", "weather", "era5_land_sample.nc"),
                 os.path.join(cache, "era5_land_2023.nc"))
     db_path = str(tmp_path / "wiz.duckdb")
-    # Menu order is source_id: 1=weather (era5_weather), 2=stats19. Pick both with "1-2".
-    reader, writer, _ = scripted([db_path, "1-2", "2023", "snapshot", "y"])
+    # Menu order is source_id: 1=bank_holidays, 2=weather (era5_weather), 3=stats19.
+    # Pick weather+stats19 with "2-3".
+    reader, writer, _ = scripted([db_path, "2-3", "2023", "snapshot", "y"])
     client = console.run_wizard(reader, writer, cache_dir=cache)
     try:
         assert client is not None and os.path.exists(db_path)
@@ -451,8 +459,9 @@ def test_run_wizard_prompts_and_builds_weather_offline(tmp_path, monkeypatch):
     shutil.copy(os.path.join(os.path.dirname(__file__), "fixtures", "weather", "era5_land_sample.nc"),
                 os.path.join(cache, "era5_land_2023.nc"))
     db_path = str(tmp_path / "wiz.duckdb")
-    # Menu order is source_id: 1=weather (era5_weather), 2=stats19. Pick both with "1-2".
-    reader, writer, _ = scripted([db_path, "1-2", "2023", "snapshot", "y"])
+    # Menu order is source_id: 1=bank_holidays, 2=weather (era5_weather), 3=stats19.
+    # Pick weather+stats19 with "2-3".
+    reader, writer, _ = scripted([db_path, "2-3", "2023", "snapshot", "y"])
     secret = scripted_secret(["TOKEN-XYZ"])
     client = console.run_wizard(reader, writer, secret_reader=secret, cache_dir=cache)
     try:

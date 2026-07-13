@@ -1,5 +1,13 @@
+import os
+import shutil
+
 import crossroads
 from crossroads.client import Client
+
+# bank_holidays is an always-active source whose extract() fetches gov.uk; seeding its
+# committed fixture keeps the real-registry builds below fully offline.
+_BANK_HOLIDAYS_FIXTURE = os.path.join(
+    os.path.dirname(__file__), "fixtures", "bank_holidays", "bank-holidays-sample.json")
 
 
 def test_init_engine_returns_client():
@@ -23,7 +31,12 @@ def test_empty_build_is_noop_in_memory():
 
 def test_build_against_on_disk_database(tmp_path):
     db_path = tmp_path / "local_analytics.db"
-    client = crossroads.init_engine(database_path=str(db_path))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    # Real (unrestricted) registry: bank_holidays is active on a no-datasets build, so
+    # seed its feed fixture to keep this offline (boundaries load from bundled reference).
+    shutil.copy(_BANK_HOLIDAYS_FIXTURE, os.path.join(str(cache), "bank-holidays.json"))
+    client = crossroads.init_engine(database_path=str(db_path), cache_dir=str(cache))
     client.build()
     assert client.con.execute("SELECT 1").fetchone()[0] == 1
     client.close()
