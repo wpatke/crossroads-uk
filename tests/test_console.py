@@ -257,7 +257,15 @@ def test_decline_does_not_build():
 
 def test_main_abort_path_returns_zero(monkeypatch, capsys):
     # Exercise the real entry point offline. Declining means no build, no network.
-    # main() uses live discovery, so "1" selects the first discovered dataset.
+    # main() uses live discovery, so "1" selects the first discovered dataset — which
+    # may be the weather source. Make the credential path deterministic so the test
+    # exercises the abort path regardless of discovery order or the CI machine's state:
+    #   - pretend a CDS key is configured so ensure_weather_credentials never prompts;
+    #   - hard-stub getpass so no test can ever read real stdin (which fails under
+    #     pytest's output capture with "reading from stdin while output is captured").
+    monkeypatch.setenv("CDSAPI_URL", "https://example.invalid/api")
+    monkeypatch.setenv("CDSAPI_KEY", "test-key")
+    monkeypatch.setattr("getpass.getpass", lambda *a, **k: "")
     answers = iter([":memory:", "1", "2023", "snapshot", "n"])
     monkeypatch.setattr("builtins.input", lambda *a: next(answers))
     assert console.main() == 0
