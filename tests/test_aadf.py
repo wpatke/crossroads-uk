@@ -4,6 +4,8 @@ Fast, offline, deterministic. Unit tests drive the silver derivation, the extrac
 cache/zip paths, and the boundary-mode stamp against hand-built inputs; the integration
 test builds the real fixture end-to-end (opt-in via the `integration` marker)."""
 
+import csv
+import math
 import os
 import shutil
 import zipfile
@@ -21,6 +23,11 @@ from tests.test_console import _seed_full_cache
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "aadf")
 SAMPLE_CSV = os.path.join(FIXTURES, "dft_traffic_counts_aadf_sample.csv")
 FIXTURE_ROWS = 14   # documented in tests/fixtures/aadf/README.md
+
+# The committed STATS19 collision fixture (one A689 + one A179 collision in Hartlepool).
+STATS19_COLLISION_FIXTURE = os.path.join(
+    os.path.dirname(__file__), "fixtures", "stats19",
+    "dft-road-casualty-statistics-collision-2023.csv")
 
 
 # --- identity ---------------------------------------------------------------
@@ -246,3 +253,166 @@ def test_full_offline_build(tmp_path):
         assert "aadf_geom_rtree" in names
     finally:
         client.close()
+
+
+# --- risk-metric showcase (integration + live) ------------------------------
+
+# The README's showcase query, in ONE canonical shape. Only the road-class filter and the
+# road-name prefix change between variants — the A-road form (README) and the motorway form
+# share this exact join, so the test and the README stay honest about the SAME query.
+# first_road_class codes: 1 = Motorway, 3 = A road. Road names are reconstructed as
+# prefix || first_road_number to match AADF's road_name (e.g. 'A689', 'M1').
+def _risk_query(road_class, prefix, year=2023):
+    return f"""
+    WITH traffic AS (
+        SELECT road_name, lad_code,
+               SUM(all_motor_vehicles * link_length_km) AS daily_vehicle_km
+        FROM aadf_clean
+        WHERE year = {year} AND lad_code IS NOT NULL
+        GROUP BY road_name, lad_code
+    ),
+    crashes AS (
+        SELECT '{prefix}' || first_road_number AS road_name, lad_code,
+               COUNT(*) AS collisions
+        FROM collisions_spatial
+        WHERE first_road_class = {road_class} AND first_road_number > 0
+              AND lad_code IS NOT NULL
+        GROUP BY 1, 2
+    )
+    SELECT t.road_name, t.lad_code, c.collisions, t.daily_vehicle_km,
+           c.collisions / (t.daily_vehicle_km * 365 / 1e6)
+               AS collisions_per_million_vehicle_km
+    FROM traffic t
+    JOIN crashes c USING (road_name, lad_code)
+    ORDER BY collisions_per_million_vehicle_km DESC
+    """
+
+
+def _fixture_daily_vehicle_km(year):
+    """Expected denominator per road, read straight from the committed AADF fixture:
+    SUM(all_motor_vehicles x link_length_km) over that road's rows for `year`. Reading the
+    fixture (rather than hardcoding) means a fixture edit updates the expectation."""
+    totals = {}
+    with open(SAMPLE_CSV, newline="") as fh:
+        for row in csv.DictReader(fh):
+            if int(row["year"]) != year:
+                continue
+            vkm = float(row["all_motor_vehicles"]) * float(row["link_length_km"])
+            totals[row["road_name"]] = totals.get(row["road_name"], 0.0) + vkm
+    return totals
+
+
+def _fixture_collision_counts(road_class, prefix):
+    """Expected numerator per reconstructed road name (prefix || first_road_number), read
+    from the committed collision fixture. Counts every matching collision row so a fixture
+    edit updates the expectation automatically."""
+    counts = {}
+    with open(STATS19_COLLISION_FIXTURE, newline="") as fh:
+        for row in csv.DictReader(fh):
+            if int(row["first_road_class"]) == road_class and int(row["first_road_number"]) > 0:
+                name = prefix + row["first_road_number"]
+                counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+@pytest.mark.integration
+def test_risk_metric_query_end_to_end(tmp_path):
+    """The README's showcase query — collisions per million vehicle-km joined on
+    (road name x LAD) — runs against a real offline build of stats19 + aadf and
+    returns the figures the committed real fixtures imply."""
+    cache = str(tmp_path / "cache")
+    _seed_full_cache(cache)
+    db = str(tmp_path / "risk.duckdb")
+    client = crossroads.init_engine(database_path=db, cache_dir=cache)
+    client.build(datasets=["stats19", "aadf"], years=[2023], boundary_mode="snapshot")
+    try:
+        con = client.con
+
+        # A-road variant (the README example), year 2023.
+        rows = con.execute(_risk_query(3, "A")).fetchall()
+        got = {(r[0], r[1]): r for r in rows}
+
+        # Exactly the roads present in BOTH fixtures appear — A689 and A179, each in
+        # Hartlepool (E06000001) — and nothing else. The join must not invent rows.
+        assert set(got) == {("A689", "E06000001"), ("A179", "E06000001")}
+
+        # Expected numerator/denominator computed from the committed fixtures.
+        expected_collisions = _fixture_collision_counts(3, "A")
+        expected_vkm = _fixture_daily_vehicle_km(2023)
+
+        for road in ("A689", "A179"):
+            _, _, collisions, daily_vkm, metric = got[(road, "E06000001")]
+            # collisions == count of matching fixture collision rows (expected 1 each).
+            assert collisions == expected_collisions[road]
+            # daily_vehicle_km == SUM(all_motor_vehicles x link_length_km) from the fixture.
+            assert abs(daily_vkm - expected_vkm[road]) <= 1e-6 * expected_vkm[road]
+            # The risk metric is a positive, finite number.
+            assert metric > 0 and math.isfinite(metric)
+
+        # Honesty check: the fixture has no motorway collisions, so the motorway variant
+        # (first_road_class = 1) must return zero rows. This pins the fact that the query
+        # only reports real joins and never fabricates matches.
+        assert con.execute(_risk_query(1, "M")).fetchall() == []
+    finally:
+        client.close()
+
+
+# Live download test: opt-in, mirrors the skip mechanism tests/test_weather.py uses for its
+# live CDS test — only CROSSROADS_RUN_LIVE=1 is needed here (no credentials file).
+_LIVE = pytest.mark.skipif(
+    not os.environ.get("CROSSROADS_RUN_LIVE"),
+    reason="live AADF download: set CROSSROADS_RUN_LIVE=1 to run")
+
+
+@pytest.mark.live
+@_LIVE
+def test_live_national_download_shape(tmp_path):
+    """Downloads the real national AADF zip (~40 MB) and sanity-checks it. Run
+    deliberately before a release: CROSSROADS_RUN_LIVE=1 pytest -m live -k aadf.
+
+    Real-build runbook (executed by hand once — needs the network and a few minutes —
+    to produce the M1 output table Stage 03 pastes into the README):
+
+        import crossroads as cr
+        client = cr.init_engine("/tmp/aadf/showcase.db", cache_dir="/tmp/aadf")
+        client.build(datasets=["stats19", "aadf"], years=[2023], boundary_mode="snapshot")
+        # STATS19 2023 downloads from DfT on first run — expect a few minutes total.
+
+    Then run _risk_query(1, "M") (the motorway variant) against that database, filtering to
+    WHERE t.road_name = 'M1' (or take the top rows across all motorways), and save the top
+    ~8 result rows (road, LAD code, collisions, daily vehicle-km, risk metric) verbatim to
+    docs/plans/012_aadf_traffic/showcase-output.txt for Stage 03. Sanity-check before
+    accepting: collisions per road-LAD should be small integers, an M1 LAD stretch's
+    daily_vehicle_km should be order 1e5-1e7, and the metric should be well under 1.0.
+    """
+    import duckdb
+
+    cache = str(tmp_path)
+    # Real download + unzip of the national artifact (years kwarg is irrelevant to extract —
+    # the file is one artifact covering all years — but passed for interface fidelity).
+    AadfTransformer().extract(cache, years=[2023])
+    csv_path = os.path.join(cache, CSV_CACHE_FILE)
+    assert os.path.exists(csv_path)             # the canonical CSV landed in the cache
+
+    con = duckdb.connect()
+    try:
+        # Read the header only, as text, to check shape without parsing 600k rows.
+        # Compare case-insensitively: the national file capitalises some columns
+        # (LGVs, all_HGVs) that the silver SELECT names in lower case, and DuckDB binds
+        # them regardless of case — so a case-sensitive check would flag a non-problem.
+        header = {c[0].lower() for c in con.execute(
+            f"DESCRIBE SELECT * FROM read_csv('{csv_path}', all_varchar=true)").fetchall()}
+        # Every column the silver SELECT reads must be present in the national header.
+        for col in _BRONZE_COLS:
+            assert col.lower() in header, f"national header missing silver column {col!r}"
+        # Row count floor (600,551 at plan time — assert a floor, not equality) and a
+        # long year span (the file spans 2000-2025).
+        n_rows = con.execute(
+            f"SELECT count(*) FROM read_csv('{csv_path}', all_varchar=true)").fetchone()[0]
+        assert n_rows >= 500_000
+        n_years = con.execute(
+            f"SELECT count(DISTINCT year) FROM read_csv('{csv_path}', all_varchar=true)"
+        ).fetchone()[0]
+        assert n_years >= 20
+    finally:
+        con.close()

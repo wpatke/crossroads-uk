@@ -1,0 +1,60 @@
+Risk-metric showcase — real M1 output for the README (Stage 02, Step 3)
+========================================================================
+
+Produced by a real offline-capable build on 2026-07-14:
+
+    import crossroads as cr
+    client = cr.init_engine("/tmp/aadf/showcase.db", cache_dir="/tmp/aadf")
+    client.build(datasets=["stats19", "aadf"], years=[2023], boundary_mode="snapshot")
+
+Real data: STATS19 2023 collisions (DfT) + national AADF traffic counts (600,551 rows).
+The query is the canonical showcase query in its MOTORWAY form (first_road_class = 1,
+road_name = 'M' || first_road_number) — identical in shape to the A-road README example
+and to tests/test_aadf.py::test_risk_metric_query_end_to_end, only the road-class filter
+and prefix differ.
+
+Metric = collisions / (daily_vehicle_km * 365 / 1e6)
+       = collisions per million vehicle-km, per road, per local authority.
+
+
+M1 by local authority, 2023 — representative stretches (busiest first)
+----------------------------------------------------------------------
+road   lad_code    collisions   daily_vehicle_km   count_points   metric
+M1     E06000056           80        3,965,864.3             17   0.0553
+M1     E07000240           55        3,047,956.0              6   0.0494
+M1     E06000062           43        4,380,953.0              6   0.0269
+M1     E08000018           21        2,169,706.9              5   0.0265
+M1     E09000003           18          680,304.0              4   0.0725
+M1     E08000036           17        1,357,071.6              3   0.0343
+M1     E07000033           16        2,739,534.6              4   0.0160
+M1     E08000035           15        2,524,444.8             11   0.0163
+
+Sanity check (per the plan): collisions are small integers, each daily_vehicle_km is of
+order 1e5–1e7 for an M1 LAD stretch, and every metric is well under 1.0. PASS.
+(count_points is shown for context only — it is not a column of the canonical query.)
+
+
+Coverage caveat — read before choosing a ranking for the README
+---------------------------------------------------------------
+Ordering the per-LAD motorway result by the metric DESC surfaces a coverage artifact, NOT
+a genuinely high-risk stretch. One row tops the raw ranking:
+
+    M1  E07000096  collisions=15  daily_vehicle_km=5,895.2  count_points=1  metric=6.9711
+
+Root cause (debugged before it reached the README): AADF has exactly ONE M1 count point in
+that local authority, representing a 0.4 km link. The denominator therefore captures 0.4 km
+of motorway, while all 15 collisions were stamped across the district's full M1 length.
+Sparse AADF count-point coverage in a LAD → tiny denominator → inflated metric. This is
+inherent to the (road name × LAD) join the project deliberately chose (it uses only facts
+both sources state, never invents a spatial snap), not a pipeline bug. The row is excluded
+from the table above because it fails the sanity bounds; the representative stretches (5–17
+count points each) are stable and believable.
+
+Related honest behaviour: AADF has M1 count points in 24 LADs but STATS19 has M1 collisions
+in 28 LADs, so 4 collision-only LADs correctly produce NO row (no denominator, no match) —
+the query never fabricates a join.
+
+Recommendation for Stage 03 / Stage 04:
+- Show the M1 by-LAD table above (busiest stretches), NOT a raw metric-DESC ranking.
+- Document the coverage caveat alongside the boundary-mode caveat in Stage 04, so the
+  showcase is honest about what a per-LAD motorway metric can and cannot say.
