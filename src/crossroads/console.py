@@ -189,7 +189,7 @@ def _parse_boundary_mode(raw):
 def prompt_boundary_mode(reader, writer):
     """Retrospective snapshot (latest ONS vintage) vs temporally-sliced boundaries."""
     writer("Boundary mode: 1) snapshot = latest ONS boundaries (default); "
-           "2) temporal = boundaries as they were on each collision date.")
+           "2) temporal = boundaries as they were at each record's date.")
     return _prompt(reader, writer,
                    "Boundary mode", parse=_parse_boundary_mode, default="snapshot")
 
@@ -391,6 +391,20 @@ def run_wizard(reader, writer, *, secret_reader=None, engine_factory=init_engine
         secret_reader = lambda: getpass.getpass("")
 
     params = gather_parameters(reader, writer, available=available)
+
+    # Temporal + AADF only: an annual traffic average is attributed to the boundary
+    # in force at a mid-year (1 July) date, which is approximate in a year when a
+    # boundary changed. Surface that honestly and let the user opt out. (Snapshot,
+    # or temporal without traffic counts, has no such approximation — no warning.)
+    if params["boundary_mode"] == "temporal" and "aadf" in params["datasets"]:
+        writer("")   # spacer
+        writer("Note: temporal mode attributes each traffic count to the area "
+               "boundaries in force at its mid-year point; this is approximate in a "
+               "year when a boundary changed.")
+        if not prompt_confirm(reader, writer, message="Continue? (y/n)", default=True):
+            writer("Aborted — no database was built.")
+            return None
+
     if not ensure_weather_credentials(params, reader, secret_reader, writer):
         writer("Aborted — no database was built.")
         return None

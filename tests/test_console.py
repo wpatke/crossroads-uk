@@ -62,6 +62,10 @@ def _isolate_cds(monkeypatch, tmp_path):
 # A fixed one-dataset menu so the full-flow tests don't depend on live discovery.
 MENU = [("stats19", "stats19")]
 
+# Menu with aadf first (matches the real source_id-sorted order: aadf, stats19).
+MENU_WITH_AADF = [("aadf", "traffic counts (AADF)"), ("stats19", "stats19")]
+WARN_SNIPPET = "approximate in a year when a boundary changed"
+
 
 def test_gather_parameters_happy_path():
     # Answers: db path, datasets (menu index), years, boundary mode.
@@ -257,6 +261,67 @@ def test_decline_does_not_build():
     assert result is None
     assert calls == []            # build path never entered
     assert any("Aborted" in line for line in output)
+
+
+def test_temporal_aadf_warns_then_enter_proceeds():
+    # Answers: db, datasets "1" (aadf), years, temporal, "" (Enter = yes to the
+    # warning), "" (Enter = yes to the final build confirm).
+    reader, writer, output = scripted(
+        ["mydb.duckdb", "1", "2023", "temporal", "", ""])
+    captured = {}
+    def factory(**kwargs):
+        c = _FakeClient(**kwargs); captured["client"] = c; return c
+    result = console.run_wizard(reader, writer, engine_factory=factory,
+                                available=MENU_WITH_AADF)
+    assert any(WARN_SNIPPET in line for line in output)   # warning shown
+    assert result is captured["client"]                   # build proceeded
+    assert captured["client"].build_kwargs["boundary_mode"] == "temporal"
+    assert captured["client"].build_kwargs["datasets"] == ["aadf"]
+
+
+def test_temporal_aadf_decline_aborts():
+    # Answers end at the warning with "n"; the build must never run.
+    reader, writer, output = scripted(
+        ["mydb.duckdb", "1", "2023", "temporal", "n"])
+    calls = []
+    def factory(**kwargs):
+        calls.append(kwargs); return _FakeClient(**kwargs)
+    result = console.run_wizard(reader, writer, engine_factory=factory,
+                                available=MENU_WITH_AADF)
+    assert result is None
+    assert calls == []                                    # build never entered
+    assert any(WARN_SNIPPET in line for line in output)   # warning was shown
+    assert any("Aborted" in line for line in output)
+
+
+def test_temporal_without_aadf_no_warning():
+    # Pick stats19 only ("2"), temporal, then a single "" for the final confirm. If a
+    # warning prompt had fired, that single confirm answer would be consumed by it and
+    # the build would desync — so a clean build with no warning proves the gate stayed shut.
+    reader, writer, output = scripted(
+        ["mydb.duckdb", "2", "2023", "temporal", ""])
+    captured = {}
+    def factory(**kwargs):
+        c = _FakeClient(**kwargs); captured["client"] = c; return c
+    result = console.run_wizard(reader, writer, engine_factory=factory,
+                                available=MENU_WITH_AADF)
+    assert not any(WARN_SNIPPET in line for line in output)
+    assert result is captured["client"]
+    assert captured["client"].build_kwargs["datasets"] == ["stats19"]
+    assert captured["client"].build_kwargs["boundary_mode"] == "temporal"
+
+
+def test_snapshot_aadf_no_warning():
+    # Pick aadf ("1"), snapshot, one final confirm "". Warning absent, build proceeds.
+    reader, writer, output = scripted(
+        ["mydb.duckdb", "1", "2023", "snapshot", ""])
+    captured = {}
+    def factory(**kwargs):
+        c = _FakeClient(**kwargs); captured["client"] = c; return c
+    result = console.run_wizard(reader, writer, engine_factory=factory,
+                                available=MENU_WITH_AADF)
+    assert not any(WARN_SNIPPET in line for line in output)
+    assert result is captured["client"]
 
 
 def test_main_abort_path_returns_zero(monkeypatch, capsys):
