@@ -64,7 +64,7 @@ def _make_bronze(con, rows):
 
 
 def test_silver_typing_flags_and_ledger(con):
-    con.execute("LOAD spatial")
+    con.execute("INSTALL spatial; LOAD spatial")
     ensure_quality_tables(con)
     # Three rows: one fully valid, one with a blank easting, one with a bad count.
     _make_bronze(con, [
