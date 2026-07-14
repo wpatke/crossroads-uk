@@ -32,7 +32,7 @@ def test_data_sources_doc_lists_every_source():
     root = os.path.dirname(os.path.dirname(__file__))
     with open(os.path.join(root, "docs", "data-sources.md"), encoding="utf-8") as fh:
         text = fh.read()
-    for token in ("Open Government Licence", "STATS19", "ONS", "Copernicus", "ERA5-Land"):
+    for token in ("Open Government Licence", "STATS19", "ONS", "Copernicus", "ERA5-Land", "AADF"):
         assert token in text, f"docs/data-sources.md is missing {token!r}"
 
 

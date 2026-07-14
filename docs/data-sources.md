@@ -64,6 +64,33 @@ Replace `[year]` with the year you downloaded/used the data.
 
 ---
 
+## 5. DfT AADF — Traffic Counts
+
+- **Publisher:** UK Department for Transport (DfT), Road Traffic Statistics.
+- **Dataset:** Annual Average Daily Flow (AADF) by count point — daily traffic volumes per
+  road link per year, major roads counted and minor roads partly estimated. Downloaded as one
+  national zipped CSV from [https://roadtraffic.dft.gov.uk/downloads](https://roadtraffic.dft.gov.uk/downloads).
+- **Licence:** [Open Government Licence v3.0 (OGL)](https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/).
+- **Required attribution** (reproduce when you publish):
+  > Contains public sector information licensed under the Open Government Licence v3.0.
+  > Source: Department for Transport, Road Traffic Statistics.
+- **Loaded into:** the `aadf` table (see [docs/schema.md](schema.md)), with each count point
+  stamped with an ONS `lad_code`/`ctyua_code` by point-in-polygon join. The FULL year history
+  (2000 onward) is always loaded regardless of the build's `years` — the file is a single national
+  artifact, and traffic volume is denominator data for the risk metric, so slicing it by year would
+  discard useful context for no size benefit.
+- **Caveats:**
+  - **Counted vs estimated flows.** `estimation_method` distinguishes DfT-counted from
+    DfT-estimated (modelled) flows; both are retained (keep-in-place), so filter on it when your
+    analysis needs counted-only volumes.
+  - **Boundary attribution.** In temporal mode each annual count is attributed to the area
+    boundaries in force at its mid-year (1 July) point; this is exact except in a year the boundary
+    itself changed. For a risk metric, compare like years so collisions and counts resolve to the
+    same boundary vintage. The wizard shows this note and asks you to confirm when temporal mode is
+    chosen together with traffic counts.
+
+---
+
 ## Why the build does not gate on licences
 
 - **Copernicus** acceptance is performed on the CDS portal, not in this tool. Possessing a

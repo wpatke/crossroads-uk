@@ -6,7 +6,7 @@ tables dynamically (`CREATE OR REPLACE ... AS SELECT`), so this file documents t
 it is never executed. Every built database also carries its own machine-readable schema
 marker: `SELECT * FROM crossroads_meta` (see [`crossroads_meta`](#crossroads_meta)).
 
-**Schema version:** 2  ·  See [methodology.md](methodology.md) for how the data is produced
+**Schema version:** 3  ·  See [methodology.md](methodology.md) for how the data is produced
 and [spec.md §9](spec.md) for the keep-in-place quality model.
 
 ## Conventions (keep-in-place model)
@@ -264,6 +264,61 @@ CREATE TABLE ctyua_boundaries (
 );
 ```
 
+### `aadf`
+
+One row per road link per year from the DfT national AADF (Annual Average Daily Flow) file
+(traffic counts, keep-in-place 1:1 with bronze). The FULL year history (2000 onward) is
+always loaded regardless of the build's `years`. A bounding-box R-Tree index
+(`aadf_geom_rtree`) is built over `geom` for fast point-in-polygon area stamping (spec §5).
+See [transformers/aadf.py](../src/crossroads/transformers/aadf.py).
+
+```sql
+CREATE TABLE aadf (
+    source_row_key         VARCHAR,     -- stable row key: count_point_id | year (unique per link per year)
+    count_point_id         INTEGER,     -- DfT count-point identifier, typed
+    year                   INTEGER,     -- count year, typed (the annual average is for this whole year)
+    region_name            VARCHAR,     -- DfT region name, carried raw
+    local_authority_name   VARCHAR,     -- DfT local-authority name, carried raw (see lad_code for the stamped ONS code)
+    road_name              VARCHAR,     -- road name as published (e.g. 'M1', 'A179') — the risk-join key to collisions
+    road_type              VARCHAR,     -- 'Major' or 'Minor' road classification
+    start_junction_road_name VARCHAR,   -- link start-junction description, carried raw
+    end_junction_road_name VARCHAR,     -- link end-junction description, carried raw
+    easting_raw            VARCHAR,     -- raw OSGR easting exactly as published (preserved)
+    northing_raw           VARCHAR,     -- raw OSGR northing exactly as published (preserved)
+    easting                INTEGER,     -- typed OSGR easting, EPSG:27700 metres; NULL if blank/non-numeric/outside the BNG envelope
+    northing               INTEGER,     -- typed OSGR northing, EPSG:27700 metres; NULL if invalid
+    geom                   GEOMETRY,    -- POINT(EPSG:27700) from easting/northing; NULL if either coordinate invalid
+    geom_valid             BOOLEAN,     -- TRUE only when a real point was derived (drives aadf_clean)
+    link_length_km         DOUBLE,      -- length of the counted road link in km (the risk denominator multiplies this by the flow)
+    estimation_method      VARCHAR,     -- 'Counted' vs 'Estimated' — DfT flags modelled (not physically counted) flows here; Estimated rows are RETAINED, flagged as such by DfT (not by us), so filter on this when you need counted-only volumes
+    estimation_method_detailed VARCHAR, -- DfT's finer-grained estimation-method description, carried raw
+    all_motor_vehicles_raw VARCHAR,     -- raw headline flow exactly as published (preserved)
+    all_motor_vehicles     BIGINT,      -- typed headline AADF: all motor vehicles per day; NULL if blank/non-numeric/negative
+    count_valid            BOOLEAN,     -- TRUE when all_motor_vehicles is present and non-negative
+    pedal_cycles           BIGINT,      -- per-class daily flow: pedal cycles; NULL if invalid
+    two_wheeled_motor_vehicles BIGINT,  -- per-class daily flow: two-wheeled motor vehicles
+    cars_and_taxis         BIGINT,      -- per-class daily flow: cars and taxis
+    buses_and_coaches      BIGINT,      -- per-class daily flow: buses and coaches
+    lgvs                   BIGINT,      -- per-class daily flow: light goods vehicles
+    all_hgvs               BIGINT,      -- per-class daily flow: all heavy goods vehicles
+    lad_code               VARCHAR,     -- ONS LAD code, stamped point-in-polygon honouring the build's boundary_mode (see note); NULL if geom invalid / no boundary built
+    ctyua_code             VARCHAR      -- ONS CTYUA code, stamped the same way; NULL if geom invalid / no boundary built
+);
+```
+
+> **`lad_code` / `ctyua_code` — boundary-mode behaviour.** Stamped by point-in-polygon
+> against the ONS boundary tables, honouring the build's `boundary_mode`: **snapshot** uses
+> the latest boundary vintage; **temporal** uses the vintage in force at a mid-year (1 July)
+> date derived from the count's `year`. This resolves each count to the same boundaries a
+> temporal-mode collision of that year gets, so the risk join stays consistent. It is exact
+> except in a year the boundary itself changed (the annual average then straddles both
+> districts). Historical years are therefore attributed to their own contemporaneous
+> boundaries in temporal mode, not blanket-stamped with the current vintage.
+
+### `aadf_raw` (bronze)
+
+Faithful all-string copy of the national AADF CSV — see [Bronze: raw landing tables](#bronze-raw-landing-tables).
+
 ## Gold: clean views
 
 Filtered projections researchers query by default — no new data, derived from silver:
@@ -275,6 +330,8 @@ Filtered projections researchers query by default — no new data, derived from 
   validity flag (`link_valid` for vehicles/casualties, `geom_valid` for weather/boundaries).
 - **`bank_holidays_clean`** — the `bank_holidays` dimension has no reject flag, so this view is an
   unfiltered passthrough (every silver row) kept for naming consistency.
+- **`aadf_clean`** — `SELECT * FROM aadf WHERE geom_valid AND count_valid` (count points with
+  both a valid geometry and a valid headline flow; the surface the risk join reads).
 - **`<source>_labelled`** (`collisions_labelled`, `vehicles_labelled`, `casualties_labelled`)
   — the silver table plus an `<column>_label` text twin for every coded column, decoded via
   the `codebook` join. Labels are computed on demand, never stored; query the silver table for
@@ -414,3 +471,6 @@ source's and are **not re-listed here** — see the authoritative catalogue for 
   [`src/crossroads/reference/ons_boundaries.json`](../src/crossroads/reference/ons_boundaries.json).
 - **ERA5-Land weather** (`era5_weather_raw`) — Copernicus Climate Data Store, ERA5-Land reanalysis
   ([cds.climate.copernicus.eu/datasets/reanalysis-era5-land](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land)).
+- **DfT AADF traffic counts** (`aadf_raw`) — UK Department for Transport, Annual Average Daily Flow
+  by count point (one national CSV; see [docs/data-sources.md](data-sources.md) §5). The full 34-column
+  national header lands verbatim in bronze; the typed subset is documented in the [`aadf`](#aadf) silver table.

@@ -26,9 +26,14 @@ release was tested against are listed in [docs/methodology.md](docs/methodology.
   elevation and azimuth at each collision's place and time, computed mathematically (NOAA solar
   position algorithm, in SQL) from `geom` and `datetime_local`, with no external data or new
   dependency. Enables isolating low-angle solar glare as a casualty factor.
+- DfT AADF traffic-count source (`aadf` dataset): national count-point volumes 2000-onward,
+  LAD/CTYUA-stamped honouring `boundary_mode`, with an `aadf_clean` gold view and an R-Tree
+  index on the count-point geometry. Adds a README risk showcase (collisions per million
+  vehicle-km) and a wizard temporal-mode warning when traffic counts are built in temporal mode.
 
 ### Changed
 - Database `schema_version` 1 → 2 (additive: the two `collisions` columns above).
+- Database `schema_version` 2 → 3 (additive: the `aadf`/`aadf_clean`/`aadf_raw` tables above).
 
 ## [0.9.0] - 2026-07-10
 

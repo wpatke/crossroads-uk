@@ -24,6 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 # Named in the fast test: silver + gold + provenance/reference tables a researcher relies on.
 CORE_TABLES = [
     "collisions", "vehicles", "casualties", "weather", "lad_boundaries", "ctyua_boundaries",
+    "aadf", "aadf_clean",
     "collisions_spatial", "crossroads_meta", "data_quality_log", "quarantine_raw",
     "source_ingest_log", "codebook", "column_manifest",
 ]
@@ -31,11 +32,14 @@ CORE_TABLES = [
 # Tables whose EVERY column must be documented (silver + provenance/quality + reference).
 COLUMN_GUARDED = [
     "collisions", "vehicles", "casualties", "weather", "lad_boundaries", "ctyua_boundaries",
+    "aadf",
     "crossroads_meta", "data_quality_log", "quarantine_raw", "source_ingest_log",
     "quality_exemptions", "stats19_completeness", "codebook", "column_manifest",
 ]
 # Bronze copies of source columns — documented as a category, excluded from the column guard.
-EXCLUDED_PREFIXES = ("stats19_", "ons_", "era5_")  # *_raw bronze tables
+# "aadf_" (with the trailing underscore) excludes the aadf_raw bronze while leaving the silver
+# table "aadf" itself column-guarded above.
+EXCLUDED_PREFIXES = ("stats19_", "ons_", "era5_", "aadf_")  # *_raw bronze tables
 
 
 def _schema_text():
@@ -69,8 +73,8 @@ def test_documented_columns_match_built_database(tmp_path):
     )
     db = str(tmp_path / "full.duckdb")
     # Menu order is source_id: 1=aadf, 2=bank_holidays, 3=weather (era5_weather), 4=stats19.
-    # "3-4" builds weather+stats19 (the tables this drift guard checks).
-    reader, writer, _ = scripted([db, "3-4", "2023", "snapshot", "y"])
+    # "1,3-4" builds aadf+weather+stats19 (the tables this drift guard checks).
+    reader, writer, _ = scripted([db, "1,3-4", "2023", "snapshot", "y"])
     client = console.run_wizard(reader, writer, cache_dir=cache)
     try:
         text = _schema_text()
