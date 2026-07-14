@@ -68,9 +68,9 @@ def test_documented_columns_match_built_database(tmp_path):
         os.path.join(cache, "era5_land_2023.nc"),
     )
     db = str(tmp_path / "full.duckdb")
-    # Menu order is source_id: 1=bank_holidays, 2=weather (era5_weather), 3=stats19.
-    # "2-3" builds weather+stats19 (the tables this drift guard checks).
-    reader, writer, _ = scripted([db, "2-3", "2023", "snapshot", "y"])
+    # Menu order is source_id: 1=aadf, 2=bank_holidays, 3=weather (era5_weather), 4=stats19.
+    # "3-4" builds weather+stats19 (the tables this drift guard checks).
+    reader, writer, _ = scripted([db, "3-4", "2023", "snapshot", "y"])
     client = console.run_wizard(reader, writer, cache_dir=cache)
     try:
         text = _schema_text()

@@ -218,15 +218,15 @@ def test_resolve_order_raises_on_cycle():
 
 
 def test_get_active_real_order_unchanged_by_declaration():
-    # Boundaries + stats19 + weather + bank_holidays active. era5_weather and
+    # Boundaries + stats19 + weather + bank_holidays + aadf active. era5_weather and
     # bank_holidays each depend on nothing, so they sort ahead as free leaf nodes;
-    # stats19's declared edges resolve to the same relative order the three original
-    # sources always had. The declarations themselves reorder nothing — weather and
-    # bank_holidays are simply new nodes that (correctly) import before stats19.
+    # stats19's and aadf's declared edges keep them after the boundary sources they stamp
+    # against. aadf depends only on the two boundary sources, so it becomes ready once they
+    # are emitted and sorts before stats19 (smaller source_id among the ready set).
     reg = Registry()
     order = [t.source_id for t in reg.get_active(years=[2023])]
     core = [s for s in order if s not in ("era5_weather", "bank_holidays")]
-    assert core == ["ons_ctyua", "ons_lad", "stats19"]
+    assert core == ["ons_ctyua", "ons_lad", "aadf", "stats19"]
     assert order.index("era5_weather") < order.index("stats19")
 
 
