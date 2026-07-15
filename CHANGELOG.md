@@ -19,7 +19,12 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
-## [Unreleased]
+## [1.0.0] - 2026-07-15
+
+First stable release, and the first published to PyPI (`pip install crossroads-uk`). The
+DuckDB schema and public API (`crossroads` CLI, `init_engine`, `build`) are now the stable
+contract described above; subsequent changes follow the MAJOR/MINOR policy at the top of
+this file.
 
 ### Added
 - `solar_elevation_deg` and `solar_azimuth_deg` on the `collisions` table — the sun's apparent
@@ -50,4 +55,5 @@ stable-contract guarantees described above take effect at `1.0.0`.
 - Spatial standardisation to EPSG:27700 with R-Tree indices; snapshot and temporal
   boundary modes.
 
+[1.0.0]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.0
 [0.9.0]: https://github.com/wpatke/crossroads-uk/releases/tag/v0.9.0

@@ -54,4 +54,4 @@ def test_citation_cff_is_valid():
             data = yaml.safe_load(fh)
         for key in ("cff-version", "message", "title", "authors", "version"):
             assert key in data, f"CITATION.cff missing {key!r}"
-        assert data["version"] == "0.9.0"
+        assert data["version"] == "1.0.0"

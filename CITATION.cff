@@ -10,8 +10,8 @@ authors:
   - given-names: Will
     family-names: Patke
     # orcid: "https://orcid.org/0000-0000-0000-0000"   # add if available
-version: "0.9.0"
-date-released: "2026-07-10"
+version: "1.0.0"
+date-released: "2026-07-15"
 license: MIT
 repository-code: "https://github.com/wpatke/crossroads-uk"
 url: "https://github.com/wpatke/crossroads-uk"
