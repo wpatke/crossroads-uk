@@ -46,15 +46,23 @@ that local authority, representing a 0.4 km link. The denominator therefore capt
 of motorway, while all 15 collisions were stamped across the district's full M1 length.
 Sparse AADF count-point coverage in a LAD → tiny denominator → inflated metric. This is
 inherent to the (road name × LAD) join the project deliberately chose (it uses only facts
-both sources state, never invents a spatial snap), not a pipeline bug. The row is excluded
-from the table above because it fails the sanity bounds; the representative stretches (5–17
-count points each) are stable and believable.
+both sources state, never invents a spatial snap), not a pipeline bug. The representative
+stretches above (5–17 count points each) are stable and believable.
+
+Update 2026-07-15: rather than hide this row, the README now SHOWS it as the query's literal
+top result (ORDER BY metric DESC) with a "†" footnote explaining the coverage artifact — see
+the revised Decision below.
 
 Related honest behaviour: AADF has M1 count points in 24 LADs but STATS19 has M1 collisions
 in 28 LADs, so 4 collision-only LADs correctly produce NO row (no denominator, no match) —
 the query never fabricates a join.
 
-Recommendation for Stage 03 / Stage 04:
-- Show the M1 by-LAD table above (busiest stretches), NOT a raw metric-DESC ranking.
-- Document the coverage caveat alongside the boundary-mode caveat in Stage 04, so the
-  showcase is honest about what a per-LAD motorway metric can and cannot say.
+Decision for the README (updated 2026-07-15 — supersedes the original "exclude it" call):
+- INCLUDE the coverage-artifact row (E07000096) as the table's first row — it is the query's
+  literal ORDER BY metric DESC top result — flagged with a "†" footnote that explains the
+  single-count-point cause. Showing it (rather than hiding it) is the more honest choice and
+  makes the metric's coverage limitation concrete for the reader.
+- The remaining rows follow as representative stretches, busiest first. The footnote points
+  readers at the count_points column to tell solid rows from thin ones.
+- Document the coverage caveat alongside the boundary-mode caveat, so the showcase is honest
+  about what a per-LAD motorway metric can and cannot say.

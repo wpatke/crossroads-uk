@@ -27,6 +27,8 @@ venv/
 # Crossroads build artifacts
 *.db
 *.duckdb
+# DuckDB write-ahead log (e.g. crossroads.db.wal), transient
+*.wal
 .crossroads_cache/
 /htmlcov/
 

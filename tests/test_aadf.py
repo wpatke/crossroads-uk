@@ -266,7 +266,8 @@ def _risk_query(road_class, prefix, year=2023):
     return f"""
     WITH traffic AS (
         SELECT road_name, lad_code,
-               SUM(all_motor_vehicles * link_length_km) AS daily_vehicle_km
+               SUM(all_motor_vehicles * link_length_km) AS daily_vehicle_km,
+               COUNT(DISTINCT count_point_id) AS count_points
         FROM aadf_clean
         WHERE year = {year} AND lad_code IS NOT NULL
         GROUP BY road_name, lad_code
@@ -279,7 +280,7 @@ def _risk_query(road_class, prefix, year=2023):
               AND lad_code IS NOT NULL
         GROUP BY 1, 2
     )
-    SELECT t.road_name, t.lad_code, c.collisions, t.daily_vehicle_km,
+    SELECT t.road_name, t.lad_code, c.collisions, t.daily_vehicle_km, t.count_points,
            c.collisions / (t.daily_vehicle_km * 365 / 1e6)
                AS collisions_per_million_vehicle_km
     FROM traffic t
@@ -300,6 +301,19 @@ def _fixture_daily_vehicle_km(year):
             vkm = float(row["all_motor_vehicles"]) * float(row["link_length_km"])
             totals[row["road_name"]] = totals.get(row["road_name"], 0.0) + vkm
     return totals
+
+
+def _fixture_count_points(year):
+    """Expected count-point tally per road: distinct count_point_id values in the committed
+    AADF fixture for `year`. Mirrors _fixture_daily_vehicle_km so a fixture edit updates the
+    expectation automatically."""
+    points = {}
+    with open(SAMPLE_CSV, newline="") as fh:
+        for row in csv.DictReader(fh):
+            if int(row["year"]) != year:
+                continue
+            points.setdefault(row["road_name"], set()).add(row["count_point_id"])
+    return {road: len(ids) for road, ids in points.items()}
 
 
 def _fixture_collision_counts(road_class, prefix):
@@ -339,13 +353,16 @@ def test_risk_metric_query_end_to_end(tmp_path):
         # Expected numerator/denominator computed from the committed fixtures.
         expected_collisions = _fixture_collision_counts(3, "A")
         expected_vkm = _fixture_daily_vehicle_km(2023)
+        expected_points = _fixture_count_points(2023)
 
         for road in ("A689", "A179"):
-            _, _, collisions, daily_vkm, metric = got[(road, "E06000001")]
+            _, _, collisions, daily_vkm, count_points, metric = got[(road, "E06000001")]
             # collisions == count of matching fixture collision rows (expected 1 each).
             assert collisions == expected_collisions[road]
             # daily_vehicle_km == SUM(all_motor_vehicles x link_length_km) from the fixture.
             assert abs(daily_vkm - expected_vkm[road]) <= 1e-6 * expected_vkm[road]
+            # count_points == number of distinct AADF count points for that road in the fixture.
+            assert count_points == expected_points[road]
             # The risk metric is a positive, finite number.
             assert metric > 0 and math.isfinite(metric)
 
