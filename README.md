@@ -75,7 +75,29 @@ The full table/column data dictionary is in **[docs/schema.md](docs/schema.md)**
 See **[docs/methodology.md](docs/methodology.md)** for how the data is joined, converted, and
 quality-flagged, and **[docs/spec.md](docs/spec.md)** for the full product definition.
 
-## Install
+## Install from PyPI
+
+Crossroads-UK is published on PyPI as [`crossroads-uk`](https://pypi.org/project/crossroads-uk/) (requires Python 3.11+):
+
+```bash
+pip install crossroads-uk
+```
+
+If you would also like the ERA5-Land weather source (it needs a free Copernicus CDS API key -
+the build prints setup steps), run this command instead - it installs everything above, plus the
+weather libraries:
+
+```bash
+pip install "crossroads-uk[weather]"
+```
+
+Then launch the interactive wizard - note the command is `crossroads`, without the `-uk`:
+
+```bash
+crossroads
+```
+
+## Install from source
 
 ```bash
 python3 -m venv .venv         # Python 3.11 or newer
