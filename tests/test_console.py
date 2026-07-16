@@ -551,3 +551,65 @@ def test_run_wizard_prompts_and_builds_weather_offline(tmp_path, monkeypatch):
         ).fetchone()[0] >= 1
     finally:
         client.close()
+
+
+# --- [weather] extra install gate + menu annotation -------------------------
+
+def _set_extra(monkeypatch, present):
+    monkeypatch.setattr("crossroads.transformers.weather.weather_extra_available",
+                        lambda: present)
+
+
+def test_menu_annotates_weather_when_extra_absent(monkeypatch):
+    _set_extra(monkeypatch, False)
+    labels = dict(console.available_datasets())
+    assert labels["era5_weather"] != "weather"          # marked, not the plain label
+    assert "not installed" in labels["era5_weather"].lower()
+
+
+def test_menu_plain_weather_when_extra_present(monkeypatch):
+    _set_extra(monkeypatch, True)
+    labels = dict(console.available_datasets())
+    assert labels["era5_weather"] == "weather"
+
+
+def test_install_gate_noop_when_extra_present(monkeypatch):
+    _set_extra(monkeypatch, True)
+    reader, writer, output = scripted([])              # reader must not be needed
+    params = {"datasets": ["era5_weather", "stats19"], "years": [2021]}
+    assert console.ensure_weather_installed(params, reader, writer) is True
+    assert params["datasets"] == ["era5_weather", "stats19"]
+    assert not any("not installed" in line for line in output)
+
+
+def test_install_gate_noop_when_weather_not_selected(monkeypatch):
+    _set_extra(monkeypatch, False)
+    reader, writer, _ = scripted([])
+    params = {"datasets": ["stats19"], "years": [2021]}
+    assert console.ensure_weather_installed(params, reader, writer) is True
+    assert params["datasets"] == ["stats19"]
+
+
+def test_install_gate_continue_drops_weather(monkeypatch):
+    _set_extra(monkeypatch, False)
+    reader, writer, output = scripted(["y"])           # continue without weather -> yes
+    params = {"datasets": ["era5_weather", "stats19"], "years": [2021]}
+    assert console.ensure_weather_installed(params, reader, writer) is True
+    assert params["datasets"] == ["stats19"]
+    assert any('pip install "crossroads-uk[weather]"' in line for line in output)
+
+
+def test_install_gate_weather_only_abort_on_continue(monkeypatch):
+    _set_extra(monkeypatch, False)
+    reader, writer, output = scripted(["y"])           # continue, but nothing else left
+    params = {"datasets": ["era5_weather"], "years": [2021]}
+    assert console.ensure_weather_installed(params, reader, writer) is False
+    assert any("nothing to build" in line.lower() for line in output)
+
+
+def test_install_gate_decline_aborts(monkeypatch):
+    _set_extra(monkeypatch, False)
+    reader, writer, output = scripted(["n"])           # do not continue without weather
+    params = {"datasets": ["era5_weather", "stats19"], "years": [2021]}
+    assert console.ensure_weather_installed(params, reader, writer) is False
+    assert any("install the weather add-on" in line.lower() for line in output)

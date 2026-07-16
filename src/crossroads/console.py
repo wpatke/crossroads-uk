@@ -24,10 +24,25 @@ def available_datasets():
     """Discover the user-selectable datasets for the wizard menu.
 
     Returns a list of ``(source_id, display_name)`` in the registry's stable order.
+    Weather is always listed, but when the optional [weather] extra is not installed
+    its label is marked as not-installed, so the menu shows the user it is possible and
+    gives them a concrete action (rather than looking broken). The ``source_id`` is
+    unchanged, so selection still maps to weather; only the display label changes.
     Imported lazily so importing the console module stays cheap.
     """
     from crossroads.registry import Registry
-    return [(t.source_id, t.display_name) for t in Registry().selectable()]
+    from crossroads.transformers.weather import (
+        Era5WeatherTransformer, weather_extra_available)
+    weather_id = Era5WeatherTransformer.source_id
+    extra_ok = weather_extra_available()
+    result = []
+    for t in Registry().selectable():
+        label = t.display_name
+        if t.source_id == weather_id and not extra_ok:
+            # Keep the menu line short; the full explanation is given if they select it.
+            label = f"{label} (add-on not installed - see below if you pick it)"
+        result.append((t.source_id, label))
+    return result
 
 
 def _prompt(reader, writer, message, *, parse, default=None):
@@ -314,6 +329,53 @@ def run_build(params, *, engine_factory=init_engine, cache_dir=None, writer=None
     return client
 
 
+def ensure_weather_installed(params, reader, writer):
+    """Make sure the optional [weather] extra is installed before a weather build.
+
+    Returns True to proceed with the build, False to abort. May remove 'era5_weather'
+    from params['datasets'] if the user chooses to continue without weather. A no-op
+    when weather is not selected or the extra is already installed — so it never
+    prompts unnecessarily. Runs BEFORE the credential gate: no point asking for a key
+    when the code to use it is not installed.
+    """
+    from crossroads.transformers.weather import (
+        Era5WeatherTransformer, weather_extra_available, WEATHER_EXTRA_HINT)
+    weather_id = Era5WeatherTransformer.source_id
+
+    if weather_id not in params["datasets"]:
+        return True                          # weather not selected: nothing to do
+    if weather_extra_available():
+        return True                          # extra installed: nothing to do
+
+    # Friendly, plain-language explanation: this is a one-time setup step the user
+    # still needs to do, NOT a bug. Say what happened, why, and exactly how to fix it.
+    writer("")                               # spacer before the block
+    writer("You picked weather, but the optional weather add-on isn't installed yet,")
+    writer("so Crossroads can't download or build weather data. This isn't an error -")
+    writer("weather ships as an optional extra to keep the base install small and fast.")
+    writer("")
+    writer("To enable weather, install the add-on and then run Crossroads again:")
+    writer("")
+    writer(f"    {WEATHER_EXTRA_HINT}")
+    writer("")
+
+    # Offer to continue without weather for this run. Default N: the user most likely
+    # wants to install and re-run, so a bare Enter does not silently drop weather.
+    if prompt_confirm(reader, writer,
+                      message="Build the other datasets now, without weather? (y/n)",
+                      default=False):
+        params["datasets"] = [d for d in params["datasets"] if d != weather_id]
+        if not params["datasets"]:
+            writer("Weather was the only dataset selected, so there's nothing to build.")
+            writer("Install the add-on with the command above, then re-run.")
+            return False
+        writer("Continuing without weather data for this build.")
+        return True
+
+    writer("No problem - install the weather add-on with the command above, then re-run.")
+    return False
+
+
 def ensure_weather_credentials(params, reader, secret_reader, writer):
     """Make sure a CDS API key exists before a weather build; prompt and save one if not.
 
@@ -391,6 +453,12 @@ def run_wizard(reader, writer, *, secret_reader=None, engine_factory=init_engine
         secret_reader = lambda: getpass.getpass("")
 
     params = gather_parameters(reader, writer, available=available)
+
+    # Block early if weather was selected without its optional extra installed: no
+    # point asking about boundaries or a key when weather cannot be built.
+    if not ensure_weather_installed(params, reader, writer):
+        writer("Aborted - no database was built.")
+        return None
 
     # Temporal + AADF only: an annual traffic average is attributed to the boundary
     # in force at a mid-year (1 July) date, which is approximate in a year when a
