@@ -4,7 +4,7 @@
 
 A reproducible Python pipeline that downloads, cleanses, and unifies UK road-safety
 (DfT STATS19), meteorological (Copernicus ERA5-Land), and ONS boundary data into a
-single local DuckDB database — built on the fly from version-controlled code.
+single local DuckDB database, built on the fly from version-controlled code.
 
 Crossroads-UK does not ship a pre-baked database. You choose what to build; the pipeline
 fetches the raw public sources and compiles a DuckDB file on your machine, so the result
@@ -12,55 +12,28 @@ is fresh, reproducible, and exactly scoped to your query.
 
 ## Why Crossroads-UK? What can it do?
 
-**More than road safety.** Crossroads-UK is a reproducible engine for unifying UK public datasets
+**More than road safety.**
+Crossroads-UK is a reproducible engine for unifying UK public datasets
 into one local, analysis-ready DuckDB database. Road safety is where it starts, not where it stops:
 the engine is dataset-agnostic by design, so any UK public source can be added as a new transformer
-without touching the core ([docs/spec.md](docs/spec.md) §4). The rest of this section shows what that
+without touching the core (see [Modular Data Architecture](docs/spec.md#4-modular-data-architecture) in
+the spec). The rest of this section shows what that
 unification buys a researcher today.
 
-**Ask questions the raw data can't answer — like sun glare.** Because every collision carries the
-sun's elevation *and* azimuth, and every vehicle its direction of travel, you can isolate collisions
-where a low sun sat directly ahead of the driver — a sun-glare geometry you cannot reconstruct from
-STATS19 alone:
+**Join anything to anything.**
+Every source lands in one local DuckDB database on standardised keys (ONS
+local-authority codes, road numbers, dates, British National Grid coordinates), so you can combine them
+in ways no one built a feature for, using ordinary SQL. Does heavy rain shift the severity mix on the
+M1? Do collisions spike on bank holidays in one local authority? Which roads see the most crashes per
+vehicle-km? Each is just a join you write, and DuckDB runs it locally. See the
+[real-world examples](#real-world-examples) below.
 
-```sql
--- Low sun close to the driver's line of travel: classic sun-glare geometry.
-WITH v AS (
-    SELECT accident_index,
-           CASE vehicle_direction_to        -- DfT 8-point code -> compass bearing (deg)
-               WHEN 1 THEN 0 WHEN 2 THEN 45 WHEN 3 THEN 90 WHEN 4 THEN 135
-               WHEN 5 THEN 180 WHEN 6 THEN 225 WHEN 7 THEN 270 WHEN 8 THEN 315
-           END AS bearing_deg
-    FROM vehicles
-    WHERE vehicle_direction_to BETWEEN 1 AND 8    -- 0 = parked, -1/9 = unknown
-)
-SELECT c.accident_index,
-       c.collision_severity,                                  -- 1=Fatal 2=Serious 3=Slight
-       round(c.solar_elevation_deg, 1) AS sun_elevation_deg,  -- low = near the horizon
-       round(180 - abs(abs(c.solar_azimuth_deg - v.bearing_deg) - 180), 1) AS sun_offset_deg
-FROM collisions c
-JOIN v USING (accident_index)
-WHERE c.solar_elevation_deg BETWEEN 0 AND 10                  -- sun above the horizon, but low
-  AND 180 - abs(abs(c.solar_azimuth_deg - v.bearing_deg) - 180) <= 30   -- within 30 deg ahead
-ORDER BY sun_offset_deg
-LIMIT 1
-```
-
-`sun_offset_deg` is the angle between the sun and the direction of travel — `0` means the sun was
-dead ahead. The sun's position is computed mathematically (NOAA) from each collision's place and
-time; nothing is downloaded for it.
-
-The single most head-on case in a real 2023 national build — a low morning sun (6° above the horizon)
-sitting directly in the driver's line of travel, `sun_offset_deg` of 0 meaning dead ahead. This needs
-only `stats19`; no weather extra:
-
-| accident_index | collision_severity | sun_elevation_deg | sun_offset_deg |
-|----------------|-------------------:|------------------:|---------------:|
-| 2023311351084  |                  3 |               6.0 |            0.0 |
-
-**Variables you'd normally engineer are already columns.** Matching gridded weather to crash points
-and geocoding to ONS boundaries is normally weeks of GIS work. In Crossroads they are attributes of
-the collision row — no joins to any external file:
+**A schema built for fast reads.**
+A single collision row carries its weather, its
+local authority, its bank-holiday status, and the position of the sun overhead. Those are datasets that
+normally take a lot of work to align: gridded weather matched to each crash point, coordinates
+geocoded to ONS boundaries. Crossroads does that alignment once, at build time, so what would be a
+multi-source join is a single `SELECT`:
 
 ```sql
 SELECT accident_index,
@@ -76,28 +49,31 @@ ORDER BY datetime_local
 LIMIT 1
 ```
 
-The earliest collision of 2023, from a real national build — weather, sun, boundary, and holiday are
-all just columns on the row, with no joins to any external file:
-
-| accident_index | collision_severity | temperature_c | precipitation_mm | solar_elevation_deg | lad_code  | is_bank_holiday |
-|----------------|-------------------:|--------------:|-----------------:|--------------------:|-----------|-----------------|
-| 2023340NN0022  |                  2 |          10.1 |              4.5 |               -60.7 | E06000061 | false           |
-
-`temperature_c` and `precipitation_mm` need the optional `weather` extra and a free Copernicus key;
-`solar_elevation_deg`, `lad_code`, and `is_bank_holiday` need no paid extra or key.
-
-**Measure risk, not raw counts.** Traffic-exposure denominators turn collision counts into an
-exposure-adjusted rate — see [Real-world example: real risk, not raw counts](#real-world-example-real-risk-not-raw-counts)
+**Measure risk, not raw counts.**
+Traffic-exposure denominators turn collision counts into an
+exposure-adjusted rate. See [Example 1: real risk, not raw counts](#example-1-real-risk-not-raw-counts)
 below.
 
-**Reproducible and auditable by construction.** Crossroads ships no pre-baked database: it is
-compiled from version-controlled code, so a colleague re-running the same build gets the same result.
-Nothing is silently dropped — every value that fails validation is logged with a reason in
-`data_quality_log` — and each database carries a provenance stamp you can cite:
+### Crossroads-UK is built to be trusted
 
-```sql
-SELECT * FROM crossroads_meta;   -- version, schema, build parameters, build time
-```
+It doesn't just download data and hand it over. It builds the database on your machine, records
+anything it couldn't use instead of silently dropping it, and stamps each build so a colleague can
+reproduce it exactly:
+
+- A **keep-in-place** data model (bronze/silver/gold): raw rows are never deleted; records
+  that fail validation are flagged with a reason in a queryable `data_quality_log`.
+- Spatial standardisation to the British National Grid (EPSG:27700) with R-Tree indices.
+- Snapshot or temporally-sliced boundary joins.
+- Build-time conservation invariants that halt the build if any row goes unaccounted for.
+- DfT AADF traffic volumes, LAD-stamped, enabling per-vehicle-km risk denominators (turn raw
+  collision counts into an exposure-adjusted rate).
+- A **provenance stamp** on every database (version, schema, build parameters, and build time)
+  so a re-run reproduces the result and you can cite it: `SELECT * FROM crossroads_meta;`
+
+The full table/column data dictionary is in **[docs/schema.md](docs/schema.md)**.
+
+See **[docs/methodology.md](docs/methodology.md)** for how the data is joined, converted, and
+quality-flagged, and **[docs/spec.md](docs/spec.md)** for the full product definition.
 
 ## Install
 
@@ -130,28 +106,15 @@ client.close()
 ```
 
 The **weather** source additionally needs the `weather` extra installed and a free
-Copernicus CDS API key — the build prints setup steps if it is missing.
+Copernicus CDS API key. The build prints setup steps if it is missing.
 
-## What you get
+## Real-world examples
 
-- A **keep-in-place** data model (bronze/silver/gold): raw rows are never deleted; records
-  that fail validation are flagged with a reason in a queryable `data_quality_log`.
-- Spatial standardisation to the British National Grid (EPSG:27700) with R-Tree indices.
-- Snapshot or temporally-sliced boundary joins.
-- Build-time conservation invariants that halt the build if any row goes unaccounted for.
-- DfT AADF traffic volumes, LAD-stamped, enabling per-vehicle-km risk denominators (turn raw
-  collision counts into an exposure-adjusted rate).
-
-The full table/column data dictionary is in **[docs/schema.md](docs/schema.md)**.
-
-See **[docs/methodology.md](docs/methodology.md)** for how the data is joined, converted, and
-quality-flagged, and **[docs/spec.md](docs/spec.md)** for the full product definition.
-
-## Real-world example
+### Example 1: real risk, not raw counts
 
 Raw collision counts mislead: a busy motorway *looks* dangerous simply because more traffic
 means more crashes. Dividing collisions by traffic volume gives **collisions per million
-vehicle-km** — an exposure-adjusted rate — and because collisions and AADF count points already
+vehicle-km** (an exposure-adjusted rate), and because collisions and AADF count points already
 share road names and ONS LAD codes in your database, the join is plain SQL, with no point-to-line
 snapping.
 
@@ -197,20 +160,56 @@ M1 by local authority from a real 2023 build (`datasets=["stats19", "aadf"]`).
 † **Why does E07000096 top the list? Is it really dangerous?** What looks like a deadly road is just
 a counting mismatch: we counted all 15 crashes along this stretch of the M1, but measured traffic on
 only a tiny section of it (AADF has just one count point there). We do not have data for the true
-road traffic.
+road traffic. A single count point can't tell you a road is dangerous *or* safe.
 
-**Rule of thumb:** trust rows with many `count_points`, distrust rows with just one — a single count
-point can't tell you a road is dangerous *or* safe.
+### Example 2: questions the raw data can't answer
+
+Crossroads can calculate facts beyond what is in the data. For example, the raw STATS19 record tells you
+which way each vehicle was pointing but not where the sun was. Crossroads computes the sun's exact
+elevation and azimuth for every collision from the crash's own place and time, in-database and with
+nothing downloaded (the standard NOAA solar-position math). Put the two together, and you can isolate
+collisions where a low sun sat directly ahead of the driver.
+
+```sql
+-- Low sun close to the driver's line of travel: classic sun-glare geometry.
+WITH v AS (
+    SELECT accident_index,
+           CASE vehicle_direction_to        -- DfT 8-point code -> compass bearing (deg)
+               WHEN 1 THEN 0 WHEN 2 THEN 45 WHEN 3 THEN 90 WHEN 4 THEN 135
+               WHEN 5 THEN 180 WHEN 6 THEN 225 WHEN 7 THEN 270 WHEN 8 THEN 315
+           END AS bearing_deg
+    FROM vehicles
+    WHERE vehicle_direction_to BETWEEN 1 AND 8    -- 0 = parked, -1/9 = unknown
+)
+SELECT c.accident_index,
+       c.collision_severity,                                  -- 1=Fatal 2=Serious 3=Slight
+       round(c.solar_elevation_deg, 1) AS sun_elevation_deg,  -- low = near the horizon
+       round(180 - abs(abs(c.solar_azimuth_deg - v.bearing_deg) - 180), 1) AS sun_offset_deg
+FROM collisions c
+JOIN v USING (accident_index)
+WHERE c.solar_elevation_deg BETWEEN 0 AND 10                  -- sun above the horizon, but low
+  AND 180 - abs(abs(c.solar_azimuth_deg - v.bearing_deg) - 180) <= 30   -- within 30 deg ahead
+ORDER BY sun_offset_deg
+LIMIT 1
+```
+
+`sun_offset_deg` is the angle between the sun and the direction of travel. `0` means the sun was
+dead ahead. The single most head-on case in a real 2023 national build: a low morning sun 6° above
+the horizon, dead in the driver's line of travel.
+
+| accident_index | collision_severity | sun_elevation_deg | sun_offset_deg |
+|----------------|-------------------:|------------------:|---------------:|
+| 2023311351084  |                  3 |               6.0 |            0.0 |
 
 ## Data & licences
 
-Crossroads-UK downloads data directly from DfT, ONS, and Copernicus. You are responsible
+Crossroads-UK downloads data directly from DfT, ONS, Copernicus, and gov.uk. You are responsible
 for honouring each source's licence when you publish. See **[docs/data-sources.md](docs/data-sources.md)**
 for each source, its licence, and the exact attribution to reproduce.
 
 ## Citing
 
-If you use Crossroads-UK in research, please cite it — see **[CITATION.cff](CITATION.cff)**
+If you use Crossroads-UK in research, please cite it. See **[CITATION.cff](CITATION.cff)**
 (GitHub's "Cite this repository" button) or the latest release entry in
 **[CHANGELOG.md](CHANGELOG.md)**.
 
