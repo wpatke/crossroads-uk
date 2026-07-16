@@ -401,6 +401,13 @@ def ensure_weather_credentials(params, reader, secret_reader, writer):
     writer(f"Get your token from {CDS_HOME_URL} (log in -> your profile ->")
     writer("'Personal Access Token').")
 
+    # The token is read with getpass, so nothing shows on screen as it is typed
+    # or pasted. Warn about that up front so a blank-looking line doesn't read as
+    # a frozen terminal. Printed once here, before the retry loop.
+    writer("")
+    writer("Note: for security, your token stays hidden as you type or paste — the")
+    writer("screen won't change. This is expected; type it in and press Enter.")
+
     while True:
         token = _prompt_secret(secret_reader, writer,
                                "Personal Access Token (leave blank to skip)")

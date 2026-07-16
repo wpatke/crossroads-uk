@@ -448,6 +448,34 @@ def test_weather_key_prompt_saves_file(tmp_path, monkeypatch):
     assert any("Saved ~/.cdsapirc." in line for line in output)
 
 
+def test_weather_key_prompt_warns_input_is_hidden(tmp_path, monkeypatch):
+    # The masked prompt must be preceded by a note that hidden typing is expected,
+    # so a blank-looking terminal doesn't read as broken.
+    _isolate_cds(monkeypatch, tmp_path)
+    reader, writer, output = scripted([])
+    secret = scripted_secret(["MY-TOKEN-123"])
+    params = {"datasets": ["era5_weather"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, secret, writer) is True
+
+    # The note is shown exactly once, before the token prompt label.
+    assert sum("stays hidden" in ln for ln in output) == 1
+    # Match the prompt label specifically (the phrase "Personal Access Token" also
+    # appears in the explanatory block above, so anchor on the label's leave-blank hint).
+    note_idx = next(i for i, ln in enumerate(output) if "stays hidden" in ln)
+    prompt_idx = next(i for i, ln in enumerate(output) if "leave blank to skip" in ln)
+    assert note_idx < prompt_idx
+
+
+def test_no_hidden_input_note_when_key_present(tmp_path, monkeypatch):
+    # An existing key means no prompt at all, so the note must not appear.
+    _isolate_cds(monkeypatch, tmp_path)
+    (tmp_path / ".cdsapirc").write_text("url: x\nkey: y\n")
+    reader, writer, output = scripted([])
+    params = {"datasets": ["era5_weather"], "years": [2023]}
+    assert console.ensure_weather_credentials(params, reader, _boom_secret(), writer) is True
+    assert not any("stays hidden" in ln for ln in output)
+
+
 def test_weather_key_skipped_when_file_present(tmp_path, monkeypatch):
     # An existing ~/.cdsapirc means no prompt, and the file is left untouched.
     _isolate_cds(monkeypatch, tmp_path)

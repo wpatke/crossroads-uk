@@ -83,6 +83,12 @@ Crossroads-UK is published on PyPI as [`crossroads-uk`](https://pypi.org/project
 pip install crossroads-uk
 ```
 
+Already installed? Upgrade to the latest release with:
+
+```bash
+pip install --upgrade crossroads-uk
+```
+
 If you would also like the ERA5-Land weather source (it needs a free Copernicus CDS API key -
 the build prints setup steps), run this command instead - it installs everything above, plus the
 weather libraries:
