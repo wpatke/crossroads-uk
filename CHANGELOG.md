@@ -19,6 +19,27 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
+## [1.0.3] - 2026-07-16
+
+### Changed
+- Wizard: before the (masked) Copernicus CDS token prompt, note that input stays hidden
+  while typing or pasting, so the blank-looking line no longer reads as a frozen terminal.
+- README: added `pip install --upgrade crossroads-uk` instructions for updating an
+  existing install.
+
+## [1.0.2] - 2026-07-16
+
+### Fixed
+- Wizard weather setup: a rejected or malformed Copernicus CDS API key, and the `weather`
+  extra not being installed, are now handled with clear, actionable guidance instead of a
+  raw traceback.
+
+## [1.0.1] - 2026-07-16
+
+### Changed
+- README: documented installation from PyPI (`pip install crossroads-uk`, plus the
+  `[weather]` extra for the ERA5-Land source).
+
 ## [1.0.0] - 2026-07-15
 
 First stable release, and the first published to PyPI (`pip install crossroads-uk`). The
@@ -55,5 +76,8 @@ stable-contract guarantees described above take effect at `1.0.0`.
 - Spatial standardisation to EPSG:27700 with R-Tree indices; snapshot and temporal
   boundary modes.
 
+[1.0.3]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.3
+[1.0.2]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.2
+[1.0.1]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.1
 [1.0.0]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.0
 [0.9.0]: https://github.com/wpatke/crossroads-uk/releases/tag/v0.9.0
