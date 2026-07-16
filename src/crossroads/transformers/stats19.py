@@ -14,7 +14,6 @@ committed sample CSVs, so no network access occurs.
 """
 
 import os
-import urllib.request
 import urllib.error
 import warnings
 
@@ -23,6 +22,7 @@ from crossroads.quality import (
     SourceQuality, Dimension, record_source_rows, log_exclusion, create_clean_view,
 )
 from crossroads.sql import sql_str
+from crossroads.net import download_to_file
 
 # DfT publishes per-year CSVs under this base. The per-year filename template is
 # code-controlled; live filenames were verified at implementation time (2020-2024
@@ -123,21 +123,26 @@ class Stats19Transformer(BaseTransformer):
         return "accident_index" in first or "collision_index" in first
 
     def _fetch(self, url, dest):
-        """Download `url` to `dest` safely, then validate before it reaches the cache.
+        """Download `url` to `dest` safely, validating before it reaches the cache.
 
-        Fetch to a temporary sibling ('<dest>.part'), confirm it looks like a STATS19 CSV,
-        then atomically move it into place. A missing year (HTTP 404) or any other HTTP error
-        becomes a researcher-friendly ValueError; a non-CSV body (e.g. an error page returned
-        as 200 OK) is rejected. In every failure case the partial file is removed, so a bad
-        response can never poison the cache for a later run (extract() skips re-downloading
-        any file that already exists).
+        download_to_file streams to a temporary sibling ('<dest>.part') with a socket
+        timeout (a stalled endpoint fails fast, never hangs), runs the CSV content check,
+        then atomically moves the file into place. A missing year (HTTP 404) or any other
+        HTTP error becomes a researcher-friendly ValueError; a non-CSV body (e.g. an error
+        page returned as 200 OK) is rejected by the validator. In every failure case the
+        partial file is removed, so a bad response can never poison the cache for a later
+        run (extract() skips re-downloading any file that already exists).
         """
-        tmp = dest + ".part"
+        def _validate(tmp):
+            # Validate the bytes we actually got, not just the HTTP status.
+            if not self._looks_like_stats19_csv(tmp):
+                raise ValueError(
+                    f"Downloaded file from {url} is not a STATS19 CSV (the server may have "
+                    f"returned an error page instead of data). Nothing was cached."
+                )
         try:
-            urllib.request.urlretrieve(url, tmp)
+            download_to_file(url, dest, validator=_validate)
         except urllib.error.HTTPError as exc:
-            if os.path.exists(tmp):
-                os.remove(tmp)
             if exc.code == 404:
                 raise ValueError(
                     f"No STATS19 data found at {url} (HTTP 404). DfT usually publishes a "
@@ -145,14 +150,6 @@ class Stats19Transformer(BaseTransformer):
                     f"be available yet -- try an earlier year."
                 ) from exc
             raise ValueError(f"Failed to download {url} (HTTP {exc.code}).") from exc
-        # Validate the bytes we actually got, not just the HTTP status.
-        if not self._looks_like_stats19_csv(tmp):
-            os.remove(tmp)
-            raise ValueError(
-                f"Downloaded file from {url} is not a STATS19 CSV (the server may have "
-                f"returned an error page instead of data). Nothing was cached."
-            )
-        os.replace(tmp, dest)   # atomic within the same directory; cache holds only valid files
 
     def extract(self, cache_dir, **kwargs):
         os.makedirs(cache_dir, exist_ok=True)

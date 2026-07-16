@@ -17,7 +17,6 @@ committed .geojson fixture files, so no network access occurs.
 import json
 import os
 import urllib.parse
-import urllib.request
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ from crossroads.quality import (
     record_source_rows, log_exclusion,
 )
 from crossroads.sql import sql_str
+from crossroads.net import download_to_file
 
 # British National Grid envelope, used to verify geometry really is EPSG:27700.
 # (DuckDB GEOMETRY stores no SRID, so we sanity-check coordinate ranges.)
@@ -194,8 +194,9 @@ class _BoundaryTransformer(BaseTransformer):
         self._vintages_to_load = wanted
 
     def _download_source(self, vintage, dest_path):
-        """Download a vintage from the ONS FeatureServer GeoJSON endpoint."""
-        urllib.request.urlretrieve(vintage.url, dest_path)
+        """Download a vintage from the ONS FeatureServer GeoJSON endpoint (streamed,
+        socket-timed so a stalled endpoint fails fast rather than hanging, atomic)."""
+        download_to_file(vintage.url, dest_path)
 
     def transform_and_load(self, con, cache_dir):
         vintages = getattr(self, "_vintages_to_load", None) or self._vintages_for()

@@ -3,6 +3,7 @@
 Offline: the cache is pre-seeded with committed sample CSVs so extract() finds the
 files and performs no network download.
 """
+import io
 import os
 import shutil
 import urllib.request
@@ -280,11 +281,11 @@ def test_fetch_missing_year_raises_friendly_error(tmp_path, monkeypatch):
     """A 404 (unpublished year) -> ValueError, and nothing is cached."""
     cache = str(tmp_path / "cache")
 
-    def fake_urlretrieve(url, filename):
+    def fake_urlopen(url, timeout=None):
         # Simulate DfT returning 404 for a not-yet-published year.
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
 
-    monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     t = Stats19Transformer()
     with pytest.raises(ValueError) as exc:
         t.extract(cache, years=[2999])
@@ -298,12 +299,11 @@ def test_fetch_html_error_page_is_rejected(tmp_path, monkeypatch):
     """A 200-OK response whose body is an HTML error page -> ValueError, nothing cached."""
     cache = str(tmp_path / "cache")
 
-    def fake_urlretrieve(url, filename):
+    def fake_urlopen(url, timeout=None):
         # Simulate a server that answers a missing file with 200 OK + an HTML page.
-        with open(filename, "w") as f:
-            f.write("<!DOCTYPE html><html><body>File not found</body></html>")
+        return io.BytesIO(b"<!DOCTYPE html><html><body>File not found</body></html>")
 
-    monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     t = Stats19Transformer()
     with pytest.raises(ValueError) as exc:
         t.extract(cache, years=[2999])
@@ -315,13 +315,12 @@ def test_fetch_valid_csv_is_cached_atomically(tmp_path, monkeypatch):
     """A valid STATS19 CSV lands at its final path with no leftover .part file."""
     cache = str(tmp_path / "cache")
 
-    def fake_urlretrieve(url, filename):
+    def fake_urlopen(url, timeout=None):
         # A minimal but valid-looking STATS19 CSV (header names the index column).
-        with open(filename, "w") as f:
-            f.write("collision_index,collision_year,collision_severity\n"
-                    "2999010000001,2999,3\n")
+        return io.BytesIO(b"collision_index,collision_year,collision_severity\n"
+                          b"2999010000001,2999,3\n")
 
-    monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     t = Stats19Transformer()
     t.extract(cache, years=[2999])   # loops collision/vehicle/casualty -> three files
     files = sorted(os.listdir(cache))

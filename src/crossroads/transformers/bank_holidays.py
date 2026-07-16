@@ -18,10 +18,10 @@ STATS19 optionally consumes the `bank_holidays` table to stamp collisions.is_ban
 
 import json
 import os
-import urllib.request
 
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import QualityExemption, create_clean_view
+from crossroads.net import download_to_file
 
 # The live GOV.UK feed. Public, Open Government Licence v3.0.
 FEED_URL = "https://www.gov.uk/bank-holidays.json"
@@ -51,24 +51,17 @@ class BankHolidaysTransformer(BaseTransformer):
         self._download(path)
 
     def _download(self, dest):
-        """Fetch the feed to `dest`, written atomically (download to a temp, parse-check,
-        then rename) so an interrupted or corrupt download never leaves a half-file that
-        the extract() cache check would mistake for a good one."""
-        tmp = dest + ".part"
-        try:
-            with urllib.request.urlopen(FEED_URL, timeout=60) as resp:
-                raw = resp.read()
-            data = json.loads(raw)                       # fail fast on a non-JSON error page
+        """Fetch the feed to `dest`, streamed and atomic, with a socket timeout so a stalled
+        endpoint fails fast rather than hanging. A validator parses the JSON and confirms all
+        divisions are present BEFORE the file is promoted, so a non-JSON error page or a
+        truncated feed never reaches the cache."""
+        def _validate(tmp):
+            with open(tmp, "r", encoding="utf-8") as fh:
+                data = json.load(fh)                     # fail fast on a non-JSON error page
             if not all(d in data for d in DIVISIONS):    # smoke check: all divisions present
                 raise ValueError(
                     f"bank-holidays feed missing expected divisions; got {sorted(data)}")
-            with open(tmp, "wb") as fh:
-                fh.write(raw)
-            os.replace(tmp, dest)                         # atomic promote on success
-        except Exception:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
+        download_to_file(FEED_URL, dest, timeout=60, validator=_validate)
 
     # --- transform_and_load ------------------------------------------------
     def transform_and_load(self, con, cache_dir):

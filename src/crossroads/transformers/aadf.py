@@ -33,7 +33,6 @@ Design notes:
 
 import os
 import shutil
-import urllib.request
 import warnings
 import zipfile
 
@@ -42,6 +41,7 @@ from crossroads.quality import (
     SourceQuality, Dimension, record_source_rows, log_exclusion, create_clean_view,
 )
 from crossroads.sql import sql_str
+from crossroads.net import download_to_file
 
 # The single national AADF file. Public, Open Government Licence v3.0
 # (listed on https://roadtraffic.dft.gov.uk/downloads).
@@ -98,21 +98,12 @@ class AadfTransformer(BaseTransformer):
         self._unzip_single_csv(zip_path, csv_path)
 
     def _download(self, url, dest):
-        """Fetch the zip to `dest`, written atomically (download to a temp, then rename) so
-        an interrupted download never leaves a half-file the cache check would trust. A zip
-        cannot be parse-checked mid-download; it is validated instead by opening it in
+        """Fetch the zip to `dest`, streamed and atomic (download to a temp, then rename) so
+        an interrupted download never leaves a half-file the cache check would trust, with a
+        socket timeout so a stalled endpoint fails fast rather than hanging. A zip cannot be
+        parse-checked mid-download; it is validated instead by opening it in
         _unzip_single_csv (a corrupt archive raises there)."""
-        tmp = dest + ".part"
-        try:
-            with urllib.request.urlopen(url, timeout=120) as resp:
-                data = resp.read()
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp, dest)           # atomic promote on success
-        except Exception:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
+        download_to_file(url, dest)
 
     def _unzip_single_csv(self, zip_path, csv_dest):
         """Extract the single CSV member of the national zip to the canonical cache name.
