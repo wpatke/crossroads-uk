@@ -11,9 +11,19 @@ own bronze/silver tables and simply describes them with a SourceQuality.
 import logging
 from dataclasses import dataclass
 
+from crossroads.sql import sql_str
+
 # Default reject-rate ceiling (spec §9-3). A source/dimension may override it;
 # a build() call may override the default globally. 0.05 == 5%.
 DEFAULT_REJECT_CEILING = 0.05
+
+# Default quarantine-rate ceiling (spec §9). Quarantine (a line that could not be
+# structured into bronze at all) is a DIFFERENT signal from a field-level reject: a
+# structurally-broken line in a well-formed government CSV should be near-zero, so this
+# ceiling is deliberately much tighter than the reject ceiling. 0.005 == 0.5% — still
+# ~100x headroom over a handful of stray lines in a large file, but it catches a real
+# upstream format change (a large fraction failing to parse) far sooner than 5% would.
+DEFAULT_QUARANTINE_CEILING = 0.005
 
 
 @dataclass(frozen=True)
@@ -202,6 +212,66 @@ def quarantine_row(con, *, source_id, raw_text, reason):
     )
 
 
+def load_csv_bronze_with_quarantine(con, *, bronze_table, paths, read_opts, source_id):
+    """Create `bronze_table` from rejects-capturing read_csv(s) and quarantine every
+    rejected line (spec §9 — an unparseable line is recorded in quarantine_raw, never
+    silently dropped and never fatal). Returns (loaded_rows, quarantined_rows).
+
+    `paths` is a list of source CSV file paths. `read_opts` is the per-file column-options
+    string (e.g. "header=true, all_varchar=true"). all_varchar=true means type casts never
+    fail, so a "reject" here is a STRUCTURAL problem (wrong column count, unterminated
+    quote) — exactly "a row that cannot be structured into bronze" (spec §9). Rows that
+    parse but hold bad VALUES reach bronze as strings and are handled later by silver
+    validation + data_quality_log.
+
+    Each file is loaded into its own staging table with rejects captured, then the staging
+    tables are combined with UNION ALL BY NAME (columns matched by name, missing filled
+    NULL — the same result the old union_by_name=true gave). This per-file shape is
+    REQUIRED: DuckDB rejects the rejects_table option together with union_by_name, so the
+    name-union is done at the SQL level instead. DuckDB also auto-creates a companion scan
+    table whose default name ('reject_scans') collides on the second store_rejects load in
+    one connection, so both the rejects and scan tables are named uniquely per staging load
+    and dropped after use. Identifiers are code-controlled; paths are escaped with sql_str;
+    no row values are ever interpolated.
+    """
+    quarantined = 0
+    stages = []
+    for i, path in enumerate(paths):
+        stage = f"{bronze_table}_stage_{i}"
+        rej = f"{stage}_rejects"
+        scan = f"{rej}_scan"
+        for t in (stage, rej, scan):
+            con.execute(f"DROP TABLE IF EXISTS {t}")
+        con.execute(
+            f"CREATE TABLE {stage} AS SELECT * FROM read_csv({sql_str(path)}, {read_opts}, "
+            f"ignore_errors=true, store_rejects=true, "
+            f"rejects_table='{rej}', rejects_scan='{scan}')")
+        # One reject_errors row per bad VALUE; a single bad line can appear more than once
+        # (e.g. several offending columns). Group by (file_id, line) — the physical source
+        # line — so each rejected line is quarantined exactly once, while two distinct lines
+        # with identical text still count as two (grouping by csv_line would undercount them
+        # and break conservation).
+        rejected = con.execute(
+            f"SELECT any_value(csv_line), any_value(error_message) FROM {rej} "
+            f"GROUP BY file_id, line").fetchall()
+        for raw_line, reason in rejected:
+            quarantine_row(con, source_id=source_id, raw_text=raw_line,
+                           reason=f"unparseable CSV line: {reason}")
+        quarantined += len(rejected)
+        con.execute(f"DROP TABLE IF EXISTS {rej}")
+        con.execute(f"DROP TABLE IF EXISTS {scan}")
+        stages.append(stage)
+    # Combine the per-file staging tables, matching columns by NAME (fills absent columns
+    # with NULL) — the historical accident_* / modern collision_* tranches coexist exactly
+    # as they did under union_by_name.
+    union_sql = " UNION ALL BY NAME ".join(f"SELECT * FROM {s}" for s in stages)
+    con.execute(f"CREATE OR REPLACE TABLE {bronze_table} AS {union_sql}")
+    for s in stages:
+        con.execute(f"DROP TABLE IF EXISTS {s}")
+    loaded = con.execute(f"SELECT count(*) FROM {bronze_table}").fetchone()[0]
+    return loaded, quarantined
+
+
 def record_exemption(con, source_id, reason):
     """Record a source's deliberate opt-out from the quality invariants.
 
@@ -268,6 +338,11 @@ class FlagLedgerAgreementError(QualityInvariantError):
 
 class RejectRateExceededError(QualityInvariantError):
     """A source/dimension reject rate exceeded its configured ceiling."""
+
+
+class QuarantineRateExceededError(QualityInvariantError):
+    """quarantined / source_rows exceeded the quarantine ceiling — a likely upstream
+    format change, not the rare stray line the keep-in-place design tolerates."""
 
 
 class SchemaContractError(QualityInvariantError):
@@ -371,6 +446,33 @@ def check_conservation(con, spec):
         )
 
 
+def check_quarantine_rate(con, spec, ceiling=DEFAULT_QUARANTINE_CEILING):
+    """Invariant (fatal above ceiling): quarantined / source_rows <= ceiling.
+
+    Quarantine (rows that could not be structured into bronze at all) must be rare
+    (spec §9). Making malformed lines non-fatal must not let a changed upstream format
+    quietly dump half the file into quarantine, so this tripwire keeps a flood fatal.
+    source_rows is the independently-counted source total; quarantined is the
+    quarantine_raw count for this source. An empty source (0 rows) passes.
+    """
+    source_rows = con.execute(
+        "SELECT coalesce(sum(source_rows), 0) FROM source_ingest_log WHERE source_id = ?",
+        [spec.source_id],
+    ).fetchone()[0]
+    if source_rows == 0:
+        return
+    quarantined = con.execute(
+        "SELECT count(*) FROM quarantine_raw WHERE source_id = ?",
+        [spec.source_id],
+    ).fetchone()[0]
+    rate = quarantined / source_rows
+    if rate > ceiling:
+        raise QuarantineRateExceededError(
+            f"[{spec.source_id}] quarantine rate {rate:.4f} ({quarantined}/{source_rows}) "
+            f"exceeds ceiling {ceiling:.4f}. This may signal a silent upstream format change."
+        )
+
+
 def check_flag_ledger_agreement(con, spec):
     """Invariant 2 (fatal): per dimension, silver flag==FALSE set == ledger set.
 
@@ -455,6 +557,7 @@ def run_invariants(con, specs, default_ceiling=DEFAULT_REJECT_CEILING):
     for spec in specs:
         check_schema_contract(con, spec)   # fail fast on a missing silver column
         check_conservation(con, spec)
+        check_quarantine_rate(con, spec)   # flood of unparseable lines -> fatal
         check_flag_ledger_agreement(con, spec)
         check_reject_rates(con, spec, default_ceiling)
 

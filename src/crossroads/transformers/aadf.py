@@ -31,6 +31,7 @@ Design notes:
     lower-cased names in the silver SELECT bind to them.
 """
 
+import csv
 import os
 import shutil
 import warnings
@@ -39,8 +40,8 @@ import zipfile
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
     SourceQuality, Dimension, record_source_rows, log_exclusion, create_clean_view,
+    load_csv_bronze_with_quarantine,
 )
-from crossroads.sql import sql_str
 from crossroads.net import download_to_file
 
 # The single national AADF file. Public, Open Government Licence v3.0
@@ -131,17 +132,18 @@ class AadfTransformer(BaseTransformer):
                 f"[aadf] no cached CSV at {path}; extract() must run first "
                 f"(or seed the cache in tests).")
         # BRONZE: faithful, header-driven, all-string copy. No year filter (full history).
-        # Path is cache-derived (trusted); no row values are interpolated.
-        con.execute(
-            f"CREATE OR REPLACE TABLE {self.BRONZE} AS "
-            f"SELECT * FROM read_csv({sql_str(path)}, header=true, all_varchar=true)")
+        # Any line that cannot be structured is quarantined (spec §9 — recorded, not fatal).
+        # Path is cache-derived + escaped; no row values are interpolated.
+        load_csv_bronze_with_quarantine(
+            con, bronze_table=self.BRONZE, paths=[path],
+            read_opts="header=true, all_varchar=true", source_id=self.source_id)
         # SILVER (typed, keep-in-place 1:1), then the exclusion ledger, then the area stamp.
         self._derive_silver(con)
         self._log_rejections(con)
         self._stamp_area_codes(con)
-        # CONSERVATION: record how many rows were read from the source file.
-        n = con.execute(f"SELECT count(*) FROM {self.BRONZE}").fetchone()[0]
-        record_source_rows(con, self.source_id, n)
+        # CONSERVATION: record rows read INDEPENDENTLY (Python csv reader, not count(bronze)),
+        # so source_rows == bronze + quarantine is a real check (spec §9).
+        record_source_rows(con, self.source_id, self._count_source_rows(path))
         # GOLD: valid-geometry AND valid-count projection.
         create_clean_view(con, self.CLEAN_VIEW, self.SILVER, ["geom_valid", "count_valid"])
         # INDEX: bounding-box R-Tree over the silver geometry, for fast point-in-polygon
@@ -150,6 +152,14 @@ class AadfTransformer(BaseTransformer):
         con.execute(f"DROP INDEX IF EXISTS {self.SILVER}_geom_rtree")
         con.execute(
             f"CREATE INDEX {self.SILVER}_geom_rtree ON {self.SILVER} USING RTREE (geom)")
+
+    def _count_source_rows(self, path):
+        """Independent count of data rows in the national CSV (header excluded), via
+        Python's csv reader — a genuine second opinion, NOT DuckDB, so it can catch DuckDB
+        silently dropping a row. RFC-4180 correct (handles quoted road names)."""
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            n = sum(1 for _ in csv.reader(fh))
+        return max(0, n - 1)                     # minus the header row
 
     def _derive_silver(self, con):
         """Typed silver, 1:1 with bronze. Factored out so a test can drive it against a

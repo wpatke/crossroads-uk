@@ -198,6 +198,20 @@ class _BoundaryTransformer(BaseTransformer):
         socket-timed so a stalled endpoint fails fast rather than hanging, atomic)."""
         download_to_file(vintage.url, dest_path)
 
+    def _count_features(self, path):
+        """Independent count of features in a GeoJSON file (one bronze row per feature),
+        read straight from the JSON rather than via ST_Read, so it is a genuine second
+        opinion for the conservation invariant. A file with no 'features' array is
+        counted as 0 and warned (ST_Read would then also yield nothing)."""
+        with open(path, encoding="utf-8") as f:
+            features = json.load(f).get("features")
+        if features is None:
+            warnings.warn(
+                f"{self.source_id}: {path} has no 'features' array; counted as 0 source rows.",
+                stacklevel=2)
+            return 0
+        return len(features)
+
     def transform_and_load(self, con, cache_dir):
         vintages = getattr(self, "_vintages_to_load", None) or self._vintages_for()
 
@@ -206,8 +220,10 @@ class _BoundaryTransformer(BaseTransformer):
         # from code-controlled Vintage constants (trusted interpolation); paths
         # are also code/cache-derived. Row values are never interpolated.
         selects = []
+        source_features = 0          # independent conservation count (GeoJSON features)
         for v in vintages:
             path = os.path.join(cache_dir, v.source_file)
+            source_features += self._count_features(path)
             selects.append(
                 f"SELECT {sql_str(v.label)} AS vintage, "
                 f"{v.code_col} AS area_code, {v.name_col} AS area_name, geom "
@@ -221,9 +237,10 @@ class _BoundaryTransformer(BaseTransformer):
         # geometry row) without needing real fixture files.
         self._derive_silver_and_ledger(con, vintages)
 
-        # --- CONSERVATION: record how many rows were read from the source.
-        n = con.execute(f"SELECT count(*) FROM {self.bronze_table}").fetchone()[0]
-        record_source_rows(con, self.source_id, n)
+        # --- CONSERVATION: record rows read INDEPENDENTLY (GeoJSON feature count, not
+        # count(bronze)), so a feature ST_Read dropped would fail the invariant. GeoJSON is
+        # parsed all-or-nothing by GDAL (no per-feature reject), so no quarantine path here.
+        record_source_rows(con, self.source_id, source_features)
 
         # --- GOLD: valid-geometry view.
         create_clean_view(con, self.clean_view, self.silver_table, ["geom_valid"])

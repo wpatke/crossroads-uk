@@ -13,6 +13,7 @@ in-database with read_csv. For offline tests the cache is pre-seeded with the
 committed sample CSVs, so no network access occurs.
 """
 
+import csv
 import os
 import urllib.error
 import warnings
@@ -20,6 +21,7 @@ import warnings
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
     SourceQuality, Dimension, record_source_rows, log_exclusion, create_clean_view,
+    load_csv_bronze_with_quarantine,
 )
 from crossroads.sql import sql_str
 from crossroads.net import download_to_file
@@ -168,23 +170,39 @@ class Stats19Transformer(BaseTransformer):
         paths = [os.path.join(cache_dir, self._filename(ftype, y)) for y in self._years]
         return [p for p in paths if os.path.exists(p)]
 
-    def _load_bronze(self, con, bronze_table, files):
-        """Faithful all-string bronze from one or more CSVs.
+    def _load_bronze(self, con, bronze_table, files, source_id):
+        """Faithful all-string bronze from one or more CSVs, quarantining any line that
+        cannot be structured (spec §9 — recorded, not fatal). Returns (loaded, quarantined).
 
         read_csv with union_by_name lets historical (accident_*) and modern
         (collision_*) tranches coexist (absent columns become NULL); all_varchar
-        preserves raw values exactly. Paths are cache-derived (trusted); values
-        are never interpolated.
+        preserves raw values exactly, so a reject is a structural problem (wrong column
+        count), not a bad value. Paths are cache-derived + escaped; values never interpolated.
         """
         if not files:
             raise FileNotFoundError(
                 f"[stats19] no cached CSVs for {bronze_table}; extract() must run "
                 f"first (years={self._years}).")
-        paths_sql = "[" + ", ".join(sql_str(p) for p in files) + "]"
-        con.execute(
-            f"CREATE OR REPLACE TABLE {bronze_table} AS "
-            f"SELECT * FROM read_csv({paths_sql}, union_by_name=true, all_varchar=true)"
-        )
+        # The helper loads each file with rejects captured, then UNION ALL BY NAME across
+        # them (the historical accident_* / modern collision_* tranches coexist, absent
+        # columns become NULL — the same result union_by_name gave, which cannot be combined
+        # with reject capture in a single read_csv).
+        return load_csv_bronze_with_quarantine(
+            con, bronze_table=bronze_table, paths=files,
+            read_opts="header=true, all_varchar=true", source_id=source_id)
+
+    def _count_source_rows(self, files):
+        """Independent count of data rows across `files` (header excluded), via Python's
+        csv reader — deliberately NOT DuckDB, so it can catch DuckDB silently dropping a
+        row. RFC-4180 correct (handles quoted fields), so it agrees with DuckDB's logical
+        rows on well-formed government CSVs; a disagreement makes conservation fire, which
+        is the correct fail-loud outcome for a genuinely malformed file (spec §2)."""
+        total = 0
+        for path in files:
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+                n = sum(1 for _ in csv.reader(fh))
+                total += max(0, n - 1)          # minus the header row
+        return total
 
     def _load_codebook(self, con):
         """Load the committed codebook CSV into the `codebook` reference table.
@@ -416,15 +434,17 @@ class Stats19Transformer(BaseTransformer):
         self._load_codebook(con)
         self._load_column_manifest(con)
 
-        # --- BRONZE (×3): faithful copies; record rows read for conservation. ---
+        # --- BRONZE (×3): faithful copies; unparseable lines quarantined (not fatal).
+        # source_rows is counted INDEPENDENTLY (Python csv reader, not count(bronze)), so
+        # conservation source_rows == bronze + quarantine is a real check (spec §9). ---
         for sid, bronze, ftype in (
             (self.COLLISION_SID, self.COLLISION_BRONZE, "collision"),
             (self.VEHICLE_SID, self.VEHICLE_BRONZE, "vehicle"),
             (self.CASUALTY_SID, self.CASUALTY_BRONZE, "casualty"),
         ):
-            self._load_bronze(con, bronze, self._cached_files(cache_dir, ftype))
-            n = con.execute(f"SELECT count(*) FROM {bronze}").fetchone()[0]
-            record_source_rows(con, sid, n)
+            files = self._cached_files(cache_dir, ftype)
+            self._load_bronze(con, bronze, files, sid)   # captures + quarantines rejects
+            record_source_rows(con, sid, self._count_source_rows(files))
 
         # --- SILVER (×3): keep-in-place 1:1. Collision silver must be derived FIRST —
         # vehicle/casualty silver compute link_valid by joining to the collisions table. ---

@@ -87,6 +87,26 @@ def test_source_row_keys_are_unique(tmp_path):
     client.close()
 
 
+def test_source_rows_recorded_independently_and_clean_fixture_quarantines_nothing(tmp_path):
+    """source_ingest_log holds the INDEPENDENT csv.reader row count (not count(bronze)),
+    and the clean committed fixtures quarantine nothing (spec §9 conservation is real)."""
+    import csv as _csv
+    client = _stats19_client(tmp_path)
+    client.build(years=YEARS)
+    for ftype, sid in (("collision", "stats19_collision"),
+                       ("vehicle", "stats19_vehicle"),
+                       ("casualty", "stats19_casualty")):
+        path = os.path.join(FIXTURES, f"dft-road-casualty-statistics-{ftype}-2023.csv")
+        with open(path, newline="") as fh:
+            indep = sum(1 for _ in _csv.reader(fh)) - 1        # data rows, header excluded
+        recorded = client.con.execute(
+            "SELECT source_rows FROM source_ingest_log WHERE source_id = ?", [sid]
+        ).fetchone()[0]
+        assert recorded == indep, f"{sid}: recorded {recorded} != independent {indep}"
+    assert client.con.execute("SELECT count(*) FROM quarantine_raw").fetchone()[0] == 0
+    client.close()
+
+
 def test_identity_normalized_to_accident_index(tmp_path):
     # Canonical silver identity is accident_index, never NULL for the sample.
     client = _stats19_client(tmp_path)

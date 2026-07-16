@@ -555,8 +555,10 @@ def test_build_with_undecided_source_is_fatal():
 
 class _RebuildableTransformer(BaseTransformer):
     """Recreates its own bronze/silver idempotently and writes one exclusion +
-    one quarantine row per build. reject_ceiling is loosened so the 1-of-2 FALSE
-    flag does not trip the reject-rate tripwire (not what this test exercises)."""
+    one quarantine row per build. reject_ceiling is loosened so the single FALSE
+    flag does not trip the reject-rate tripwire (not what this test exercises); the
+    bronze is 300 rows so the single quarantined line (1/301 ~= 0.33%) stays under the
+    0.5% quarantine-rate tripwire, which is also not what this test exercises."""
 
     @property
     def source_id(self):
@@ -568,17 +570,17 @@ class _RebuildableTransformer(BaseTransformer):
     def transform_and_load(self, con, cache_dir):
         # The transformer owns its bronze/silver DDL -> recreate idempotently.
         con.execute("CREATE OR REPLACE TABLE rb_raw (source_row_key VARCHAR)")
-        con.execute("INSERT INTO rb_raw VALUES ('a'), ('b')")
+        con.execute("INSERT INTO rb_raw SELECT 'r' || i FROM range(300) t(i)")
         con.execute("CREATE OR REPLACE TABLE rb (source_row_key VARCHAR, ok BOOLEAN)")
-        con.execute("INSERT INTO rb VALUES ('a', TRUE), ('b', FALSE)")
+        con.execute("INSERT INTO rb SELECT 'r' || i, (i <> 0) FROM range(300) t(i)")  # r0 FALSE
         log_exclusion(
-            con, source_id="rb", source_row_key="b", column_name="x",
+            con, source_id="rb", source_row_key="r0", column_name="x",
             rule_id="rb.x.bad", rule_desc="bad", severity="reject_dimension",
             raw_value="-1",
         )
         quarantine_row(con, source_id="rb", raw_text="broken,line", reason="bad row")
-        # 2 rows landed in bronze + 1 quarantined = 3 rows read from source.
-        record_source_rows(con, "rb", 3)
+        # 300 rows landed in bronze + 1 quarantined = 301 rows read from source.
+        record_source_rows(con, "rb", 301)
 
     def quality_spec(self):
         return SourceQuality(
@@ -722,3 +724,76 @@ def test_resolve_undecided_inside_tuple_warns_when_not_fatal(con):
         con, [_FakeTransformer("u", (spec, None))], undecided_fatal=False
     )
     assert out == [spec]
+
+
+# --- CSV bronze loader: reject capture + quarantine (spec §9) ---
+
+def test_malformed_csv_line_is_quarantined_not_fatal(tmp_path, con):
+    """A structurally-broken row (wrong column count) is skipped from bronze, recorded
+    verbatim in quarantine_raw, and the load returns — it does NOT crash the build."""
+    from crossroads.quality import load_csv_bronze_with_quarantine
+    ensure_quality_tables(con)
+    p = tmp_path / "sample.csv"
+    p.write_text("a,b,c\n1,2,3\n4,5\n6,7,8\n")     # line "4,5" has only 2 columns -> reject
+    loaded, quarantined = load_csv_bronze_with_quarantine(
+        con, bronze_table="t_raw", paths=[str(p)],
+        read_opts="header=true, all_varchar=true", source_id="t")
+    assert loaded == 2 and quarantined == 1
+    assert con.execute("SELECT count(*) FROM t_raw").fetchone()[0] == 2
+    q = con.execute("SELECT raw_text FROM quarantine_raw WHERE source_id='t'").fetchall()
+    assert any("4,5" in r[0] for r in q)           # the bad line was recorded verbatim
+
+
+def test_quarantine_dedups_by_line_not_text(tmp_path, con):
+    """Two DISTINCT source lines with identical text are quarantined as TWO rows, so the
+    source total (bronze + quarantine) still balances (grouping by text would undercount)."""
+    from crossroads.quality import load_csv_bronze_with_quarantine
+    ensure_quality_tables(con)
+    p = tmp_path / "dup.csv"
+    p.write_text("a,b,c\n1,2,3\n4,5\n4,5\n7,8,9\n")  # two identical bad lines "4,5"
+    loaded, quarantined = load_csv_bronze_with_quarantine(
+        con, bronze_table="d_raw", paths=[str(p)],
+        read_opts="header=true, all_varchar=true", source_id="d")
+    assert loaded == 2 and quarantined == 2         # 2 good + 2 bad == 4 source rows
+
+
+def test_clean_csv_quarantines_nothing(tmp_path, con):
+    """A clean file loads fully and writes no quarantine rows."""
+    from crossroads.quality import load_csv_bronze_with_quarantine
+    ensure_quality_tables(con)
+    p = tmp_path / "clean.csv"
+    p.write_text("a,b,c\n1,2,3\n4,5,6\n")
+    loaded, quarantined = load_csv_bronze_with_quarantine(
+        con, bronze_table="c_raw", paths=[str(p)],
+        read_opts="header=true, all_varchar=true", source_id="c")
+    assert loaded == 2 and quarantined == 0
+    assert con.execute(
+        "SELECT count(*) FROM quarantine_raw WHERE source_id='c'").fetchone()[0] == 0
+
+
+# --- Quarantine-rate tripwire (spec §9: quarantine must be rare) ---
+
+def test_quarantine_rate_over_ceiling_fails(con):
+    from crossroads.quality import check_quarantine_rate, QuarantineRateExceededError
+    ensure_quality_tables(con)
+    record_source_rows(con, "s", 10)
+    for i in range(3):                              # 3/10 = 30% > 5%
+        quarantine_row(con, source_id="s", raw_text=f"bad{i}", reason="x")
+    spec = SourceQuality("s", "s_raw", "s_silver")
+    with pytest.raises(QuarantineRateExceededError):
+        check_quarantine_rate(con, spec)
+
+
+def test_quarantine_rate_within_ceiling_passes(con):
+    from crossroads.quality import check_quarantine_rate
+    ensure_quality_tables(con)
+    record_source_rows(con, "s", 1000)
+    quarantine_row(con, source_id="s", raw_text="bad", reason="x")   # 1/1000 = 0.1% <= 0.5%
+    check_quarantine_rate(con, SourceQuality("s", "s_raw", "s_silver"))  # must not raise
+
+
+def test_quarantine_rate_empty_source_passes(con):
+    from crossroads.quality import check_quarantine_rate
+    ensure_quality_tables(con)
+    record_source_rows(con, "s", 0)
+    check_quarantine_rate(con, SourceQuality("s", "s_raw", "s_silver"))  # 0 rows -> no raise

@@ -277,8 +277,11 @@ class Era5WeatherTransformer(BaseTransformer):
 
         self._load_bronze(con, paths)
         self._derive_silver_and_ledger(con)
-        n = con.execute(f"SELECT count(*) FROM {self.BRONZE}").fetchone()[0]
-        record_source_rows(con, self.source_id, n)                    # conservation
+        # CONSERVATION: source_rows is the grid-cell total counted INDEPENDENTLY from the
+        # NetCDF dimensions (see _load_bronze), not count(bronze), so a dropped cell in the
+        # xarray->dataframe materialisation would fail the invariant. NetCDF is read
+        # all-or-nothing (no per-row reject concept), so there is no quarantine path here.
+        record_source_rows(con, self.source_id, self._source_cell_count)
         create_clean_view(con, self.CLEAN_VIEW, self.SILVER, ["geom_valid"])   # gold
 
     def _load_bronze(self, con, nc_paths):
@@ -290,9 +293,16 @@ class Era5WeatherTransformer(BaseTransformer):
         import xarray as xr                      # lazy
         import pandas as pd                      # lazy (xarray dependency)
         frames = []
+        self._source_cell_count = 0              # independent conservation count (grid cells)
         for p in nc_paths:
             ds = xr.open_dataset(p)
             tname = "valid_time" if ("valid_time" in ds.variables or "valid_time" in ds.coords) else "time"
+            # One bronze row per grid cell = the product of t2m's dimensions. Counted from
+            # the dataset dims (not len(df)) so it is an independent check of the load.
+            cells = 1
+            for d in ds["t2m"].dims:
+                cells *= ds.sizes[d]
+            self._source_cell_count += cells
             df = ds[["t2m", "tp"]].to_dataframe().reset_index()
             df = df.rename(columns={tname: "valid_time"})
             frames.append(df[["valid_time", "latitude", "longitude", "t2m", "tp"]])

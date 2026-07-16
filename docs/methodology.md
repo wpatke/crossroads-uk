@@ -71,10 +71,13 @@ existed on its date. Detail: [spec.md §3C](spec.md).
 
 No source row is ever deleted. Bad values are nulled in the typed "silver" columns, the
 raw value is preserved, a boolean flag records the failure, and a `data_quality_log` row
-explains it. "Gold" views filter to valid-only. Three invariants are asserted on every
-build — conservation (`source == clean + quarantined`), flag/ledger agreement, and a
-reject-rate ceiling — and the build halts if any row is unaccounted for. Full model:
-[spec.md §9](spec.md).
+explains it. A CSV line so broken it cannot be structured at all (wrong column count) is
+written verbatim to `quarantine_raw` and the build continues — it is recorded, not dropped,
+and never crashes the build. "Gold" views filter to valid-only. Four invariants are
+asserted on every build — conservation (`source == clean + quarantined`, with `source`
+counted independently of the loaded rows), flag/ledger agreement, a reject-rate ceiling,
+and a quarantine-rate ceiling — and the build halts if any row is unaccounted for. Full
+model: [spec.md §9](spec.md).
 
 ## Reproducibility
 

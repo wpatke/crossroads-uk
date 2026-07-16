@@ -247,19 +247,20 @@ data_quality_log(
 )
 ```
 
-Rows that cannot be structured at all (e.g. a malformed CSV line that never reaches bronze) are written to a separate `quarantine_raw(source_id, raw_text, reason, ingested_at)`. This must be rare.
+Rows that cannot be structured at all (e.g. a malformed CSV line that never reaches bronze) are written to a separate `quarantine_raw(source_id, raw_text, reason, ingested_at)`. This must be rare. CSV sources load with DuckDB's reject-capture enabled, so a structurally-broken line (wrong column count, unterminated quote) is recorded in `quarantine_raw` verbatim and the build **continues** — it is never silently dropped and never crashes the build. Its rarity is enforced by the quarantine-rate tripwire (invariant 4 below).
 
 ### Invariants (asserted on every build)
 
-All three run as aggregate SQL count checks (single `O(rows)` scans in DuckDB), not per-row Python loops, so the audit never becomes the bottleneck.
+These run as aggregate SQL count checks (single `O(rows)` scans in DuckDB), not per-row Python loops, so the audit never becomes the bottleneck.
 
-1. **Conservation (hard, fatal):** `source_rows == clean_rows + quarantined_rows`, where `clean_rows` are the silver rows retained (keep-in-place means `count(<source>_raw) == count(silver)`) and `quarantined_rows` are `quarantine_raw` rows. A mismatch means rows vanished unaccounted — a bug — and halts the build.
+1. **Conservation (hard, fatal):** `source_rows == clean_rows + quarantined_rows`, where `clean_rows` are the silver rows retained (keep-in-place means `count(<source>_raw) == count(silver)`) and `quarantined_rows` are `quarantine_raw` rows. Crucially, `source_rows` is counted **independently of bronze** — for CSV sources by an independent row count of the raw files (Python's `csv` reader, not DuckDB), and for the NetCDF/GeoJSON sources by the source's own grid-cell / feature count — so this genuinely checks the source→bronze step. (Recording `source_rows` as `count(bronze)` would make it self-satisfying.) A mismatch means rows vanished unaccounted — a bug — and halts the build.
 2. **Flag/ledger agreement (hard, fatal):** every silver row with a `NULL`ed clean column has at least one matching `data_quality_log` entry, and vice versa.
 3. **Reject-rate tripwire (configurable, fatal above ceiling):** for each source and dimension, `rejected / total` must be ≤ a configured ceiling (**default: 5%**). Exceeding it fails the build as a regression tripwire that catches silent upstream format changes. Below it, rejections are logged, never fatal.
+4. **Quarantine-rate tripwire (configurable, fatal above ceiling):** for each source, `quarantined_rows / source_rows` must be ≤ a configured ceiling (**default: 0.5%** — deliberately tighter than the reject ceiling, because a structurally-unparseable line in a well-formed source should be near-zero, not merely "under 5%"). Because a malformed line is quarantined-and-continued rather than fatal (above), this tripwire keeps "record and continue" from silently swallowing a large fraction of a file when an upstream format changes.
 
 ### Halt semantics
 
-The build halts **only** on (a) a conservation-invariant failure, (b) a flag/ledger disagreement, or (c) a reject-rate ceiling breach. Expected, rule-based, logged rejections are not fatal. This is the operational definition of the **zero unaccounted loss** policy stated in §2, and it supersedes any notion of halting on individual cleansed records.
+The build halts **only** on (a) a conservation-invariant failure, (b) a flag/ledger disagreement, (c) a reject-rate ceiling breach, or (d) a quarantine-rate ceiling breach. Expected, rule-based, logged rejections — and rare quarantined lines below the ceiling — are not fatal. This is the operational definition of the **zero unaccounted loss** policy stated in §2, and it supersedes any notion of halting on individual cleansed records.
 
 ### Worked example — Stats19 coordinate sentinels
 
