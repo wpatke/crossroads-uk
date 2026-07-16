@@ -27,6 +27,7 @@ from crossroads.quality import (
     SourceQuality, Dimension, create_clean_view,
     record_source_rows, log_exclusion,
 )
+from crossroads.sql import sql_str
 
 # British National Grid envelope, used to verify geometry really is EPSG:27700.
 # (DuckDB GEOMETRY stores no SRID, so we sanity-check coordinate ranges.)
@@ -207,9 +208,9 @@ class _BoundaryTransformer(BaseTransformer):
         for v in vintages:
             path = os.path.join(cache_dir, v.source_file)
             selects.append(
-                f"SELECT '{v.label}' AS vintage, "
+                f"SELECT {sql_str(v.label)} AS vintage, "
                 f"{v.code_col} AS area_code, {v.name_col} AS area_name, geom "
-                f"FROM ST_Read('{path}')"
+                f"FROM ST_Read({sql_str(path)})"
             )
         bronze_sql = " UNION ALL ".join(selects)
         con.execute(f"CREATE OR REPLACE TABLE {self.bronze_table} AS {bronze_sql}")
@@ -247,11 +248,11 @@ class _BoundaryTransformer(BaseTransformer):
         Labels and dates are code-controlled constants (trusted interpolation).
         """
         vf = "CASE vintage " + " ".join(
-            f"WHEN '{v.label}' THEN DATE '{v.valid_from}'" for v in vintages
+            f"WHEN {sql_str(v.label)} THEN DATE {sql_str(v.valid_from)}" for v in vintages
         ) + " END"
         vt = "CASE vintage " + " ".join(
-            f"WHEN '{v.label}' THEN "
-            + (f"DATE '{v.valid_to}'" if v.valid_to else "NULL")
+            f"WHEN {sql_str(v.label)} THEN "
+            + (f"DATE {sql_str(v.valid_to)}" if v.valid_to else "NULL")
             for v in vintages
         ) + " END"
         return vf, vt

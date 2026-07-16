@@ -22,6 +22,7 @@ from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
     SourceQuality, Dimension, record_source_rows, log_exclusion, create_clean_view,
 )
+from crossroads.sql import sql_str
 
 # DfT publishes per-year CSVs under this base. The per-year filename template is
 # code-controlled; live filenames were verified at implementation time (2020-2024
@@ -182,7 +183,7 @@ class Stats19Transformer(BaseTransformer):
             raise FileNotFoundError(
                 f"[stats19] no cached CSVs for {bronze_table}; extract() must run "
                 f"first (years={self._years}).")
-        paths_sql = "[" + ", ".join(f"'{p}'" for p in files) + "]"
+        paths_sql = "[" + ", ".join(sql_str(p) for p in files) + "]"
         con.execute(
             f"CREATE OR REPLACE TABLE {bronze_table} AS "
             f"SELECT * FROM read_csv({paths_sql}, union_by_name=true, all_varchar=true)"
@@ -207,7 +208,7 @@ class Stats19Transformer(BaseTransformer):
             f"       CAST(code AS VARCHAR)     AS code, "
             f"       CAST(label AS VARCHAR)    AS label, "
             f"       CAST(is_missing AS BOOLEAN) AS is_missing "
-            f"FROM read_csv('{_CODEBOOK_PATH}', header=true, all_varchar=true)")
+            f"FROM read_csv({sql_str(_CODEBOOK_PATH)}, header=true, all_varchar=true)")
 
     def _load_column_manifest(self, con):
         """Load the committed column manifest into the `column_manifest` reference table.
@@ -228,7 +229,7 @@ class Stats19Transformer(BaseTransformer):
             f'       CAST("column" AS VARCHAR) AS col, '
             f"       CAST(kind AS VARCHAR)     AS kind, "
             f"       CAST(dtype AS VARCHAR)    AS dtype "
-            f"FROM read_csv('{_COLUMN_MANIFEST_PATH}', header=true, all_varchar=true)")
+            f"FROM read_csv({sql_str(_COLUMN_MANIFEST_PATH)}, header=true, all_varchar=true)")
 
     def _coalesce_present(self, con, table, candidates, alias):
         """Build `COALESCE(<present candidates>) AS alias` over only columns that
@@ -274,7 +275,7 @@ class Stats19Transformer(BaseTransformer):
             # can't silently leak a -1 into a cleaned code. It never nulls a real value:
             # no STATS19 coded field uses -1 as a meaningful category.
             return (f"CASE WHEN {col} = '-1' OR {col} IN (SELECT code FROM {self.CODEBOOK_TABLE} "
-                    f"WHERE variable = '{col}' AND is_missing) "
+                    f"WHERE variable = {sql_str(col)} AND is_missing) "
                     f"THEN NULL ELSE TRY_CAST({col} AS INTEGER) END AS {col}")
         if kind == "numeric":
             typ = dtype or "INTEGER"
@@ -345,7 +346,7 @@ class Stats19Transformer(BaseTransformer):
         raw = self._coalesce_present(con, bronze_table, present, f"{column}_raw")
         raw_ex = raw.replace(f" AS {column}_raw", "")        # bare expression, no alias
         cleaned = (f"CASE WHEN ({raw_ex}) = '-1' OR ({raw_ex}) IN (SELECT code FROM {self.CODEBOOK_TABLE} "
-                   f"WHERE variable = '{column}' AND is_missing) "
+                   f"WHERE variable = {sql_str(column)} AND is_missing) "
                    f"THEN NULL ELSE TRY_CAST(({raw_ex}) AS INTEGER) END")
         return (f"({raw_ex}) AS {column}_raw",
                 f"{cleaned} AS {column}",
@@ -966,7 +967,7 @@ class Stats19Transformer(BaseTransformer):
                 selects.append(f"{a}.label AS {col}_label")
                 joins.append(
                     f"LEFT JOIN {self.CODEBOOK_TABLE} {a} "
-                    f"  ON {a}.variable = '{col}' AND {a}.code = CAST(s.{col} AS VARCHAR)")
+                    f"  ON {a}.variable = {sql_str(col)} AND {a}.code = CAST(s.{col} AS VARCHAR)")
             con.execute(
                 f"CREATE OR REPLACE VIEW {silver}_labelled AS "
                 f"SELECT {', '.join(selects)} FROM {silver} s {' '.join(joins)}")

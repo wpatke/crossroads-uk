@@ -41,6 +41,7 @@ from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
     SourceQuality, Dimension, record_source_rows, log_exclusion, create_clean_view,
 )
+from crossroads.sql import sql_str
 
 # The single national AADF file. Public, Open Government Licence v3.0
 # (listed on https://roadtraffic.dft.gov.uk/downloads).
@@ -142,7 +143,7 @@ class AadfTransformer(BaseTransformer):
         # Path is cache-derived (trusted); no row values are interpolated.
         con.execute(
             f"CREATE OR REPLACE TABLE {self.BRONZE} AS "
-            f"SELECT * FROM read_csv('{path}', header=true, all_varchar=true)")
+            f"SELECT * FROM read_csv({sql_str(path)}, header=true, all_varchar=true)")
         # SILVER (typed, keep-in-place 1:1), then the exclusion ledger, then the area stamp.
         self._derive_silver(con)
         self._log_rejections(con)
