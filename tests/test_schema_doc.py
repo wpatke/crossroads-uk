@@ -64,6 +64,10 @@ def test_schema_doc_mentions_core_tables():
 def test_documented_columns_match_built_database(tmp_path):
     """Build the full offline fixture DB (weather + stats19 + ONS) and assert every real
     column of the guarded tables appears in docs/schema.md."""
+    # The weather source imports xarray, which lives in the optional [weather] extra.
+    # Skip cleanly (rather than crashing) if it isn't installed. The release CI job
+    # installs .[dev,weather], so the drift guard still runs there — see .github/workflows/tests.yml.
+    pytest.importorskip("xarray")
     cache = str(tmp_path / "cache")
     _seed_full_cache(cache)
     # Seed weather too, so the weather table exists in the built DB.
