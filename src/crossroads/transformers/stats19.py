@@ -95,6 +95,9 @@ class Stats19Transformer(BaseTransformer):
     # --- ledger rules for the collision dimensions (also referenced by quality_spec) ---
     COORD_RULE = "stats19.coord.sentinel"
     DATETIME_RULE = "stats19.datetime.invalid"
+    # WARN (not a reject): the date parsed but the time did not, so datetime_local fell
+    # back to midnight and weather/solar were deliberately left unstamped for the row.
+    TIME_IMPUTED_RULE = "stats19.time.imputed"
 
     # --- ledger rules for the vehicle/casualty link dimension ---
     VEHICLE_LINK_RULE = "stats19.link.orphan_vehicle"
@@ -568,6 +571,10 @@ class Stats19Transformer(BaseTransformer):
             # Prefer the full datetime; fall back to midnight when only the date parsed.
             f"  COALESCE(datetime_parsed, date_parsed) AS datetime_local, "
             f"  (date_parsed IS NOT NULL) AS datetime_valid, "
+            # TRUE when the date parsed but the time did not (blank/unparseable) -> datetime_local
+            # fell back to midnight. NOT a rejection (the row is fully kept and datetime_valid stays
+            # TRUE); it marks that weather/solar were deliberately left unstamped for this row.
+            f"  (date_parsed IS NOT NULL AND datetime_parsed IS NULL) AS time_imputed, "
             # Filled by the spatial stamp; present now so the schema is stable.
             f"  CAST(NULL AS VARCHAR) AS lad_code, "
             f"  CAST(NULL AS VARCHAR) AS ctyua_code, "
@@ -616,6 +623,20 @@ class Stats19Transformer(BaseTransformer):
                 column_name="datetime_local", rule_id=self.DATETIME_RULE,
                 rule_desc="collision date is missing or unparseable",
                 severity="reject_dimension", raw_value=str(d))
+
+        # Time imputed to midnight: record as a WARN (not a rejection) so the database can
+        # answer "which collisions had no time, and were therefore left unstamped?". warn rows
+        # are ignored by the flag/ledger-agreement invariant, so this adds no new dimension.
+        imputed = con.execute(
+            f"SELECT source_row_key, time_raw FROM {self.COLLISION_SILVER} "
+            f"WHERE time_imputed = TRUE").fetchall()
+        for key, t in imputed:
+            log_exclusion(
+                con, source_id=self.COLLISION_SID, source_row_key=key,
+                column_name="datetime_local", rule_id=self.TIME_IMPUTED_RULE,
+                rule_desc="collision time missing/unparseable; datetime_local set to midnight "
+                          "and weather/solar left unstamped",
+                severity="warn", raw_value=str(t))
 
         # CORE severity ledger: one row per collision_severity_valid = FALSE.
         self._log_missing_codes(con, self.COLLISION_SILVER, self.COLLISION_SID,
@@ -775,7 +796,9 @@ class Stats19Transformer(BaseTransformer):
             f"      SELECT source_row_key, datetime_local, "
             f"             ST_Transform(geom, 'EPSG:27700', 'EPSG:4326', always_xy := true) AS ll "
             f"      FROM {self.COLLISION_SILVER} "
-            f"      WHERE geom IS NOT NULL AND datetime_local IS NOT NULL"
+            # skip midnight-imputed rows — a weather value computed at 00:00 for a
+            # time-unknown collision would be misleading (reviewer point 3).
+            f"      WHERE geom IS NOT NULL AND datetime_local IS NOT NULL AND time_imputed = FALSE"
             f"    ) c2 "
             f"    JOIN weather w "
             f"      ON w.grid_i = CAST(round(ST_Y(c2.ll) * 10) AS INTEGER) "
@@ -877,7 +900,9 @@ class Stats19Transformer(BaseTransformer):
             f"      SELECT source_row_key, datetime_local, "
             f"             ST_Transform(geom, 'EPSG:27700', 'EPSG:4326', always_xy := true) AS ll "
             f"      FROM {self.COLLISION_SILVER} "
-            f"      WHERE geom IS NOT NULL AND datetime_local IS NOT NULL"
+            # skip midnight-imputed rows — a solar value computed at 00:00 for a
+            # time-unknown collision would be misleading (reviewer point 3).
+            f"      WHERE geom IS NOT NULL AND datetime_local IS NOT NULL AND time_imputed = FALSE"
             f"    )"
             f"  ), astro AS ("      # date-only astronomical terms (independent of lat/lon)
             f"    SELECT k, lon, lat, mod(es, 86400) / 60.0 AS utc_min, "

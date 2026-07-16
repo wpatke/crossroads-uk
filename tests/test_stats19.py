@@ -217,8 +217,10 @@ def test_sentinel_and_bad_date_flagged_and_logged(con):
                       ("c3", "stats19.datetime.invalid")]
 
 
-def test_missing_time_falls_back_to_midnight(con):
-    # A blank time is NOT a rejection: datetime_local is that date at 00:00 and valid.
+def test_missing_time_flagged_and_left_unstamped(con):
+    # A blank time is NOT a rejection: the date parsed, so datetime_local is that date at
+    # 00:00 and datetime_valid stays TRUE. But time_imputed marks the midnight fallback so
+    # the row can be found and left unstamped, and a WARN ledger row records the imputation.
     from crossroads.quality import ensure_quality_tables
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
@@ -230,8 +232,20 @@ def test_missing_time_falls_back_to_midnight(con):
         "       location_easting_osgr, location_northing_osgr, date, time)")
     t = Stats19Transformer(); t._derive_collision_silver(con)
     row = con.execute(
-        "SELECT datetime_valid, CAST(datetime_local AS VARCHAR) FROM collisions").fetchone()
-    assert row[0] is True and row[1].startswith("2023-01-07 00:00:00")
+        "SELECT datetime_valid, time_imputed, CAST(datetime_local AS VARCHAR) "
+        "FROM collisions WHERE time_raw = ''").fetchone()
+    assert row[0] is True                       # datetime_valid stays TRUE (date parsed)
+    assert row[1] is True                       # time_imputed flags the midnight fallback
+    assert row[2].startswith("2023-01-07 00:00:00")
+
+    # Exactly one WARN ledger row records the imputation; it is NOT a reject_dimension row.
+    warns = con.execute(
+        "SELECT count(*) FROM data_quality_log "
+        "WHERE rule_id = 'stats19.time.imputed' AND severity = 'warn'").fetchone()[0]
+    assert warns == 1
+    rejects = con.execute(
+        "SELECT count(*) FROM data_quality_log WHERE severity = 'reject_dimension'").fetchone()[0]
+    assert rejects == 0                          # a missing time is not a rejection
 
 
 def test_vehicles_and_casualties_link_to_collisions(tmp_path):
@@ -951,12 +965,12 @@ def _stub_collisions_geo(con, rows):
     # stamp's inverse reprojection lands back on the same grid cell.
     vals = ", ".join(
         f"('{k}', ST_Transform(ST_Point({lon},{lat}),'EPSG:4326','EPSG:27700',always_xy:=true)::GEOMETRY, "
-        f" TRUE, TIMESTAMP '{dt}', NULL, NULL, CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE))"
+        f" TRUE, TIMESTAMP '{dt}', NULL, NULL, CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE), FALSE)"
         for k, lon, lat, dt in rows)
     con.execute(
         f"CREATE TABLE collisions AS SELECT * FROM (VALUES {vals}) AS "
         f"t(source_row_key, geom, geom_valid, datetime_local, lad_code, ctyua_code, "
-        f"  temperature_c, precipitation_mm)")
+        f"  temperature_c, precipitation_mm, time_imputed)")   # time_imputed FALSE -> row is stamped
 
 
 def test_weather_stamp_matches_cell_and_hour(con):
@@ -973,6 +987,30 @@ def test_weather_stamp_matches_cell_and_hour(con):
     assert res["k_in"] == (15.0, 1.0)
     assert res["k_hour"] == (None, None)
     assert res["k_cell"] == (None, None)
+
+
+def test_stamps_skip_time_imputed_rows(con):
+    # Two collisions in the SAME weather cell + hour with valid geom: identical except
+    # time_imputed. The normal row is stamped (weather AND solar); the imputed row is left
+    # NULL for both -- an honest "unknown" instead of a misleading 00:00 value (Stage 04).
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    _stub_weather(con)
+    _stub_collisions_geo(con, [
+        ("k_normal",  -1.2, 54.7, "2023-06-15 14:30:00"),
+        ("k_imputed", -1.2, 54.7, "2023-06-15 14:30:00"),
+    ])
+    # Mark one row as time-imputed (the stub builds every row with time_imputed = FALSE).
+    con.execute("UPDATE collisions SET time_imputed = TRUE WHERE source_row_key = 'k_imputed'")
+    # _solar_stamp writes into these columns; the weather stub omits them, so add them.
+    con.execute("ALTER TABLE collisions ADD COLUMN solar_elevation_deg DOUBLE")
+    con.execute("ALTER TABLE collisions ADD COLUMN solar_azimuth_deg DOUBLE")
+    t = Stats19Transformer()
+    t._weather_stamp(con)
+    t._solar_stamp(con)
+    res = {r[0]: r[1:] for r in con.execute(
+        "SELECT source_row_key, temperature_c, solar_elevation_deg FROM collisions").fetchall()}
+    assert res["k_normal"][0] == 15.0 and res["k_normal"][1] is not None   # normal row stamped
+    assert res["k_imputed"] == (None, None)                                # imputed row left NULL
 
 
 def test_weather_stamp_tolerates_missing_weather_table(con):
@@ -1079,9 +1117,9 @@ def test_solar_stamp_matches_known_noaa_values(tmp_path):
     con.execute(
         "CREATE TABLE collisions AS "
         "SELECT * FROM (VALUES "
-        "  ('noon', TIMESTAMP '2023-12-22 12:00:00'), "
-        "  ('midnight', TIMESTAMP '2023-12-22 00:00:00') "
-        ") AS t(source_row_key, datetime_local)")
+        "  ('noon', TIMESTAMP '2023-12-22 12:00:00', FALSE), "
+        "  ('midnight', TIMESTAMP '2023-12-22 00:00:00', FALSE) "
+        ") AS t(source_row_key, datetime_local, time_imputed)")   # not imputed -> both stamped
     con.execute("ALTER TABLE collisions ADD COLUMN geom GEOMETRY")
     con.execute(
         "UPDATE collisions SET geom = ST_Transform("
@@ -1111,8 +1149,8 @@ def test_solar_stamp_applies_bst_offset_in_summer(tmp_path):
     con.execute(
         "CREATE TABLE collisions AS "
         "SELECT * FROM (VALUES "
-        "  ('summer_noon_bst', TIMESTAMP '2023-06-21 13:00:00') "
-        ") AS t(source_row_key, datetime_local)")
+        "  ('summer_noon_bst', TIMESTAMP '2023-06-21 13:00:00', FALSE) "
+        ") AS t(source_row_key, datetime_local, time_imputed)")   # not imputed -> stamped
     con.execute("ALTER TABLE collisions ADD COLUMN geom GEOMETRY")
     con.execute(
         "UPDATE collisions SET geom = ST_Transform("

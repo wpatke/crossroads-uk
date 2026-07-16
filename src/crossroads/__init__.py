@@ -22,4 +22,4 @@ except PackageNotFoundError:  # not installed; no metadata to read
 # renamed/removed field). It is a plain literal here (hand-maintained), independent of the
 # git-derived package version. A schema change is also a MINOR (or MAJOR, if breaking)
 # release — see CHANGELOG.md.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4

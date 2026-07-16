@@ -6,7 +6,7 @@ tables dynamically (`CREATE OR REPLACE ... AS SELECT`), so this file documents t
 it is never executed. Every built database also carries its own machine-readable schema
 marker: `SELECT * FROM crossroads_meta` (see [`crossroads_meta`](#crossroads_meta)).
 
-**Schema version:** 3  ·  See [methodology.md](methodology.md) for how the data is produced
+**Schema version:** 4  ·  See [methodology.md](methodology.md) for how the data is produced
 and [spec.md §9](spec.md) for the keep-in-place quality model.
 
 ## Conventions (keep-in-place model)
@@ -54,6 +54,7 @@ CREATE TABLE collisions (
     time_raw               VARCHAR,     -- raw collision time as published (HH:MM; may be blank)
     datetime_local         TIMESTAMP,   -- collision timestamp, UK local; midnight fallback when only the date parsed
     datetime_valid         BOOLEAN,     -- TRUE when the DATE parsed (a missing time is not a rejection)
+    time_imputed           BOOLEAN,     -- TRUE when the date parsed but the time did not (datetime_local is midnight); weather/solar are left NULL for these rows
     lad_code               VARCHAR,     -- ONS LAD code stamped by point-in-polygon join; NULL if geom invalid / no boundary built
     ctyua_code             VARCHAR,     -- ONS CTYUA code stamped by point-in-polygon join; NULL if geom invalid / no boundary built
     temperature_c          DOUBLE,      -- 2 m air temperature (°C) from the ERA5-Land cell at the collision hour; NULL if weather not built / no match
