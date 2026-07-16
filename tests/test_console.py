@@ -49,12 +49,18 @@ def _boom_secret():
 
 
 def _isolate_cds(monkeypatch, tmp_path):
-    """Point ~/.cdsapirc at an empty tmp home and clear CDSAPI_* env vars.
+    """Redirect ~/.cdsapirc into tmp_path and clear CDSAPI_* env vars.
 
-    os.path.expanduser("~") honors $HOME on Linux/macOS (the dev + CI platforms),
-    so this keeps the credential tests hermetic — they never touch the real file.
+    We override the production seam _cdsapirc_path() directly rather than setting
+    $HOME, because os.path.expanduser("~") ignores $HOME on Windows (it uses
+    %USERPROFILE%). Patching the seam keeps the credential tests hermetic on every
+    OS — they never touch the developer's real ~/.cdsapirc.
+
+    Note: _cdsapirc_path() returns a str (console._write_cdsapirc does `path + ".part"`),
+    so we return str(...) here, not a Path.
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    fake_rc = str(tmp_path / ".cdsapirc")
+    monkeypatch.setattr(console, "_cdsapirc_path", lambda: fake_rc)
     monkeypatch.delenv("CDSAPI_URL", raising=False)
     monkeypatch.delenv("CDSAPI_KEY", raising=False)
 
