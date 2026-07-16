@@ -286,6 +286,53 @@ def test_orphan_vehicle_is_flagged_and_logged(con):
     assert ledger == [("cX|1", "stats19.link.orphan_vehicle")]
 
 
+def test_vehicle_carries_year_and_reference_from_modern_names(con):
+    """Regression: real DfT child files (2020+) name the carried metadata collision_year /
+    collision_ref_no, not accident_year / accident_reference. The bespoke coalesce must
+    carry them into accident_year / accident_reference — the name-matched broad loop cannot
+    rename, so before the fix these two columns were 100% NULL on real data (a golden-source
+    verification caught it). Mirrors test_collision_reference_alias_branch for vehicles."""
+    from crossroads.quality import ensure_quality_tables
+    ensure_quality_tables(con)
+    _empty_reference_stubs(con)                       # empty manifest -> broad loop is a no-op
+    con.execute("CREATE TABLE collisions AS SELECT * FROM (VALUES ('2024A1')) AS t(accident_index)")
+    con.execute(
+        "CREATE TABLE stats19_vehicle_raw AS SELECT * FROM (VALUES "
+        "  ('2024A1','2024','ref1','1')"
+        ") AS t(collision_index, collision_year, collision_ref_no, vehicle_reference)")
+    t = Stats19Transformer(); t._derive_vehicle_silver(con)
+    row = con.execute(
+        "SELECT accident_index, accident_year, accident_reference, link_valid "
+        "FROM vehicles").fetchone()
+    assert row[0] == "2024A1"          # index coalesced from collision_index
+    assert row[1] == "2024"            # collision_year -> accident_year (was NULL before the fix)
+    assert row[2] == "ref1"            # collision_ref_no -> accident_reference (was NULL before)
+    assert row[3] is True              # still links to the collision
+
+
+def test_casualty_carries_year_and_reference_from_modern_names(con):
+    """Regression mirror for the casualty path: collision_year / collision_ref_no must
+    populate accident_year / accident_reference (both were 100% NULL on real data before
+    the fix)."""
+    from crossroads.quality import ensure_quality_tables
+    ensure_quality_tables(con)
+    _empty_reference_stubs(con)
+    con.execute("CREATE TABLE collisions AS SELECT * FROM (VALUES ('2024A1')) AS t(accident_index)")
+    con.execute(
+        "CREATE TABLE stats19_casualty_raw AS SELECT * FROM (VALUES "
+        "  ('2024A1','2024','ref1','1','1','2')"
+        ") AS t(collision_index, collision_year, collision_ref_no, "
+        "        vehicle_reference, casualty_reference, casualty_severity)")
+    t = Stats19Transformer(); t._derive_casualty_silver(con)
+    row = con.execute(
+        "SELECT accident_index, accident_year, accident_reference, link_valid "
+        "FROM casualties").fetchone()
+    assert row[0] == "2024A1"
+    assert row[1] == "2024"            # collision_year -> accident_year (was NULL before the fix)
+    assert row[2] == "ref1"            # collision_ref_no -> accident_reference (was NULL before)
+    assert row[3] is True
+
+
 @pytest.mark.integration
 def test_download_real_dft_sample(tmp_path):
     t = Stats19Transformer()

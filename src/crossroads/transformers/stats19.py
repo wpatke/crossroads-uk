@@ -650,17 +650,30 @@ class Stats19Transformer(BaseTransformer):
         acc = self._coalesce_present(con, self.VEHICLE_BRONZE,
                                      ["collision_index", "accident_index"], "accident_index")
         idx_expr = acc.replace(" AS accident_index", "")
-        # Exclude ONLY the columns the bespoke SELECT below actually emits: accident_index
-        # (coalesced from either name) + vehicle_reference. accident_year/accident_reference
-        # are NOT bespoke-produced here, so they fall to the broad loop and are carried
-        # (carried raw, matching how collision carries them) -- otherwise they'd vanish.
-        exclude = {"accident_index", "collision_index", "vehicle_reference"}
+        # accident_year/accident_reference must be coalesced over their name variants HERE,
+        # exactly as the collision path does. Modern DfT child files (2020+) name them
+        # collision_year / collision_ref_no; the broad loop matches manifest names only and
+        # cannot rename, so without this bespoke coalesce those two columns would be all-NULL
+        # placeholders on real data (the tranche the manifest name is absent from). Emitting
+        # them here — and excluding every name variant from the broad loop — carries the real
+        # value while keeping each column on exactly ONE path.
+        yr = self._coalesce_present(con, self.VEHICLE_BRONZE,
+                                    ["collision_year", "accident_year"], "accident_year")
+        ref = self._coalesce_present(con, self.VEHICLE_BRONZE,
+                                     ["collision_ref_no", "collision_reference", "accident_reference"],
+                                     "accident_reference")
+        # Exclude every column the bespoke SELECT below emits (all name variants), so the
+        # broad loop never also produces them: accident_index + vehicle_reference + the
+        # year/reference metadata now coalesced above.
+        exclude = {"accident_index", "collision_index", "vehicle_reference",
+                   "accident_year", "collision_year",
+                   "accident_reference", "collision_reference", "collision_ref_no"}
         broad = self._broad_fragments(con, self.VEHICLE_BRONZE, "vehicle", exclude)
         broad_sql = (", " + ", ".join(broad)) if broad else ""
         con.execute(
             f"CREATE OR REPLACE TABLE {self.VEHICLE_SILVER} AS "
             f"SELECT ({idx_expr}) || '|' || vehicle_reference AS source_row_key, "
-            f"       {acc}, vehicle_reference, "
+            f"       {acc}, {yr}, {ref}, vehicle_reference, "
             f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
             f"         AS link_valid "
             f"       {broad_sql} "
@@ -678,12 +691,22 @@ class Stats19Transformer(BaseTransformer):
         acc = self._coalesce_present(con, self.CASUALTY_BRONZE,
                                      ["collision_index", "accident_index"], "accident_index")
         idx_expr = acc.replace(" AS accident_index", "")
-        # As in vehicles: exclude the bespoke-emitted keys (accident_index +
-        # vehicle_reference + casualty_reference), PLUS casualty_severity (now CORE-audited
-        # below, so it must not also be defined by the broad loop). accident_year/
-        # accident_reference fall to the broad loop and are carried, never dropped.
+        # accident_year/accident_reference are coalesced over their name variants HERE (same
+        # reason as vehicles): modern child files name them collision_year / collision_ref_no,
+        # and the name-matched broad loop cannot rename, so relying on it would leave both
+        # columns all-NULL on real data. Emit them bespoke and exclude every name variant.
+        yr = self._coalesce_present(con, self.CASUALTY_BRONZE,
+                                    ["collision_year", "accident_year"], "accident_year")
+        ref = self._coalesce_present(con, self.CASUALTY_BRONZE,
+                                     ["collision_ref_no", "collision_reference", "accident_reference"],
+                                     "accident_reference")
+        # Exclude the bespoke-emitted keys (accident_index + vehicle_reference +
+        # casualty_reference) and the year/reference variants coalesced above, PLUS
+        # casualty_severity (CORE-audited below), so none is defined twice.
         exclude = {"accident_index", "collision_index", "vehicle_reference",
-                   "casualty_reference", "casualty_severity"}
+                   "casualty_reference", "casualty_severity",
+                   "accident_year", "collision_year",
+                   "accident_reference", "collision_reference", "collision_ref_no"}
         # CORE severity audit: raw twin + cleaned INTEGER + valid flag.
         sev_raw, sev_clean, sev_valid = self._core_severity_fragments(
             con, self.CASUALTY_BRONZE, "casualty_severity", ["casualty_severity"])
@@ -693,7 +716,7 @@ class Stats19Transformer(BaseTransformer):
             f"CREATE OR REPLACE TABLE {self.CASUALTY_SILVER} AS "
             f"SELECT ({idx_expr}) || '|' || vehicle_reference || '|' || casualty_reference "
             f"         AS source_row_key, "
-            f"       {acc}, vehicle_reference, casualty_reference, "
+            f"       {acc}, {yr}, {ref}, vehicle_reference, casualty_reference, "
             f"       (({idx_expr}) IN (SELECT accident_index FROM {self.COLLISION_SILVER})) "
             f"         AS link_valid, "
             # CORE severity audit: raw twin, cleaned INTEGER, valid flag.
