@@ -61,13 +61,19 @@ def test_schema_doc_mentions_core_tables():
 
 
 @pytest.mark.integration
-def test_documented_columns_match_built_database(tmp_path):
+def test_documented_columns_match_built_database(tmp_path, monkeypatch):
     """Build the full offline fixture DB (weather + stats19 + ONS) and assert every real
     column of the guarded tables appears in docs/schema.md."""
     # The weather source imports xarray, which lives in the optional [weather] extra.
     # Skip cleanly (rather than crashing) if it isn't installed. The release CI job
     # installs .[dev,weather], so the drift guard still runs there — see .github/workflows/tests.yml.
     pytest.importorskip("xarray")
+    # A configured CDS key bypasses the wizard's credential prompt so this build stays
+    # offline and hermetic. Without it the wizard falls through to getpass, which crashes
+    # under pytest on a machine with no ~/.cdsapirc (e.g. CI). The fake key is never used —
+    # weather data comes from the seeded .nc fixture. Mirrors test_wizard_builds_weather_offline.
+    monkeypatch.setenv("CDSAPI_URL", "https://example.invalid/api")
+    monkeypatch.setenv("CDSAPI_KEY", "test-key")
     cache = str(tmp_path / "cache")
     _seed_full_cache(cache)
     # Seed weather too, so the weather table exists in the built DB.
