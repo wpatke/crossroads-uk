@@ -111,6 +111,73 @@ def _looks_like_licence_error(exc):
                ("licence", "license", "not accepted", "terms of use"))
 
 
+# Exact install command for the optional [weather] extra. Distribution name is
+# 'crossroads-uk'; the extra is 'weather'. Single source of truth — the wizard
+# imports this so its advice matches the transformer's exactly.
+WEATHER_EXTRA_HINT = 'pip install "crossroads-uk[weather]"'
+
+
+def weather_extra_available():
+    """True when the optional [weather] extra is importable.
+
+    Keyed on xarray: it parses ERA5-Land NetCDF on every weather build path
+    (real download AND offline seeded-cache), and the [weather] extra installs it
+    alongside cdsapi/netCDF4. Uses importlib.util.find_spec so it does NOT import
+    the heavy module — cheap enough to call while drawing the wizard menu.
+    """
+    import importlib.util
+    return importlib.util.find_spec("xarray") is not None
+
+
+def _missing_extra_message(exc):
+    """Friendly, actionable steps when the [weather] extra is not installed.
+
+    Reached by a programmatic build() caller who selected weather without the extra;
+    the wizard blocks this earlier with the same command. Framed as a setup step the
+    user still needs to do, NOT as a program error.
+    """
+    return (
+        "Weather data isn't available yet because the optional weather add-on isn't\n"
+        "installed. This isn't a bug: weather ships as an optional extra so the base\n"
+        "install stays small and fast.\n\n"
+        "To enable weather, install the add-on and then re-run:\n\n"
+        f"    {WEATHER_EXTRA_HINT}\n\n"
+        f"(technical detail: {exc})"
+    )
+
+
+def _auth_error_message(exc):
+    """Actionable steps when CDS rejects the key (HTTP 401 / authentication failed).
+
+    The key was FOUND but not accepted — expired, revoked, or mistyped. cdsapi does
+    not validate offline, so this only surfaces at download time; we translate the raw
+    401 into a check-your-key message instead of a traceback.
+    """
+    return (
+        "Copernicus rejected your CDS API key (authentication failed).\n\n"
+        "A key was found in ~/.cdsapirc (or your CDSAPI_* environment variables) but\n"
+        "not accepted — it may be expired, revoked, or mistyped.\n\n"
+        f"Get a fresh token from your CDS profile ({CDS_HOME_URL} -> log in -> your\n"
+        "profile -> 'Personal Access Token'), then set ~/.cdsapirc to:\n\n"
+        f"    url: {CDS_HOME_URL}/api\n"
+        "    key: <your-personal-access-token>\n\n"
+        "and re-run the build.\n\n"
+        f"(underlying cdsapi error: {exc})"
+    )
+
+
+def _looks_like_auth_error(exc):
+    """Heuristic: is this CDS failure an authentication/authorization rejection (401)?
+
+    Matches 401 / auth wording only, kept separate from the licence (403) heuristic so a
+    bad key is not mis-reported as an unaccepted licence and vice versa.
+    """
+    text = str(exc).lower()
+    return any(word in text for word in (
+        "401", "unauthorized", "authentication failed", "operation not allowed",
+        "invalid api key", "invalid token"))
+
+
 def _normalize_to_netcdf(path):
     """Ensure `path` is a plain NetCDF file, unwrapping the CDS zip envelope if present.
 
@@ -192,7 +259,13 @@ class Era5WeatherTransformer(BaseTransformer):
         interrupted build resumes without re-fetching completed months. cdsapi and xarray
         are imported lazily so the module and the offline tests do not require the
         [weather] extra."""
-        import cdsapi                                   # lazy: real download only
+        try:
+            import cdsapi                               # lazy: real download only
+        except ImportError as exc:
+            # The [weather] extra is not installed. Give the exact install command
+            # rather than a raw ImportError. The wizard blocks this earlier, but a
+            # programmatic build() caller reaches here directly.
+            raise RuntimeError(_missing_extra_message(exc)) from exc
         cache_dir = os.path.dirname(dest)
 
         # cdsapi raises a bare, cryptic exception when it can't find the API key
@@ -224,8 +297,10 @@ class Era5WeatherTransformer(BaseTransformer):
         except Exception as exc:
             if os.path.exists(tmp):
                 os.remove(tmp)                       # never leave a partial temp behind
-            # Give targeted help for the two common post-auth failures; otherwise let the
-            # real error through unchanged (network, disk, etc. are self-explanatory).
+            # Translate the common CDS setup failures into actionable steps; otherwise let
+            # the real error through unchanged (network, disk, etc. are self-explanatory).
+            if _looks_like_auth_error(exc):          # 401: a key was found but rejected
+                raise RuntimeError(_auth_error_message(exc)) from exc
             if _looks_like_licence_error(exc):
                 raise RuntimeError(_licence_message(exc)) from exc
             if _looks_like_too_large_error(exc):
