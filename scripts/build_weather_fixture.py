@@ -20,7 +20,7 @@ import csv
 import os
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -81,7 +81,10 @@ def _build_dataset():
     lon_nodes = sorted({t[1] for t in triples})
     lats = sorted({round(v, 1) for n in lat_nodes for v in (n - 0.1, n, n + 0.1)})
     lons = sorted({round(v, 1) for n in lon_nodes for v in (n - 0.1, n, n + 0.1)})
-    times = sorted({t[2] for t in triples})
+    # Each collision hour H plus H + 1 hour. Precipitation for a collision comes from
+    # the row one hour later, and that row needs the row before it (H) so its running
+    # total can be de-accumulated into an hourly amount.
+    times = sorted({t[2] + delta for t in triples for delta in (timedelta(0), timedelta(hours=1))})
 
     lats = np.array(lats, dtype="float64")
     lons = np.array(lons, dtype="float64")

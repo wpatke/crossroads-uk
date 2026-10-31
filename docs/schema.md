@@ -58,7 +58,7 @@ CREATE TABLE collisions (
     lad_code               VARCHAR,     -- ONS LAD code stamped by point-in-polygon join; NULL if geom invalid / no boundary built
     ctyua_code             VARCHAR,     -- ONS CTYUA code stamped by point-in-polygon join; NULL if geom invalid / no boundary built
     temperature_c          DOUBLE,      -- 2 m air temperature (°C) from the ERA5-Land cell at the collision hour; NULL if weather not built / no match
-    precipitation_mm       DOUBLE,      -- hourly precipitation (mm) from the ERA5-Land cell; NULL if weather not built / no match
+    precipitation_mm       DOUBLE,      -- precipitation (mm) that fell in the ERA5-Land cell during the clock hour the collision happened in (e.g. 14:00-15:00 for a 14:30 collision; taken from the weather row stamped one hour later); NULL if weather not built / no match
     solar_elevation_deg    DOUBLE,      -- sun's apparent elevation above the horizon (deg, refraction-corrected; negative = below horizon/night); computed mathematically (NOAA) from geom + datetime_local; NULL if geom/datetime invalid
     solar_azimuth_deg      DOUBLE,      -- sun's azimuth (deg clockwise from true north: 0=N/90=E/180=S/270=W) at the collision place/time; NULL if geom/datetime invalid
     is_bank_holiday        BOOLEAN,     -- TRUE if the collision's date is a bank holiday in its nation (from lad_code prefix); FALSE if a known non-holiday in-coverage; NULL if unknown (no/unknown nation, no date, or date outside the gov.uk feed's coverage)
@@ -203,7 +203,7 @@ CREATE TABLE weather (
     valid_time_utc         TIMESTAMP,   -- raw hourly instant, UTC (ERA5-Land is UTC-native)
     valid_time_local       TIMESTAMP,   -- same instant expressed in UK civil time (Europe/London)
     temperature_c          DOUBLE,      -- 2 m air temperature in °C (t2m − 273.15); NULL over sea/NaN cells
-    precipitation_mm       DOUBLE       -- hourly total precipitation in mm (tp × 1000); NULL over sea/NaN cells
+    precipitation_mm       DOUBLE       -- precipitation in mm that fell in the hour ENDING at valid_time (ERA5 convention: the 14:00 row is rain from 13:00 to 14:00), de-accumulated from ERA5-Land's running daily total; NULL over sea/NaN cells and when there is no previous hour to subtract (the first hour loaded, or a gap between non-consecutive years)
 );
 ```
 

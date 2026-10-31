@@ -14,10 +14,15 @@ The grid cells and hours are derived from the committed STATS19 collision fixtur
   (`round(coord, 1)`), and the node axes are padded by ±one 0.1° cell of margin;
 - each collision's **local** timestamp is floored to the hour and converted to the
   **UTC** instant (via `zoneinfo.ZoneInfo("Europe/London")`), so the weather silver's
-  derived *local* hour lines up with the collision's local hour.
+  derived *local* hour lines up with the collision's local hour;
+- the hour **after** each collision hour is included too. A collision's
+  precipitation comes from the row one hour later (rain in the hour ending then), and
+  that row needs the hour before it so its running total can be de-accumulated.
 
 This guarantees, by construction, that at least one collision falls on a weather
-cell + hour — Stage 03's stamping always has something to match.
+cell + hour — Stage 03's stamping always has something to match, for both
+temperature and precipitation. `tp` rises steadily within the cube, as a real
+running total does, so each consecutive pair de-accumulates to 0.5 mm.
 
 The cube also contains **exactly one all-NaN "sea" cell** (valid coordinates,
 `t2m`/`tp` = NaN) in a margin latitude that no collision maps to. It proves the
@@ -51,13 +56,13 @@ compare would be meaningless.
 ## Imitated `ncdump -h` header
 
 The committed fixture currently expands to the following shape (a small patch over
-County Durham, six hours in 2023). The axis lengths grow if the collision fixture
+County Durham, twelve hours in 2023). The axis lengths grow if the collision fixture
 changes; the *structure* below is the contract:
 
 ```
 netcdf era5_land_sample {
 dimensions:
-        valid_time = 6 ;
+        valid_time = 12 ;
         latitude = 3 ;
         longitude = 3 ;
 variables:

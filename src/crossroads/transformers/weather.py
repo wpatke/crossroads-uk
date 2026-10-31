@@ -16,10 +16,16 @@ and are imported lazily, so this module imports cleanly for discovery without th
 Offline tests seed the cache with a committed synthetic .nc, so extract() downloads
 nothing.
 
-Note on ``tp``: ERA5-Land total precipitation is an accumulation in metres. This
-transformer takes each published hourly value, converts to millimetres, and stores
-it as-is (the spec §5 baseline is "precipitation" with no de-accumulation). This is
-a documented simplification.
+Note on ``tp``: ERA5-Land total precipitation is a running total in metres,
+accumulated since 00:00 UTC: each hourly value is the rain so far that day, and the
+value stamped 00:00 is the whole of the PREVIOUS day. Bronze keeps that raw running
+total. Silver de-accumulates it into the rain that fell in the hour ENDING at
+valid_time (the ERA5 convention), per grid cell, in time order:
+
+  • 01:00 UTC        -> the raw value (the running total has just restarted)
+  • any other hour   -> this hour's total minus the previous hour's (clipped at 0)
+  • no previous hour -> NULL (the first hour loaded, or a gap between non-consecutive
+                        years); we cannot tell how much of the total is this hour's
 """
 
 import os
@@ -400,7 +406,12 @@ class Era5WeatherTransformer(BaseTransformer):
           • valid_time_utc  = raw naive UTC instant
           • valid_time_local= (utc AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London' (naive local)
           • temperature_c   = t2m - 273.15   (Kelvin -> Celsius; NULL/NaN -> NULL)
-          • precipitation_mm= tp * 1000       (metres -> millimetres; NULL/NaN -> NULL)
+          • precipitation_mm= rain in the hour ENDING at valid_time_utc, in mm. tp is a
+                              running total since 00:00 UTC, so it is de-accumulated:
+                              01 UTC -> tp; otherwise tp - previous hour's tp (clipped
+                              at 0, which absorbs tiny rounding negatives); NULL when
+                              there is no row exactly 1 hour earlier for the same cell.
+                              NULL/NaN -> NULL. Then metres -> millimetres (* 1000).
           • grid_i/grid_j   = round(lat/lon * 10) integer grid index (STATS19's join key)
 
         Sea/NaN cells (ERA5-Land is a LAND model) keep NULL metrics BY DOMAIN — not a
@@ -420,6 +431,16 @@ class Era5WeatherTransformer(BaseTransformer):
             f"    TRY_CAST(t2m AS DOUBLE) AS t2m_k, "
             f"    TRY_CAST(tp  AS DOUBLE) AS tp_m "
             f"  FROM {self.BRONZE}"
+            f"), "
+            # For de-accumulating tp: the same cell's previous row (its tp and its time).
+            # The time lets us check the previous row really is exactly 1 hour earlier.
+            # Done in SQL (not pandas) because this table is ~108M rows per year.
+            f"lagged AS ("
+            f"  SELECT *, "
+            f"    LAG(tp_m)           OVER cell_hours AS prev_tp_m, "
+            f"    LAG(valid_time_utc) OVER cell_hours AS prev_time_utc "
+            f"  FROM typed "
+            f"  WINDOW cell_hours AS (PARTITION BY latitude, longitude ORDER BY valid_time_utc)"
             f") "
             f"SELECT "
             f"  CAST(round(latitude * 10)  AS INTEGER) || '|' || "
@@ -434,8 +455,15 @@ class Era5WeatherTransformer(BaseTransformer):
             f"  valid_time_utc, "
             f"  (valid_time_utc AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London' AS valid_time_local, "
             f"  CASE WHEN t2m_k IS NULL OR isnan(t2m_k) THEN NULL ELSE t2m_k - 273.15 END AS temperature_c, "
-            f"  CASE WHEN tp_m  IS NULL OR isnan(tp_m)  THEN NULL ELSE tp_m  * 1000.0 END AS precipitation_mm "
-            f"FROM typed"
+            f"  CASE "
+            f"    WHEN tp_m IS NULL OR isnan(tp_m) THEN NULL "                  # sea cell
+            f"    WHEN hour(valid_time_utc) = 1 THEN tp_m * 1000.0 "            # total just restarted
+            f"    WHEN prev_time_utc = valid_time_utc - INTERVAL 1 HOUR "
+            f"     AND prev_tp_m IS NOT NULL AND NOT isnan(prev_tp_m) "
+            f"      THEN greatest(tp_m - prev_tp_m, 0.0) * 1000.0 "             # this hour's share
+            f"    ELSE NULL "                                                   # no previous hour
+            f"  END AS precipitation_mm "
+            f"FROM lagged"
         )
         # LEDGER: one reject_dimension row per geom_valid = FALSE, so flag/ledger
         # agreement holds. A missing coordinate is the only geom rejection.

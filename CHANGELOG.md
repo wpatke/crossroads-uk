@@ -19,6 +19,25 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
+## [1.0.4] - 2026-10-31
+
+### Fixed
+- **Precipitation was wrong in every earlier build that included weather.** ERA5-Land
+  publishes precipitation as a running total since 00:00 UTC, not an hourly amount, and
+  earlier builds stored that running total unchanged. `weather.precipitation_mm` and
+  `collisions.precipitation_mm` therefore held the rain *so far that day*: a 23:00
+  collision carried nearly the whole day's rain, a 01:00 collision almost none, and
+  average hourly rainfall came out roughly 12x too high. Precipitation is now
+  de-accumulated into true hourly amounts. Temperature was not affected.
+- `weather.precipitation_mm` is now the rain in the hour *ending* at `valid_time` (the
+  ERA5 convention). `collisions.precipitation_mm` is the rain during the clock hour the
+  collision happened in (14:00-15:00 for a 14:30 collision). See
+  [docs/methodology.md](docs/methodology.md#weather-value-handling).
+
+**Action required:** rebuild any database that includes weather. To check an existing
+database, run `SELECT crossroads_version FROM crossroads_meta`; anything below 1.0.4 with
+weather is affected. Cached `.nc` files are still valid, so a rebuild downloads nothing new.
+
 ## [1.0.3] - 2026-07-16
 
 ### Changed

@@ -997,14 +997,19 @@ def test_labelled_views_end_to_end(tmp_path):
 # --- Weather stamping (Stage 03) ---------------------------------------------
 
 def _stub_weather(con):
-    # One weather cell (54.7,-1.2) at 14:00 LOCAL (13:00 UTC in BST).
+    # One weather cell (54.7,-1.2) at 14:00 and 15:00 LOCAL (13:00/14:00 UTC in BST).
+    # precipitation_mm is the rain in the hour ENDING at the row's time, so a 14:xx
+    # collision should get temperature from the 14:00 row and rain from the 15:00 row.
     con.execute("INSTALL icu"); con.execute("LOAD icu")
     con.execute(
         "CREATE TABLE weather AS SELECT "
         "  CAST(round(54.7*10) AS INTEGER) AS grid_i, "
         "  CAST(round(-1.2*10) AS INTEGER) AS grid_j, "
-        "  ((TIMESTAMP '2023-06-15 13:00:00') AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London' AS valid_time_local, "
-        "  15.0 AS temperature_c, 1.0 AS precipitation_mm")
+        "  ((t) AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London' AS valid_time_local, "
+        "  temperature_c, precipitation_mm "
+        "FROM (VALUES (TIMESTAMP '2023-06-15 13:00:00', 15.0, 9.0), "   # rain 13:00-14:00 local
+        "             (TIMESTAMP '2023-06-15 14:00:00', 16.0, 1.0)) "   # rain 14:00-15:00 local
+        "  AS v(t, temperature_c, precipitation_mm)")
 
 
 def _stub_collisions_geo(con, rows):
@@ -1031,7 +1036,7 @@ def test_weather_stamp_matches_cell_and_hour(con):
     Stats19Transformer()._weather_stamp(con)
     res = {r[0]: (r[1], r[2]) for r in con.execute(
         "SELECT source_row_key, temperature_c, precipitation_mm FROM collisions").fetchall()}
-    assert res["k_in"] == (15.0, 1.0)
+    assert res["k_in"] == (15.0, 1.0)        # temp at 14:00, rain from 14:00-15:00
     assert res["k_hour"] == (None, None)
     assert res["k_cell"] == (None, None)
 

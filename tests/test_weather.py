@@ -92,7 +92,8 @@ def test_weather_silver_epsg27700_and_conversions(con):
     row = con.execute(
         "SELECT temperature_c, precipitation_mm FROM weather "
         "WHERE grid_i = CAST(round(54.7*10) AS INTEGER) AND grid_j = CAST(round(-1.2*10) AS INTEGER)").fetchone()
-    assert abs(row[0] - 15.0) < 1e-6 and abs(row[1] - 1.0) < 1e-6           # K->C, m->mm
+    assert abs(row[0] - 15.0) < 1e-6                                        # K->C
+    assert row[1] is None             # a single hour has no previous hour to de-accumulate from (see A1)
 
     local = con.execute("SELECT CAST(valid_time_local AS VARCHAR) FROM weather LIMIT 1").fetchone()[0]
     assert local.startswith("2023-06-15 14:00:00")                          # 13:00 UTC -> 14:00 BST
@@ -104,6 +105,69 @@ def test_weather_silver_epsg27700_and_conversions(con):
     # No geom rejection for these all-coordinate rows.
     assert con.execute("SELECT count(*) FROM data_quality_log "
                        "WHERE source_id='era5_weather'").fetchone()[0] == 0
+
+
+def _cumulative_bronze(con):
+    """Seed a synthetic bronze where tp is a RUNNING TOTAL since 00:00 UTC, as in real
+    ERA5-Land. One land cell (54.7, -1.2) over several hours of 14-15 June 2023 (BST),
+    and one sea cell (NaN) over three hours. tp is in metres; comments give mm."""
+    con.execute("INSTALL spatial"); con.execute("LOAD spatial")
+    con.execute("INSTALL icu"); con.execute("LOAD icu")
+    ensure_quality_tables(con)
+    con.execute(
+        "CREATE TABLE era5_weather_raw AS SELECT * FROM (VALUES "
+        "  (TIMESTAMP '2023-06-14 23:00:00', 54.7, -1.2, 280.15, 0.0050), "  # 5.0 mm, first hour
+        "  (TIMESTAMP '2023-06-15 00:00:00', 54.7, -1.2, 281.15, 0.0060), "  # 6.0 mm, day's total
+        "  (TIMESTAMP '2023-06-15 01:00:00', 54.7, -1.2, 282.15, 0.0004), "  # 0.4 mm, reset
+        "  (TIMESTAMP '2023-06-15 02:00:00', 54.7, -1.2, 283.15, 0.0003), "  # 0.3 mm, dips (rounding)
+        "  (TIMESTAMP '2023-06-15 03:00:00', 54.7, -1.2, 284.15, 0.0021), "  # 2.1 mm
+        "  (TIMESTAMP '2023-06-15 05:00:00', 54.7, -1.2, 285.15, 0.0030), "  # 3.0 mm, after a gap
+        "  (TIMESTAMP '2023-06-15 00:00:00', 55.9, -3.0, CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE)), "
+        "  (TIMESTAMP '2023-06-15 01:00:00', 55.9, -3.0, CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE)), "
+        "  (TIMESTAMP '2023-06-15 02:00:00', 55.9, -3.0, CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE)) "
+        ") AS t(valid_time, latitude, longitude, t2m, tp)")
+
+
+# --- A1. Precipitation is de-accumulated from the running total into hourly amounts ---
+def test_weather_silver_deaccumulates_precipitation(con):
+    _cumulative_bronze(con)
+    Era5WeatherTransformer()._derive_silver_and_ledger(con)
+
+    assert con.execute("SELECT count(*) FROM weather").fetchone()[0] == 9    # keep-in-place
+
+    land = dict(con.execute(
+        "SELECT strftime(valid_time_utc, '%d %H'), precipitation_mm FROM weather "
+        "WHERE grid_i = CAST(round(54.7*10) AS INTEGER)").fetchall())
+    assert land["14 23"] is None                           # first hour: no predecessor
+    assert abs(land["15 00"] - 1.0) < 1e-9                 # normal hour: 6.0 - 5.0
+    assert abs(land["15 01"] - 0.4) < 1e-9                 # 01 UTC reset: the raw value
+    assert land["15 02"] == 0.0                            # 0.3 - 0.4 < 0 -> clipped to 0
+    assert abs(land["15 03"] - 1.8) < 1e-9                 # normal hour: 2.1 - 0.3
+    assert land["15 05"] is None                           # 04:00 missing -> gap -> NULL
+
+    sea = con.execute("SELECT count(*) FROM weather WHERE grid_i = CAST(round(55.9*10) AS INTEGER) "
+                      "AND precipitation_mm IS NULL").fetchone()[0]
+    assert sea == 3                                        # sea cell stays NULL every hour
+
+
+# --- A1b. A STATS19 collision picks up the de-accumulated value for its own hour ---
+def test_collision_stamped_with_deaccumulated_precipitation(con):
+    from crossroads.transformers.stats19 import Stats19Transformer
+    _cumulative_bronze(con)
+    Era5WeatherTransformer()._derive_silver_and_ledger(con)
+    # One collision in the land cell at 03:40 BST (02:40 UTC). Its clock hour is
+    # 02:00-03:00 UTC, so it should get the rain from the row stamped 03:00 UTC
+    # (1.8 mm, not the raw running total 2.1 mm) and the temperature from 02:00 UTC.
+    con.execute(
+        "CREATE TABLE collisions AS SELECT 'k1' AS source_row_key, "
+        "  ST_Transform(ST_Point(-1.2, 54.7), 'EPSG:4326', 'EPSG:27700', always_xy := true)::GEOMETRY AS geom, "
+        "  TIMESTAMP '2023-06-15 03:40:00' AS datetime_local, FALSE AS time_imputed, "
+        "  CAST(NULL AS DOUBLE) AS temperature_c, CAST(NULL AS DOUBLE) AS precipitation_mm")
+    Stats19Transformer()._weather_stamp(con)
+    temp, precip = con.execute(
+        "SELECT temperature_c, precipitation_mm FROM collisions").fetchone()
+    assert abs(temp - 10.0) < 1e-9                         # 283.15 K at 02:00 UTC
+    assert abs(precip - 1.8) < 1e-9                        # rain 02:00-03:00 UTC
 
 
 # --- A2. Per-month request shape (no network) ---

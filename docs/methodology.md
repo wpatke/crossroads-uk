@@ -55,10 +55,25 @@ WHERE solar_elevation_deg BETWEEN 0 AND 15      -- low sun, above the horizon
 
 ## Weather value handling
 
-ERA5-Land 2 m temperature (Kelvin) and total precipitation (metres, an hourly
-accumulation) are ingested; precipitation is converted to millimetres and stored as
-published (no de-accumulation — a documented simplification). Sea cells outside the land
-model carry `NULL` metrics by domain, kept in place. Detail:
+ERA5-Land 2 m temperature (Kelvin) and total precipitation (metres) are ingested.
+Temperature is an instant reading and is converted to °C. Precipitation is published as a
+running total accumulated since 00:00 UTC, so the 23:00 value holds nearly a whole day's
+rain and the 00:00 value holds all of the previous day's. The raw value is kept in the
+bronze table; the `weather` table de-accumulates it, per grid cell, into the rain that fell
+in the hour **ending** at each timestamp:
+
+- at 01:00 UTC the running total has just restarted, so the hourly amount is the raw value;
+- at any other hour it is this hour's total minus the previous hour's, clipped at 0 to
+  absorb tiny rounding negatives;
+- with no row exactly one hour earlier (the first hour loaded, or a gap between
+  non-consecutive years) it is `NULL`.
+
+Sea cells outside the land model carry `NULL` metrics by domain, kept in place.
+
+When stamping a collision in clock hour H (e.g. 14:30 → H = 14:00), `temperature_c` is
+the reading at H and `precipitation_mm` is the rain from H to H + 1 hour, i.e. the hour the
+collision happened in. On the night the clocks go forward, the local hour after 00:xx does
+not exist, so collisions in that one hour have `NULL` precipitation. Detail:
 [spec.md §5 Phase 4](spec.md).
 
 ## Boundary drift
