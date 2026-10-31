@@ -56,7 +56,7 @@ README_UNIFIED = """
 SELECT accident_index,
        collision_severity,     -- 1=Fatal 2=Serious 3=Slight
        temperature_c,          -- ERA5-Land 2 m air temp at the collision hour
-       precipitation_mm,       -- ERA5-Land hourly precipitation at that cell
+       precipitation_mm,       -- ERA5-Land rain (mm) during the collision hour
        solar_elevation_deg,    -- sun's elevation (NOAA); negative = below horizon
        lad_code,               -- ONS local authority (point-in-polygon)
        is_bank_holiday         -- gov.uk bank-holiday calendar for that nation

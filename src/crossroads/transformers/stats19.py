@@ -798,9 +798,18 @@ class Stats19Transformer(BaseTransformer):
 
         Match (spec §3A/§3B): reproject each collision point back to lon/lat, round to the
         0.1° ERA5-Land grid index (grid_i, grid_j), and match the weather cell with the same
-        index AND the same UK-local hour (weather.valid_time_local is pre-materialised, so
-        no ICU is needed here). weather is unique per (cell, hour), so min() aggregates over
-        at most one row — the same defensive GROUP BY _spatial_stamp uses for area_code."""
+        index (weather.valid_time_local is pre-materialised, so no ICU is needed here).
+
+        Which weather hour? For a collision in clock hour H (e.g. 14:30 -> H = 14:00):
+          • temperature_c    comes from the row stamped H (an instant reading at 14:00).
+          • precipitation_mm comes from the row stamped H + 1 hour, because weather's
+            precipitation is the rain in the hour ENDING at its timestamp. So a 14:30
+            collision gets the rain that fell 14:00-15:00, the hour it happened in.
+        Each is its own equality join (wt and wp), so DuckDB can hash-join on cell + hour.
+        weather is unique per (cell, hour), so each min() sees at most one value (except
+        the repeated local hour when clocks go back) — the same defensive GROUP BY
+        _spatial_stamp uses. When the clocks go forward, the local hour after 00:xx does
+        not exist, so collisions in that one hour get NULL precipitation."""
         if not self._table_exists(con, "weather"):
             warnings.warn(
                 "stats19: weather table not found; temperature_c/precipitation_mm left NULL "
@@ -811,10 +820,12 @@ class Stats19Transformer(BaseTransformer):
             f"UPDATE {self.COLLISION_SILVER} AS c "
             f"SET temperature_c = m.temperature_c, precipitation_mm = m.precipitation_mm "
             f"FROM ("
-            f"  SELECT k, min(temperature_c) AS temperature_c, "
-            f"         min(precipitation_mm) AS precipitation_mm "
+            f"  SELECT c3.k, min(wt.temperature_c) AS temperature_c, "
+            f"         min(wp.precipitation_mm) AS precipitation_mm "
             f"  FROM ("
-            f"    SELECT c2.source_row_key AS k, w.temperature_c, w.precipitation_mm "
+            f"    SELECT source_row_key AS k, date_trunc('hour', datetime_local) AS c_hour, "
+            f"           CAST(round(ST_Y(ll) * 10) AS INTEGER) AS gi, "
+            f"           CAST(round(ST_X(ll) * 10) AS INTEGER) AS gj "
             f"    FROM ("
             f"      SELECT source_row_key, datetime_local, "
             f"             ST_Transform(geom, 'EPSG:27700', 'EPSG:4326', always_xy := true) AS ll "
@@ -822,13 +833,17 @@ class Stats19Transformer(BaseTransformer):
             # skip midnight-imputed rows — a weather value computed at 00:00 for a
             # time-unknown collision would be misleading (reviewer point 3).
             f"      WHERE geom IS NOT NULL AND datetime_local IS NOT NULL AND time_imputed = FALSE"
-            f"    ) c2 "
-            f"    JOIN weather w "
-            f"      ON w.grid_i = CAST(round(ST_Y(c2.ll) * 10) AS INTEGER) "
-            f"     AND w.grid_j = CAST(round(ST_X(c2.ll) * 10) AS INTEGER) "
-            f"     AND date_trunc('hour', w.valid_time_local) = date_trunc('hour', c2.datetime_local)"
-            f"  ) j "
-            f"  GROUP BY k"
+            f"    ) c2"
+            f"  ) c3 "
+            # temperature: the weather row at the collision's own hour
+            f"  LEFT JOIN weather wt "
+            f"    ON wt.grid_i = c3.gi AND wt.grid_j = c3.gj "
+            f"   AND date_trunc('hour', wt.valid_time_local) = c3.c_hour "
+            # precipitation: the row one hour later (its rain fell during the collision's hour)
+            f"  LEFT JOIN weather wp "
+            f"    ON wp.grid_i = c3.gi AND wp.grid_j = c3.gj "
+            f"   AND date_trunc('hour', wp.valid_time_local) = c3.c_hour + INTERVAL 1 HOUR "
+            f"  GROUP BY c3.k"
             f") m WHERE c.source_row_key = m.k"
         )
 
