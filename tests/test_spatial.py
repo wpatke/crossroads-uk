@@ -200,12 +200,16 @@ def test_build_loads_spatial_extension():
     assert client.con.execute(
         "SELECT ST_AsText(ST_Point(1, 2))"
     ).fetchone()[0] == "POINT (1 2)"
+    # always_xy := true keeps (x, y) = (longitude, latitude); DuckDB 2.0 requires the axis
+    # order to be stated, like every ST_Transform call in src/.
     lon_lat = client.con.execute(
         "SELECT ST_X(g), ST_Y(g) FROM ("
-        "  SELECT ST_Transform(ST_Point(530000, 180000), 'EPSG:27700', 'EPSG:4326') AS g"
+        "  SELECT ST_Transform(ST_Point(530000, 180000), 'EPSG:27700', 'EPSG:4326', "
+        "                      always_xy := true) AS g"
         ")"
     ).fetchone()
-    assert 50.0 < lon_lat[0] < 53.0
+    assert -1.0 < lon_lat[0] < 1.0      # central London longitude (about -0.13)
+    assert 51.0 < lon_lat[1] < 52.0     # central London latitude (about 51.5)
     client.close()
 
 
