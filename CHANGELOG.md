@@ -19,7 +19,7 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
-## [1.0.4] - Unreleased
+## [1.0.4] - 2026-10-31
 
 ### Fixed
 - **Precipitation was wrong in every earlier build that included weather.** ERA5-Land
