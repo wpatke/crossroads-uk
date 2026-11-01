@@ -10,13 +10,17 @@ Crossroads-UK does not ship a pre-baked database. You choose what to build; the 
 fetches the raw public sources and compiles a DuckDB file on your machine, so the result
 is fresh, reproducible, and exactly scoped to your query.
 
+Want to explore the data quickly? [AskCrossroads](https://github.com/wpatke/askcrossroads)
+lets you ask a Crossroads-UK database questions in plain English and answers with a chart, a
+table, and the SQL it ran (see [below](#ask-questions-in-plain-english)).
+
 ## Why Crossroads-UK? What can it do?
 
 **More than road safety.**
 Crossroads-UK is a reproducible engine for unifying UK public datasets
 into one local, analysis-ready DuckDB database. Road safety is where it starts, not where it stops:
 the engine is dataset-agnostic by design, so any UK public source can be added as a new transformer
-without touching the core (see [Modular Data Architecture](docs/spec.md#4-modular-data-architecture) in
+without touching the core (see [Modular Data Architecture](https://github.com/wpatke/crossroads-uk/blob/main/docs/spec.md#4-modular-data-architecture) in
 the spec). The rest of this section shows what that
 unification buys a researcher today.
 
@@ -70,10 +74,10 @@ reproduce it exactly:
 - A **provenance stamp** on every database (version, schema, build parameters, and build time)
   so a re-run reproduces the result and you can cite it: `SELECT * FROM crossroads_meta;`
 
-The full table/column data dictionary is in **[docs/schema.md](docs/schema.md)**.
+The full table/column data dictionary is in **[docs/schema.md](https://github.com/wpatke/crossroads-uk/blob/main/docs/schema.md)**.
 
-See **[docs/methodology.md](docs/methodology.md)** for how the data is joined, converted, and
-quality-flagged, and **[docs/spec.md](docs/spec.md)** for the full product definition.
+See **[docs/methodology.md](https://github.com/wpatke/crossroads-uk/blob/main/docs/methodology.md)** for how the data is joined, converted, and
+quality-flagged, and **[docs/spec.md](https://github.com/wpatke/crossroads-uk/blob/main/docs/spec.md)** for the full product definition.
 
 ## Install from PyPI
 
@@ -229,17 +233,28 @@ the horizon, dead in the driver's line of travel.
 |----------------|-------------------:|------------------:|---------------:|
 | 2023311351084  |                  3 |               6.0 |            0.0 |
 
+## Ask questions in plain English
+
+[AskCrossroads](https://github.com/wpatke/askcrossroads) is a separate companion app for
+exploring a Crossroads-UK database quickly. You type a question; an AI model writes the SQL;
+you get back a chart, a table, and the SQL that ran. It is useful whether or not you write SQL
+yourself: the query it shows is a ready-made starting point you can copy and refine.
+
+AskCrossroads is most helpful as an exploratory tool. The AI's SQL can be wrong, so treat its
+answers as a starting point. Before citing a figure, check the SQL it shows, then cite that
+query along with the build's `crossroads_meta` stamp so others can reproduce it.
+
 ## Data & licences
 
 Crossroads-UK downloads data directly from DfT, ONS, Copernicus, and gov.uk. You are responsible
-for honouring each source's licence when you publish. See **[docs/data-sources.md](docs/data-sources.md)**
+for honouring each source's licence when you publish. See **[docs/data-sources.md](https://github.com/wpatke/crossroads-uk/blob/main/docs/data-sources.md)**
 for each source, its licence, and the exact attribution to reproduce.
 
 ## Citing
 
-If you use Crossroads-UK in research, please cite it. See **[CITATION.cff](CITATION.cff)**
+If you use Crossroads-UK in research, please cite it. See **[CITATION.cff](https://github.com/wpatke/crossroads-uk/blob/main/CITATION.cff)**
 (GitHub's "Cite this repository" button) or the latest release entry in
-**[CHANGELOG.md](CHANGELOG.md)**.
+**[CHANGELOG.md](https://github.com/wpatke/crossroads-uk/blob/main/CHANGELOG.md)**.
 
 ## Development
 
@@ -251,7 +266,7 @@ python -m pytest -m integration  # slow / networked tests (run deliberately)
 
 ## Licence & AI disclosure
 
-Crossroads-UK is released under the [MIT Licence](LICENSE). This project is **not
+Crossroads-UK is released under the [MIT Licence](https://github.com/wpatke/crossroads-uk/blob/main/LICENSE). This project is **not
 affiliated with or endorsed by** the Department for Transport, the Office for National
 Statistics, Ordnance Survey, or Copernicus/ECMWF. AI usage in development is documented in
-**[docs/ai-disclosure.md](docs/ai-disclosure.md)**.
+**[docs/ai-disclosure.md](https://github.com/wpatke/crossroads-uk/blob/main/docs/ai-disclosure.md)**.
