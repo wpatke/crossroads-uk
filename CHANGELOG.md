@@ -19,6 +19,16 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
+## [1.0.5] - 2026-11-01
+
+Documentation only: the code and the databases it builds are the same as 1.0.4.
+
+### Changed
+- README: links to [AskCrossroads](https://github.com/wpatke/askcrossroads), a companion app
+  for exploring a Crossroads-UK database by asking questions in plain English.
+- README: links to other files in the repository are now full GitHub URLs, so they work on
+  the PyPI project page as well as on GitHub.
+
 ## [1.0.4] - 2026-10-31
 
 ### Fixed
@@ -95,6 +105,8 @@ stable-contract guarantees described above take effect at `1.0.0`.
 - Spatial standardisation to EPSG:27700 with R-Tree indices; snapshot and temporal
   boundary modes.
 
+[1.0.5]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.5
+[1.0.4]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.4
 [1.0.3]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.3
 [1.0.2]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.2
 [1.0.1]: https://github.com/wpatke/crossroads-uk/releases/tag/v1.0.1
