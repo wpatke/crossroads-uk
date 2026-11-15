@@ -25,9 +25,9 @@ instead of only proving the join logic via synthetic fixtures.
 ## Naming note
 
 The live 2023 files use the `collision_*` identity naming
-(`collision_index`/`collision_year`/`collision_ref_no`), not `accident_*`. Per-year
-files are only published individually for 2020 onward; none of those use the older
-`accident_*` naming. To keep the committed fixture on the canonical `accident_*`
+(`collision_index`/`collision_year`/`collision_ref_no`), not `accident_*`. DfT publishes
+single-year files only for its most recent years (2021–2025 when checked in November
+2026), and none of those use the older `accident_*` naming. To keep the committed fixture on the canonical `accident_*`
 convention (so the offline test suite exercises that path), the three identity
 columns were renamed at fixture-generation time:
 `collision_index`→`accident_index`, `collision_year`→`accident_year`,
@@ -87,4 +87,73 @@ for name, by in order.items():
         WHERE collision_index IN ({keys})
         ORDER BY {by}
     ) TO '{OUT}/dft-road-casualty-statistics-{name}-2023.csv' (HEADER, DELIMITER ',')""")
+```
+
+## Combined-file sample (`combined/`)
+
+`combined/dft-road-casualty-statistics-{collision,vehicle,casualty}-1979-latest-published-year.csv`
+stand in for DfT's large combined 1979-onwards files in the offline tests of the
+older-year fallback (download once, then split into per-year files).
+
+These are **hand-made, not DfT data verbatim.** They copy the 2023 rows above, re-labelled
+as 2005 (3 collisions, 8 vehicles, 6 casualties), 2019 (2, 3, 2) and 2020 (3, 6, 4):
+
+- The header is DfT's real current header: the `collision_*` identity names, as in the
+  real combined files (the 2023 fixture's `accident_*` rename is undone).
+- `collision_index` gets the new year in place of `2023`, `collision_year` is the new year,
+  and `date` moves to the same day and month in the new year, with `day_of_week`
+  recomputed for it (DfT: 1 = Sunday). Coordinates are unchanged, so the points still fall
+  inside the committed LAD sample.
+- 2005 rows have `-1` for fields DfT did not collect that year (`driver_imd_decile`,
+  `lsoa_of_driver`, `journey_purpose_of_driver`, `casualty_imd_decile`).
+- Rows are written with the years **mixed together** (2019, 2005, 2020, 2005, …), as in
+  DfT's real file, so the tests prove the split does not assume rows are grouped by year.
+
+Recipe (run from the repository root):
+
+```python
+import csv, datetime, os
+
+FIX = "tests/fixtures/stats19"
+OUT = os.path.join(FIX, "combined")
+os.makedirs(OUT, exist_ok=True)
+
+# Which 2023 collisions become which year. The ORDER of this list is the order rows are
+# written, so years are mixed together the way they are in DfT's real combined file.
+PLAN = [("20231700H1872", 2019), ("20231700H1732", 2005), ("20231700H1932", 2020),
+        ("20231700H1822", 2005), ("20231700H1882", 2019), ("2023170H10013", 2020),
+        ("20231700H1862", 2005), ("2023170H10023", 2020)]
+# DfT's current files use these names; the 2023 fixture renamed them to accident_*.
+RENAME = {"accident_index": "collision_index", "accident_year": "collision_year",
+          "accident_reference": "collision_ref_no"}
+# Fields DfT did not collect in 2005 (blank or -1 for that year in DfT's real data).
+NOT_COLLECTED_2005 = {"driver_imd_decile", "lsoa_of_driver", "journey_purpose_of_driver",
+                      "casualty_imd_decile"}
+
+for ftype in ("collision", "vehicle", "casualty"):
+    with open(os.path.join(FIX, f"dft-road-casualty-statistics-{ftype}-2023.csv"), newline="") as f:
+        rows = list(csv.reader(f))
+    header = [RENAME.get(c, c) for c in rows[0]]
+    col = {name: i for i, name in enumerate(header)}
+    by_index = {}
+    for r in rows[1:]:
+        by_index.setdefault(r[col["collision_index"]], []).append(r)
+    out = [",".join(header)]
+    for old_index, year in PLAN:
+        for r in by_index[old_index]:
+            r = list(r)
+            r[col["collision_index"]] = str(year) + old_index[4:]
+            r[col["collision_year"]] = str(year)
+            if ftype == "collision":
+                d = datetime.datetime.strptime(r[col["date"]], "%d/%m/%Y").date().replace(year=year)
+                r[col["date"]] = d.strftime("%d/%m/%Y")
+                r[col["day_of_week"]] = str(d.isoweekday() % 7 + 1)   # DfT: 1 = Sunday
+            if year == 2005:
+                for name in NOT_COLLECTED_2005 & set(col):
+                    r[col[name]] = "-1"
+            out.append(",".join(r))
+    name = f"dft-road-casualty-statistics-{ftype}-1979-latest-published-year.csv"
+    with open(os.path.join(OUT, name), "w", newline="") as f:
+        f.write("\n".join(out) + "\n")
+    print(name, len(out) - 1, "rows")
 ```

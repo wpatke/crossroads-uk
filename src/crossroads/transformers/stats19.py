@@ -17,6 +17,7 @@ import csv
 import os
 import urllib.error
 import warnings
+from datetime import date
 
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
@@ -24,13 +25,38 @@ from crossroads.quality import (
     load_csv_bronze_with_quarantine,
 )
 from crossroads.sql import sql_str
-from crossroads.net import download_to_file
+from crossroads.net import download_to_file, url_exists
 
-# DfT publishes per-year CSVs under this base. The per-year filename template is
-# code-controlled; live filenames were verified at implementation time (2020-2024
-# are published individually; earlier years are not).
+# DfT publishes its STATS19 CSVs under this base. Every file name below is
+# code-controlled. DfT's page listing them: ROAD_SAFETY_PAGE.
 DFT_BASE_URL = "https://data.dft.gov.uk/road-accidents-safety-data"
+ROAD_SAFETY_PAGE = "https://www.gov.uk/government/statistics/road-safety-data"
+
+# The per-year cache file name the rest of the pipeline reads. It is also DfT's
+# single-year file name.
 _FILE_TEMPLATE = "dft-road-casualty-statistics-{ftype}-{year}.csv"
+
+# DfT's first year of STATS19 data. The wizard's year prompt uses this too.
+EARLIEST_YEAR = 1979
+
+# DfT publishes only its most recent years (2021-2025 when checked in November 2026) as
+# single-year files. Every year, including those, is also in one large combined file per
+# type. The single-year window moves forward each year, so the code never hard-codes which
+# years have single-year files: it tries the single-year file and falls back on a 404.
+_COMBINED_TEMPLATE = "dft-road-casualty-statistics-{ftype}-1979-latest-published-year.csv"
+
+# The three file types, in the order they are fetched. Collision comes first so that a
+# problem with a year is found before the two larger vehicle/casualty downloads start.
+_FILE_TYPES = ("collision", "vehicle", "casualty")
+
+# Column that says which year a combined-file row belongs to. DfT's current files call it
+# collision_year; older DfT files called it accident_year. Both are accepted. It is the
+# only year field in all three files, so a vehicle or casualty row always lands in the
+# same year's file as its collision.
+_YEAR_COLUMNS = ("collision_year", "accident_year")
+
+# How many years back from today to look for DfT's newest single-year file.
+_NEWEST_YEAR_SEARCH = 3
 
 # Missing/out-of-range coordinate sentinels (spec §9). A coordinate equal to any of
 # these — or blank / non-numeric — is treated as missing: typed value NULL, geom NULL,
@@ -130,13 +156,17 @@ class Stats19Transformer(BaseTransformer):
     def _fetch(self, url, dest):
         """Download `url` to `dest` safely, validating before it reaches the cache.
 
+        Returns True when the file was downloaded, or False when DfT answered 404 (no such
+        file). The caller decides what a missing file means: for a single-year file it is
+        normal (older years are only in the combined file).
+
         download_to_file streams to a temporary sibling ('<dest>.part') with a socket
         timeout (a stalled endpoint fails fast, never hangs), runs the CSV content check,
-        then atomically moves the file into place. A missing year (HTTP 404) or any other
-        HTTP error becomes a researcher-friendly ValueError; a non-CSV body (e.g. an error
-        page returned as 200 OK) is rejected by the validator. In every failure case the
-        partial file is removed, so a bad response can never poison the cache for a later
-        run (extract() skips re-downloading any file that already exists).
+        then atomically moves the file into place. Any other HTTP error becomes a
+        researcher-friendly ValueError; a non-CSV body (e.g. an error page returned as
+        200 OK) is rejected by the validator. In every failure case the partial file is
+        removed, so a bad response can never poison the cache for a later run (extract()
+        skips re-downloading any file that already exists).
         """
         def _validate(tmp):
             # Validate the bytes we actually got, not just the HTTP status.
@@ -149,24 +179,186 @@ class Stats19Transformer(BaseTransformer):
             download_to_file(url, dest, validator=_validate)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                raise ValueError(
-                    f"No STATS19 data found at {url} (HTTP 404). DfT usually publishes a "
-                    f"year's data partway through the following year, so this year may not "
-                    f"be available yet -- try an earlier year."
-                ) from exc
+                return False
             raise ValueError(f"Failed to download {url} (HTTP {exc.code}).") from exc
+        return True
 
     def extract(self, cache_dir, **kwargs):
         os.makedirs(cache_dir, exist_ok=True)
         self._years = [int(y) for y in (kwargs.get("years") or [])]
         self._boundary_mode = kwargs.get("boundary_mode", "snapshot")
-        for year in self._years:
-            for ftype in ("collision", "vehicle", "casualty"):
+
+        # 1. A year before DfT's first year can never be built. Say so before any download.
+        too_early = [y for y in self._years if y < EARLIEST_YEAR]
+        if too_early:
+            raise ValueError(
+                f"STATS19 data starts in {EARLIEST_YEAR}, so "
+                f"{', '.join(str(y) for y in too_early)} cannot be built. Choose years from "
+                f"{EARLIEST_YEAR} onwards.")
+
+        # 2. Try each year's single-year file. A 404 is normal for an older year: note it,
+        #    and take that year from DfT's combined file below.
+        needs_combined = {ftype: [] for ftype in _FILE_TYPES}
+        for ftype in _FILE_TYPES:
+            for year in self._years:
                 path = os.path.join(cache_dir, self._filename(ftype, year))
-                # Offline-friendly: if already cached (or test-seeded), skip download.
-                if not os.path.exists(path):
-                    url = f"{DFT_BASE_URL}/{self._filename(ftype, year)}"
-                    self._fetch(url, path)   # validates + atomic-moves; raises ValueError if unavailable
+                if os.path.exists(path):
+                    continue      # already cached (or test-seeded): no download needed
+                url = f"{DFT_BASE_URL}/{self._filename(ftype, year)}"
+                if not self._fetch(url, path):
+                    needs_combined[ftype].append(year)
+
+        missing_years = sorted({y for years in needs_combined.values() for y in years})
+        if not missing_years:
+            return
+
+        # 3. Before any large download, check that no missing year is simply too recent.
+        #    (If the newest year can't be found, the combined file's contents decide.)
+        newest = self._newest_published_year()
+        if newest is not None:
+            too_recent = [y for y in missing_years if y > newest]
+            if too_recent:
+                raise ValueError(
+                    f"STATS19 data for {', '.join(str(y) for y in too_recent)} has not been "
+                    f"published yet: DfT's newest published year is {newest}. DfT usually "
+                    f"publishes a year's data partway through the following year.")
+
+        # 4. Every other missing year comes from DfT's combined file: downloaded once into
+        #    the cache, then split into the per-year files the rest of the pipeline reads.
+        for ftype in _FILE_TYPES:
+            if needs_combined[ftype]:
+                combined_path = self._combined_file(cache_dir, ftype)
+                self._split_combined(combined_path, ftype, needs_combined[ftype], cache_dir)
+
+    def _newest_published_year(self):
+        """DfT's newest year that has a single-year collision file, or None if not found.
+
+        DfT always publishes its newest years as single-year files, so counting down from
+        the current calendar year finds the newest published year in one or two checks.
+        Returns None if none of the last few years exist (for example, if DfT renamed its
+        files). Then the combined file's own contents decide instead (see _split_combined).
+        """
+        this_year = date.today().year
+        for year in range(this_year, this_year - _NEWEST_YEAR_SEARCH, -1):
+            if url_exists(f"{DFT_BASE_URL}/{self._filename('collision', year)}"):
+                return year
+        return None
+
+    def _combined_file(self, cache_dir, ftype):
+        """Path to DfT's combined 1979-onwards file for `ftype`, downloaded once if it is
+        not already cached. These files are large (about 1-2 GB each), so _fetch streams
+        them to disk; they are never read into memory."""
+        name = _COMBINED_TEMPLATE.format(ftype=ftype)
+        path = os.path.join(cache_dir, name)
+        if not os.path.exists(path):
+            url = f"{DFT_BASE_URL}/{name}"
+            if not self._fetch(url, path):
+                raise ValueError(
+                    f"DfT's combined STATS19 file was not found at {url} (HTTP 404). DfT may "
+                    f"have renamed or moved it; see {ROAD_SAFETY_PAGE}.")
+        return path
+
+    def _year_column_index(self, header, path):
+        """Position of the year column (_YEAR_COLUMNS) in a combined file's header row."""
+        # Strip a possible byte-order mark and spaces, and ignore case, for this lookup only.
+        names = [name.lstrip("﻿").strip().lower() for name in (header or [])]
+        for year_column in _YEAR_COLUMNS:
+            if year_column in names:
+                return names.index(year_column)
+        raise ValueError(
+            f"{path} has no collision_year or accident_year column, so it cannot be split "
+            f"by year. DfT may have changed the file's format.")
+
+    def _split_combined(self, combined_path, ftype, years, cache_dir):
+        """Copy the requested years' rows out of DfT's combined file into per-year files.
+
+        Writes dft-road-casualty-statistics-{ftype}-{year}.csv for each year in `years`:
+        the combined file's header line, then every record whose year column equals that
+        year, in file order. Each record's ORIGINAL text is copied character for character.
+        csv.reader is used only to find where each record ends and which year it is from,
+        so quoting, blank cells and line endings stay exactly as DfT wrote them, and the
+        independent row count (_count_source_rows) sees exactly DfT's records.
+
+        Streaming: one record in memory at a time, and one pass over the file however many
+        years are wanted (rows are mixed by year, not grouped).
+
+        All-or-nothing: output goes to '.part' files, moved into place only after the whole
+        combined file has been read and every requested year has rows. On any error every
+        '.part' file is deleted, so the cache never holds a half-written year.
+        """
+        wanted = {str(y): os.path.join(cache_dir, self._filename(ftype, y)) for y in years}
+        outputs = {}    # year (as text) -> its open '.part' file, opened at its first row
+        try:
+            # newline="" keeps "\r\n" vs "\n" exactly as written. surrogateescape lets any
+            # byte that is not valid UTF-8 pass through unchanged instead of failing.
+            with open(combined_path, "r", encoding="utf-8", errors="surrogateescape",
+                      newline="") as src:
+                # csv.reader asks for one line at a time and stops as soon as a record is
+                # complete (it never reads ahead). So if we remember each line we hand it,
+                # `consumed` holds exactly the current record's original text, even when a
+                # quoted value contains a line break and the record spans several lines.
+                consumed = []
+
+                def lines():
+                    for line in src:
+                        consumed.append(line)
+                        yield line
+
+                reader = csv.reader(lines())
+                header = next(reader, None)
+                header_text = "".join(consumed)
+                consumed.clear()
+                year_index = self._year_column_index(header, combined_path)
+                # The line ending DfT used, so a record without one can be finished with it.
+                ending = "\r\n" if header_text.endswith("\r\n") else "\n"
+                if not header_text.endswith("\n"):
+                    header_text += ending
+
+                for row in reader:
+                    record = "".join(consumed)
+                    consumed.clear()
+                    if not row:
+                        continue          # a blank line holds no data
+                    if len(row) <= year_index:
+                        # Never drop a row silently: a row too short to have a year cannot
+                        # be put in any year's file.
+                        raise ValueError(
+                            f"{combined_path} has a record with no year value (ending at "
+                            f"line {reader.line_num}), so it cannot be split by year. The "
+                            f"file may be damaged: delete it to download a fresh copy.")
+                    year = row[year_index].strip()
+                    if year not in wanted:
+                        continue
+                    if year not in outputs:
+                        outputs[year] = open(wanted[year] + ".part", "w", encoding="utf-8",
+                                             errors="surrogateescape", newline="")
+                        outputs[year].write(header_text)
+                    # Only the very last record of a file can lack a line ending. Add DfT's
+                    # own ending so two records can never run together in the output.
+                    if not record.endswith("\n"):
+                        record += ending
+                    outputs[year].write(record)
+
+            for fh in outputs.values():
+                fh.close()
+            missing = sorted((y for y in wanted if y not in outputs), key=int)
+            if missing:
+                raise ValueError(
+                    f"DfT's combined {ftype} file has no rows for {', '.join(missing)}, so "
+                    f"{'it' if len(missing) == 1 else 'they'} cannot be built. The cached "
+                    f"file may be out of date: delete {combined_path} to download a fresh "
+                    f"copy.")
+            # Every year is complete: move each one into place.
+            for path in wanted.values():
+                os.replace(path + ".part", path)
+        except BaseException:
+            # Something went wrong (or the run was interrupted): leave nothing half-written.
+            for year, fh in outputs.items():
+                fh.close()
+                part = wanted[year] + ".part"
+                if os.path.exists(part):
+                    os.remove(part)
+            raise
 
     def _cached_files(self, cache_dir, ftype):
         """Cached CSV paths for one file type across the resolved years (existing only)."""

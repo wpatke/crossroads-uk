@@ -11,6 +11,7 @@ import os
 from datetime import date
 
 from crossroads import init_engine  # used by run_build below
+from crossroads.transformers.stats19 import EARLIEST_YEAR
 
 # One-line, non-blocking pointer shown before the build. Crossroads does not gate on
 # data licences (see docs/data-sources.md for why); it only reminds the user they exist.
@@ -148,7 +149,15 @@ def prompt_datasets(reader, writer, available):
                    "Datasets (e.g. 1 or 1-3, 5)", parse=parse, default=None)
 
 
-_EARLIEST_STATS19_YEAR = 1979
+# Shared with the STATS19 transformer, so the wizard and the downloader always agree.
+_EARLIEST_STATS19_YEAR = EARLIEST_YEAR
+
+# DfT keeps about its five most recent years as single-year files; older years come from
+# its combined 1979-onwards files, a one-time download of about 4.3 GB in total (measured
+# November 2026; the files grow by roughly 0.1 GB a year). Used only for the build-summary
+# note below, so being a year out is harmless: the note says "may".
+_SINGLE_YEAR_WINDOW = 5
+_COMBINED_DOWNLOAD_SIZE = "about 4.3 GB"
 
 
 def _parse_one_year(token, latest):
@@ -296,13 +305,23 @@ def format_summary(params):
     """Human-readable recap of the gathered parameters, shown before confirmation."""
     years = ", ".join(str(y) for y in params["years"])
     datasets = ", ".join(params["datasets"])
-    return (
+    summary = (
         "\nBuild summary:\n"
         f"  Database file : {params['database_path']}\n"
         f"  Datasets      : {datasets}\n"
         f"  Years         : {years}\n"
         f"  Boundary mode : {params['boundary_mode']}\n"
     )
+    # Warn about the large one-time STATS19 download BEFORE the user confirms the build,
+    # so they can still say no. The cutoff moves forward by itself each year.
+    cutoff = date.today().year - _SINGLE_YEAR_WINDOW
+    if "stats19" in params["datasets"] and any(y < cutoff for y in params["years"]):
+        summary += (
+            f"  Note          : years before {cutoff} may need a one-time download of "
+            f"{_COMBINED_DOWNLOAD_SIZE}\n"
+            f"                  from DfT (later builds reuse it from the cache).\n"
+        )
+    return summary
 
 
 def run_build(params, *, engine_factory=init_engine, cache_dir=None, writer=None):

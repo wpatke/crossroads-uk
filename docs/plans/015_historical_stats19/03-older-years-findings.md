@@ -144,3 +144,48 @@ combined files: `years=[1979, 2000, 2010]`, `datasets=["stats19"]`. This downloa
 - the real geom, datetime and link reject rates for each year;
 - that the per-year row counts equal the scan's counts above (1979: 254,967 collisions;
   2000: 233,729; 2010: 154,414).
+
+### Results (run 2026-11-15)
+
+The build of `years=[1979, 2000, 2010]`, `datasets=["stats19"]` (boundaries included,
+snapshot mode) **completed in about 6 minutes, including the download**. Every invariant
+passed and nothing was quarantined. Row counts match the scan exactly:
+
+| Year | Collisions | Vehicles | Casualties | geom rejects | datetime rejects | severity rejects | Orphan vehicles / casualties |
+|---|---|---|---|---|---|---|---|
+| 1979 | 254,967 | 422,983 | 334,513 | 0.57% | 0% | 0% | 0 / 0 |
+| 2000 | 233,729 | 429,943 | 320,283 | 0.38% | 0% | 0% | 0 / 0 |
+| 2010 | 154,414 | 281,401 | 208,648 | 0% | 0% | 0% | 0 / 0 |
+
+### New finding: unreliable coordinates in 1979–1988
+
+In 1979, **19.9% of collisions got no `lad_code`**, against 0.5% in 2000 and 0.08% in 2010.
+The cause is DfT's coordinates, not the split. Some police forces' early grid references are
+simply wrong. For example, about 45% of 1979 Metropolitan Police collisions (force 1) have
+points far from London, such as (206980, 476000). All of Strathclyde's (force 97) 1979
+points miss every boundary. Some eastings are as large as 999,980, beyond Great Britain's
+grid (maximum 700,000).
+
+These points pass the `geom` check because they are real numbers, not the `-1`/`0`/blank
+sentinels. So they count as valid geometry, but they fall in the sea or outside Great
+Britain, and therefore get no `lad_code` (and no weather, solar or bank-holiday value that
+depends on it). A wrong point that happens to land inside some *other* local authority would
+be stamped with the wrong area, and this cannot be detected here.
+
+Share of collisions **with usable coordinates** that fall outside every LAD (2025-12 LAD
+boundaries, all years from the combined file):
+
+| Years | Outside every LAD | Beyond the grid (E > 700,000 or N > 1,300,000) |
+|---|---|---|
+| 1979 | 19.4% | 1.92% |
+| 1980–1981 | 13.5–13.8% | 0.2–0.3% |
+| 1982–1985, 1987–1988 | 3.7–4.6% | ≤ 0.2% |
+| 1986 | 11.3% | 0.01% |
+| 1989–1998 | 0.2–0.3% | ≤ 0.02% |
+| 1999–2025 | 0.08–0.16% | 0% |
+
+This is documented in `docs/data-sources.md` ("Older years"). **Not changed here:** treating
+off-grid points as invalid geometry would change ingestion behaviour, so it is a separate
+decision. If adopted, the existing `BNG_MIN_*`/`BNG_MAX_*` constants in `stats19.py` give
+the bounds, and the 1979 geom reject rate would rise to about 2.5%, still under the 5%
+ceiling.

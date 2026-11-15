@@ -43,6 +43,18 @@ release was tested against are listed in [docs/methodology.md](docs/methodology.
   sheet gives `33`, and the codebook script corrects it (see
   [src/crossroads/reference/README.md](src/crossroads/reference/README.md)).
 - Database `schema_version` 4 → 5 (additive: the two columns above).
+- The wizard's build summary now warns when the chosen years may need DfT's one-time
+  4.3 GB download, before you confirm the build.
+
+### Fixed
+- **STATS19 builds for any year before 2021 failed** with an HTTP 404. DfT now publishes
+  single-year files only for its most recent years (2021–2025 at the time of writing).
+  Older years are only in its combined 1979-onwards files. Crossroads now falls back to
+  those files: it downloads each one once into the cache (about 4.3 GB in total) and splits
+  out the requested years, copying DfT's rows unchanged. Every year from 1979 can now be
+  built. The tables and columns this produces are unchanged.
+- The "not published yet" error now appears only for a year newer than DfT's newest
+  published year, and names that year. A year before 1979 gets its own clear message.
 
 ## [1.0.5] - 2026-11-01
 

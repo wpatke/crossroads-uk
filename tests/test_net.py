@@ -72,3 +72,33 @@ def test_download_to_file_validator_passes_and_promotes(tmp_path, monkeypatch):
     net.download_to_file("http://example/x", dest, validator=_ok)
     assert open(dest, "rb").read() == b"good data"
     assert seen["path"] == dest + ".part"
+
+
+# --- url_exists: a cheap "is this file published?" check --------------------
+
+class _Response(io.BytesIO):
+    """A fake response whose body must never be read by url_exists."""
+    def read(self, *a):
+        raise AssertionError("url_exists must not read the response body")
+
+
+def _raise_http(code):
+    def fake(url, timeout=None):
+        raise net.urllib.error.HTTPError(url, code, "error", {}, None)
+    return fake
+
+
+def test_url_exists_true_on_200_without_reading_body(monkeypatch):
+    monkeypatch.setattr(net.urllib.request, "urlopen", lambda url, timeout=None: _Response())
+    assert net.url_exists("http://example/x") is True
+
+
+def test_url_exists_false_on_404(monkeypatch):
+    monkeypatch.setattr(net.urllib.request, "urlopen", _raise_http(404))
+    assert net.url_exists("http://example/x") is False
+
+
+def test_url_exists_raises_other_errors(monkeypatch):
+    monkeypatch.setattr(net.urllib.request, "urlopen", _raise_http(500))
+    with pytest.raises(net.urllib.error.HTTPError):
+        net.url_exists("http://example/x")
