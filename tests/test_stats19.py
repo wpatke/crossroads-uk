@@ -51,7 +51,7 @@ def _empty_reference_stubs(con):
     (leaving only the bespoke columns a test targets). Real builds load populated tables
     first; these bespoke-focused unit tests don't exercise the broad clean."""
     con.execute("CREATE TABLE IF NOT EXISTS codebook"
-                "(variable VARCHAR, code VARCHAR, label VARCHAR, is_missing BOOLEAN)")
+                "(tbl VARCHAR, variable VARCHAR, code VARCHAR, label VARCHAR, is_missing BOOLEAN)")
     con.execute("CREATE TABLE IF NOT EXISTS column_manifest"
                 "(tbl VARCHAR, col VARCHAR, kind VARCHAR, dtype VARCHAR)")
 
@@ -574,10 +574,37 @@ def test_reference_tables_load(con):
         assert {"1", "2", "3"} <= codes
         assert con.execute(
             "SELECT count(*) FROM codebook WHERE variable=? AND is_missing", [v]).fetchone()[0] == 0
-    # Unique on (variable, code); is_missing is a real BOOLEAN.
+    # Unique on (tbl, variable, code); is_missing is a real BOOLEAN.
     assert con.execute(
-        "SELECT count(*)-count(DISTINCT (variable||'\x1f'||code)) FROM codebook").fetchone()[0] == 0
+        "SELECT count(*)-count(DISTINCT (tbl||'\x1f'||variable||'\x1f'||code)) FROM codebook"
+    ).fetchone()[0] == 0
     assert {r[0]: r[1] for r in con.execute("DESCRIBE codebook").fetchall()}["is_missing"] == "BOOLEAN"
+    # Every row names its source file.
+    assert {r[0] for r in con.execute("SELECT DISTINCT tbl FROM codebook").fetchall()} == {
+        "collision", "vehicle", "casualty"}
+
+
+def test_codebook_2025_guide_codes(con):
+    """Codes first defined in the 2025 edition of DfT's guide are in the codebook, each
+    for the right file. These codes are in use in real data (junction_detail 19 in every
+    year; code 33 for e-scooters from the 2024 specification on), so without them the
+    labels would be blank."""
+    Stats19Transformer()._load_codebook(con)
+
+    def label(tbl, variable, code):
+        row = con.execute("SELECT label FROM codebook WHERE tbl=? AND variable=? AND code=?",
+                          [tbl, variable, code]).fetchone()
+        return row[0] if row else None
+
+    assert label("collision", "junction_detail", "19") == "Other junction"
+    assert label("vehicle", "vehicle_type", "33") == "Personal powered transporter"
+    # The guide's code-list sheet prints this as a second 23; the codebook script
+    # corrects it to 33 (see GUIDE_CORRECTIONS). 23 keeps its one real label.
+    assert label("casualty", "casualty_type", "33") == "Personal Powered Transporter"
+    assert label("casualty", "casualty_type", "23") == "Electric motorcycle rider or passenger"
+    # escooter_flag is in both files, with each file's own wording.
+    assert label("vehicle", "escooter_flag", "1") == "Vehicle was an e-scooter"
+    assert label("casualty", "escooter_flag", "1") == "Casualty was using an e-scooter"
 
 
 def test_column_manifest_covers_every_fixture_column(con):
@@ -593,14 +620,15 @@ def test_column_manifest_covers_every_fixture_column(con):
     kinds = {r[0] for r in con.execute(
         "SELECT DISTINCT kind FROM column_manifest").fetchall()}
     assert kinds <= {"identity", "geo", "datetime", "coded", "numeric", "text"}, f"bad kinds {kinds}"
-    # Verified size + breakdown for the committed (2024) manifest.
-    assert con.execute("SELECT count(*) FROM column_manifest").fetchone()[0] == 99
+    # Verified size + breakdown for the committed manifest.
+    assert con.execute("SELECT count(*) FROM column_manifest").fetchone()[0] == 100
     by_kind = {r[0]: r[1] for r in con.execute(
         "SELECT kind, count(*) FROM column_manifest GROUP BY kind").fetchall()}
     # longitude/latitude are numeric (DOUBLE), not geo — they carry real coordinate numbers
     # into silver (Stage 06 keep-in-place), so geo is 2 (OSGR easting/northing). speed_limit is
-    # numeric (a literal mph quantity, not a labelled code list), so coded is 59 and numeric 17.
-    assert by_kind == {"identity": 12, "geo": 2, "datetime": 2, "coded": 59, "numeric": 17, "text": 7}
+    # numeric (a literal mph quantity, not a labelled code list), so coded is 60 and numeric 17.
+    # (escooter_flag is coded in both the vehicle and casualty files.)
+    assert by_kind == {"identity": 12, "geo": 2, "datetime": 2, "coded": 60, "numeric": 17, "text": 7}
     # coded/numeric carry a dtype; identity/geo/datetime/text do not.
     assert con.execute("SELECT count(*) FROM column_manifest "
                        "WHERE kind IN ('coded','numeric') AND (dtype IS NULL OR dtype='')"
@@ -628,8 +656,8 @@ def test_collision_broad_clean_keeps_codes_nulls_missing(con):
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
     con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
-        "  ('road_type','6','Single carriageway',FALSE),('road_type','-1','Data missing or out of range',TRUE),"
-        "  ('road_type','9','Unknown',TRUE)) AS t(variable,code,label,is_missing)")
+        "  ('collision','road_type','6','Single carriageway',FALSE),('collision','road_type','-1','Data missing or out of range',TRUE),"
+        "  ('collision','road_type','9','Unknown',TRUE)) AS t(tbl,variable,code,label,is_missing)")
     con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
         "  ('collision','road_type','coded','INTEGER'),"
         "  ('collision','number_of_vehicles','numeric','INTEGER'),"
@@ -665,8 +693,8 @@ def test_casualty_broad_clean(con):
     from crossroads.quality import ensure_quality_tables
     ensure_quality_tables(con)
     con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
-        "  ('sex_of_casualty','1','Male',FALSE),"
-        "  ('sex_of_casualty','-1','Data missing or out of range',TRUE)) AS t(variable,code,label,is_missing)")
+        "  ('casualty','sex_of_casualty','1','Male',FALSE),"
+        "  ('casualty','sex_of_casualty','-1','Data missing or out of range',TRUE)) AS t(tbl,variable,code,label,is_missing)")
     con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
         "  ('casualty','sex_of_casualty','coded','INTEGER'),"
         "  ('casualty','age_of_casualty','numeric','INTEGER')) AS t(tbl,col,kind,dtype)")
@@ -732,9 +760,9 @@ def test_collision_severity_core_audit(con):
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
     con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
-        "  ('collision_severity','1','Fatal',FALSE),('collision_severity','2','Serious',FALSE),"
-        "  ('collision_severity','3','Slight',FALSE),('collision_severity','-1','Data missing or out of range',TRUE),"
-        "  ('collision_severity','9','Unknown',TRUE)) AS t(variable,code,label,is_missing)")
+        "  ('collision','collision_severity','1','Fatal',FALSE),('collision','collision_severity','2','Serious',FALSE),"
+        "  ('collision','collision_severity','3','Slight',FALSE),('collision','collision_severity','-1','Data missing or out of range',TRUE),"
+        "  ('collision','collision_severity','9','Unknown',TRUE)) AS t(tbl,variable,code,label,is_missing)")
     con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
         "  ('collision','collision_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
     con.execute("CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
@@ -771,8 +799,8 @@ def test_collision_severity_guards_bare_minus_one_without_codebook(con):
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
     con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
-        "  ('collision_severity','1','Fatal',FALSE),('collision_severity','2','Serious',FALSE),"
-        "  ('collision_severity','3','Slight',FALSE)) AS t(variable,code,label,is_missing)")
+        "  ('collision','collision_severity','1','Fatal',FALSE),('collision','collision_severity','2','Serious',FALSE),"
+        "  ('collision','collision_severity','3','Slight',FALSE)) AS t(tbl,variable,code,label,is_missing)")
     con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
         "  ('collision','collision_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
     con.execute("CREATE TABLE stats19_collision_raw AS SELECT * FROM (VALUES "
@@ -798,8 +826,8 @@ def test_collision_severity_reads_legacy_accident_severity(con):
     con.execute("INSTALL spatial"); con.execute("LOAD spatial")
     ensure_quality_tables(con)
     con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
-        "  ('collision_severity','1','Fatal',FALSE),('collision_severity','2','Serious',FALSE),"
-        "  ('collision_severity','3','Slight',FALSE)) AS t(variable,code,label,is_missing)")
+        "  ('collision','collision_severity','1','Fatal',FALSE),('collision','collision_severity','2','Serious',FALSE),"
+        "  ('collision','collision_severity','3','Slight',FALSE)) AS t(tbl,variable,code,label,is_missing)")
     con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
         "  ('collision','collision_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
     # Bronze carries accident_severity (legacy name), NOT collision_severity.
@@ -820,9 +848,9 @@ def test_casualty_severity_core_audit(con):
     from crossroads.quality import ensure_quality_tables
     ensure_quality_tables(con)
     con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
-        "  ('casualty_severity','1','Fatal',FALSE),('casualty_severity','2','Serious',FALSE),"
-        "  ('casualty_severity','3','Slight',FALSE),('casualty_severity','-1','Data missing or out of range',TRUE)"
-        ") AS t(variable,code,label,is_missing)")
+        "  ('casualty','casualty_severity','1','Fatal',FALSE),('casualty','casualty_severity','2','Serious',FALSE),"
+        "  ('casualty','casualty_severity','3','Slight',FALSE),('casualty','casualty_severity','-1','Data missing or out of range',TRUE)"
+        ") AS t(tbl,variable,code,label,is_missing)")
     con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
         "  ('casualty','casualty_severity','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
     con.execute("CREATE TABLE collisions AS SELECT * FROM (VALUES ('x1')) AS t(accident_index)")
@@ -924,9 +952,9 @@ def test_completeness_report_end_to_end(tmp_path):
 def test_labelled_view_decodes_and_never_stores(con):
     t = Stats19Transformer()
     con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
-        "  ('casualty_severity','1','Fatal',FALSE),('casualty_severity','2','Serious',FALSE),"
-        "  ('casualty_severity','-1','Data missing or out of range',TRUE),"
-        "  ('sex_of_casualty','1','Male',FALSE)) AS t(variable,code,label,is_missing)")
+        "  ('casualty','casualty_severity','1','Fatal',FALSE),('casualty','casualty_severity','2','Serious',FALSE),"
+        "  ('casualty','casualty_severity','-1','Data missing or out of range',TRUE),"
+        "  ('casualty','sex_of_casualty','1','Male',FALSE)) AS t(tbl,variable,code,label,is_missing)")
     con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
         "  ('casualty','casualty_severity','coded','INTEGER'),"
         "  ('casualty','sex_of_casualty','coded','INTEGER'),"
@@ -984,14 +1012,47 @@ def test_labelled_views_end_to_end(tmp_path):
             if c.lower() in silver_cols]
         for c in coded:
             covered = client.con.execute(
-                "SELECT count(*) FROM codebook WHERE variable = ?", [c]).fetchone()[0] > 0
+                "SELECT count(*) FROM codebook WHERE tbl = ? AND variable = ?",
+                [kind, c]).fetchone()[0] > 0
             if not covered:
                 continue                 # dictionary has nothing for this column yet -> blanks expected
             undecoded = client.con.execute(
                 f"SELECT count(*) FROM {view} "
                 f"WHERE {c} IS NOT NULL AND {c}_label IS NULL").fetchone()[0]
             assert undecoded == 0, f"{view}.{c} has {undecoded} undecoded codes"
+    # The fixture's one e-scooter collision (20231700H1932): its vehicle and casualty are
+    # code 33, and the casualty's escooter_flag reaches silver with the casualty wording.
+    veh = client.con.execute(
+        "SELECT vehicle_type, vehicle_type_label, escooter_flag_label FROM vehicles_labelled "
+        "WHERE accident_index = '20231700H1932' AND vehicle_reference = '2'").fetchone()
+    assert veh == (33, "Personal powered transporter", "Vehicle was an e-scooter")
+    cas = client.con.execute(
+        "SELECT casualty_type, casualty_type_label, escooter_flag, escooter_flag_label "
+        "FROM casualties_labelled WHERE accident_index = '20231700H1932'").fetchone()
+    assert cas == (33, "Personal Powered Transporter", 1, "Casualty was using an e-scooter")
     client.close()
+
+
+def test_labelled_view_matches_on_table(con):
+    """A column name in two files (escooter_flag) gets each file's own label, and the
+    join stays 1:1 (no duplicate rows from the other file's codebook rows)."""
+    t = Stats19Transformer()
+    con.execute("CREATE TABLE codebook AS SELECT * FROM (VALUES "
+        "  ('vehicle','escooter_flag','1','Vehicle was an e-scooter',FALSE),"
+        "  ('casualty','escooter_flag','1','Casualty was using an e-scooter',FALSE)"
+        ") AS t(tbl,variable,code,label,is_missing)")
+    con.execute("CREATE TABLE column_manifest AS SELECT * FROM (VALUES "
+        "  ('vehicle','escooter_flag','coded','INTEGER'),"
+        "  ('casualty','escooter_flag','coded','INTEGER')) AS t(tbl,col,kind,dtype)")
+    con.execute("CREATE TABLE vehicles AS SELECT * FROM (VALUES ('v1', 1)) "
+                "AS t(source_row_key, escooter_flag)")
+    con.execute("CREATE TABLE casualties AS SELECT * FROM (VALUES ('k1', 1)) "
+                "AS t(source_row_key, escooter_flag)")
+    t._create_labelled_views(con)
+    assert con.execute("SELECT escooter_flag_label FROM vehicles_labelled").fetchall() == [
+        ("Vehicle was an e-scooter",)]
+    assert con.execute("SELECT escooter_flag_label FROM casualties_labelled").fetchall() == [
+        ("Casualty was using an e-scooter",)]
 
 
 # --- Weather stamping (Stage 03) ---------------------------------------------

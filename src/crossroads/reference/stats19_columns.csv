@@ -98,3 +98,4 @@ casualty,casualty_injury_based,coded,INTEGER
 casualty,casualty_adjusted_severity_serious,numeric,DOUBLE
 casualty,casualty_adjusted_severity_slight,numeric,DOUBLE
 casualty,casualty_distance_banding,coded,INTEGER
+casualty,escooter_flag,coded,INTEGER

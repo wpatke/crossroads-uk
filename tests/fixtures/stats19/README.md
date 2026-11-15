@@ -47,33 +47,44 @@ these fixtures.
 4. Renamed the three identity columns as described above and wrote each table back
    out as CSV with the original headers otherwise untouched.
 
+## Re-cut from DfT's autumn 2026 re-issue (2026-11-14)
+
+DfT re-issued its 2023 files in autumn 2026 under the same file names. The fixtures
+were re-cut from that re-issue (downloaded 31 October 2026), keeping **exactly the
+same 8 collisions, 17 vehicles and 12 casualties**. What changed:
+
+- The casualty file gained an `escooter_flag` column (its last column).
+- The e-scooter in collision `20231700H1932` is now `vehicle_type` 33 and
+  `casualty_type` 33 ("Personal powered transporter" in DfT's 2025 Data Guide).
+  The earlier copy coded both as `-1`.
+- The severity-adjustment weights (`*_adjusted_severity_serious`/`_slight`) were
+  revised by DfT: 6 collisions and 10 casualties.
+
+Nothing else changed. The selection in step 2 still picks the same 8 collisions
+from the re-issued files, but the recipe below uses the fixed list instead, and
+sorts the rows, so a re-cut always gives the same rows in the same order.
+
 Reproduction recipe (`SRC` = a scratch dir holding the three real downloaded files):
 
 ```python
 import duckdb
-c = duckdb.connect(); c.execute("INSTALL spatial"); c.execute("LOAD spatial")
 SRC, OUT = "/scratch", "tests/fixtures/stats19"
-LAD_FIXTURE = "tests/fixtures/ons/lad_2025/lad_sample.geojson"   # newest committed LAD vintage
-c.execute(f"CREATE TABLE lad AS SELECT geom FROM ST_Read('{LAD_FIXTURE}')")
-c.execute(f"CREATE TABLE col AS SELECT * FROM read_csv_auto('{SRC}/dft-road-casualty-statistics-collision-2023.csv', all_varchar=true)")
-c.execute(f"CREATE TABLE veh AS SELECT * FROM read_csv_auto('{SRC}/dft-road-casualty-statistics-vehicle-2023.csv', all_varchar=true)")
-c.execute(f"CREATE TABLE cas AS SELECT * FROM read_csv_auto('{SRC}/dft-road-casualty-statistics-casualty-2023.csv', all_varchar=true)")
-c.execute("""CREATE TABLE cols AS
-  SELECT col.* FROM col
-  WHERE col.location_easting_osgr NOT IN ('-1','0','')
-    AND col.location_northing_osgr NOT IN ('-1','0','')
-    AND EXISTS (SELECT 1 FROM lad
-                WHERE ST_Contains(lad.geom,
-                      ST_Point(CAST(col.location_easting_osgr AS DOUBLE),
-                               CAST(col.location_northing_osgr AS DOUBLE))))
-  ORDER BY col.collision_index LIMIT 8""")
-c.execute("CREATE TABLE vehs AS SELECT v.* FROM veh v SEMI JOIN cols USING (collision_index)")
-c.execute("CREATE TABLE cass AS SELECT k.* FROM cas k SEMI JOIN cols USING (collision_index)")
-for src, name in (("cols", "collision"), ("vehs", "vehicle"), ("cass", "casualty")):
+# The 8 fixture collisions (originally chosen as in step 2 above).
+KEEP = ["20231700H1732", "20231700H1822", "20231700H1862", "20231700H1872",
+        "20231700H1882", "20231700H1932", "2023170H10013", "2023170H10023"]
+c = duckdb.connect()
+keys = ", ".join(f"'{k}'" for k in KEEP)
+order = {"collision": "collision_index",
+         "vehicle": "collision_index, CAST(vehicle_reference AS INTEGER)",
+         "casualty": "collision_index, CAST(vehicle_reference AS INTEGER), "
+                     "CAST(casualty_reference AS INTEGER)"}
+for name, by in order.items():
     c.execute(f"""COPY (
         SELECT collision_index AS accident_index, collision_year AS accident_year,
                collision_ref_no AS accident_reference,
                * EXCLUDE (collision_index, collision_year, collision_ref_no)
-        FROM {src}
+        FROM read_csv('{SRC}/dft-road-casualty-statistics-{name}-2023.csv', all_varchar=true)
+        WHERE collision_index IN ({keys})
+        ORDER BY {by}
     ) TO '{OUT}/dft-road-casualty-statistics-{name}-2023.csv' (HEADER, DELIMITER ',')""")
 ```

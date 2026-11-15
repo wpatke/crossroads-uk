@@ -28,15 +28,17 @@ provenance of `stats19_columns.csv`. Neither script reads anything from the GPL 
 ## Provenance
 
 - **Publisher / dataset:** UK Department for Transport (DfT), *Road Safety Open Dataset*.
-- **Source of truth:** the *Road Safety Open Dataset Data Guide*, **2024 edition**, published **25 September
-  2025**. Stable download URL:
-  `https://data.dft.gov.uk/road-accidents-safety-data/dft-road-casualty-statistics-road-safety-open-dataset-data-guide-2024.xlsx`
-  (mirrored at `assets.publishing.service.gov.uk/media/691c6440e39a085bda43eed6/…-data-guide-2024.xlsx`).
+- **Source of truth:** the *Road Safety Open Dataset Data Guide*, **2025 edition** (file dated 22 September
+  2026), linked from DfT's *Road safety open data* page on gov.uk. Download URL:
+  `https://assets.publishing.service.gov.uk/media/6ab2a71d997a4b2950cced58/dft-road-casualty-statistics-road-safety-open-dataset-data-guide-2025.xlsx`
+  (SHA-256 `51b08606ef3dad1ae5d4c8726241b022fc8e4bbdc910ef0e5cc2fb92b054fc12`). The older
+  `data.dft.gov.uk/road-accidents-safety-data/…-data-guide-2024.xlsx` address now returns 404.
 - **Licence:** Open Government Licence v3.0 — the same publisher/licence as the collision/vehicle/casualty
   CSVs.
-- **Derivation date:** 2026-07-04.
-- **Format of the guide:** a single-sheet `.xlsx` (sheet `2024_code_list`, ~1820 rows) with columns
-  `table`, `field name`, `code/format`, `label`, `note`.
+- **Derivation date:** 2026-11-14 (previously 2026-07-04, from the 2024 edition).
+- **Format of the guide:** an `.xlsx` whose code list is on sheet `2024_code_list` (named after the 2024
+  STATS19 *specification*, not the guide's edition), with columns `table`, `field name`, `code/format`,
+  `label`, `note`. A second sheet, `2011_to_2024_conversion`, maps old codes to new ones.
 
 The guide is re-issued annually (~late September). These CSVs are a point-in-time transcription; a refresh is
 a deliberate, reviewed step. The offline test suite reads only these committed CSVs, so a guide change never
@@ -48,15 +50,32 @@ with this MIT project and is **not** copied or adapted. It was consulted only as
 and for the missing-value handling convention (see below); both files here are derived independently from the
 DfT guide, keeping Crossroads MIT-clean.
 
-## `stats19_codebook.csv` (`variable, code, label, is_missing`)
+## `stats19_codebook.csv` (`table, variable, code, label, is_missing`)
 
 Maps each integer STATS19 code to its DfT English label and flags missing/unknown sentinels. Derived by
 `scripts/build_stats19_codebook.py`: read the guide sheet, keep **only integer-castable codes**
 (`TRY_CAST(code AS INTEGER) IS NOT NULL`, which drops ONS string codes, format strings like `(DD/MM/YYYY)`,
-and range descriptions like `1 to 9999`), and set `is_missing`. The pinned guide URL and the `MISSING_LABELS`
-set live in that script.
+and range descriptions like `1 to 9999`), apply the known-typo corrections, and set `is_missing`. The pinned
+guide URL, the `GUIDE_CORRECTIONS` list and the `MISSING_LABELS` set live in that script.
 
-- **Committed size:** ~1130 rows across ~71 variables; unique on `(variable, code)`.
+- **Committed size:** 1135 rows across 71 variables (collision 757, vehicle 256, casualty 122); unique on
+  `(table, variable, code)`. The script stops with an error if it is not.
+- **Why `table`:** the guide lists codes per file, and one column name, `escooter_flag`, is in both the
+  vehicle and casualty files with different wording ("Vehicle was an e-scooter" / "Casualty was using an
+  e-scooter"). Loaded into the database as `codebook.tbl`, matching `column_manifest.tbl`.
+- **Codes new in the 2025 edition:** `junction_detail` 19 "Other junction" (the conversion sheet maps old
+  `junction_detail_historic` 9 to it); `vehicle_type` 33 "Personal powered transporter"; `casualty_type` 33
+  "Personal Powered Transporter"; casualty `escooter_flag` 0/1. In DfT's files these are in use from the
+  2024 specification on: in the 2023 files as re-issued in autumn 2026, every code-33 vehicle and casualty
+  is an e-scooter (earlier copies coded them `-1`).
+
+### Correction to the guide (`GUIDE_CORRECTIONS`)
+The 2025 code-list sheet lists `casualty_type` code **23 twice**: "Electric motorcycle rider or passenger"
+(the real 23, unchanged from the 2024 edition) and "Personal Powered Transporter" ("introduced in 2024
+specification"). The same guide's conversion sheet gives that second one as **33** ("Personal Powered
+Transporter rider"), matching `vehicle_type` 33, and real data agrees. So the script re-keys that one row to
+33, keeping the code-list label. If the row ever stops matching (DfT fixes the typo), the script stops with
+an error so the entry can be removed.
 - **`is_missing = true` when** the code is `-1` **or** the label (trimmed, case-insensitive) is one of:
   - `data missing or out of range`
   - `unknown`
@@ -64,10 +83,10 @@ set live in that script.
   - `not known`
   - `code deprecated`
 
-  This is the set of "not recorded" labels present in the 2024 guide; it is consistent with the widely-used
-  stats19 package's missing-value handling (prior art only, never copied).
+  This is the set of "not recorded" labels present in the 2024 guide (unchanged in the 2025 edition); it is
+  consistent with the widely-used stats19 package's missing-value handling (prior art only, never copied).
 
-### Judgement calls (each verified against the 2024 guide)
+### Judgement calls (each verified against the 2024 guide, and re-checked against the 2025 edition)
 - **`unknown (self reported)` (codes `9`/`99`, 27 variables) → `is_missing = false`.** These are *recorded as
   unknown*, not *not recorded*; they are kept as real codes. Nulling them would silently drop a legitimate
   category across 27 columns. (Matches stats19, which excludes this label from its missing set. Decided with
@@ -77,7 +96,7 @@ set live in that script.
 - **`Unclassified` (code `6`, `first_road_class`/`second_road_class` only) → `false`.** A real road class; it
   appears on no other variable in this guide, so no per-variable split is needed.
 - **`Other` wherever it appears → `false`.** A real category.
-- **`data cannot be anonymised`** does **not** appear in the 2024 guide; it is not in the set. A future
+- **`data cannot be anonymised`** does **not** appear in the 2024 or 2025 guide; it is not in the set. A future
   vintage may reintroduce it — this set is vintage-pinned.
 - **Both severities are exhaustive and clean:** `collision_severity` and `casualty_severity` are each exactly
   `1=Fatal, 2=Serious, 3=Slight` with no sentinel code, so both are always `is_missing = false`.
@@ -89,8 +108,8 @@ Classifies **every** column of all three files. `table` is `collision`/`vehicle`
 (`INTEGER`/`DOUBLE`) and `coded` (`INTEGER`), blank otherwise. This is the single source of truth for how the
 keep-in-place silver (stage 06) treats each column.
 
-- **Committed size:** exactly 99 rows (44 collision + 32 vehicle + 23 casualty headers). Breakdown:
-  identity 12, geo 2, datetime 2, coded 59, numeric 17, text 7. (`geo` is just the two OSGR
+- **Committed size:** exactly 100 rows (44 collision + 32 vehicle + 24 casualty headers). Breakdown:
+  identity 12, geo 2, datetime 2, coded 60, numeric 17, text 7. (`geo` is just the two OSGR
   easting/northing columns; `longitude`/`latitude` are `numeric DOUBLE`.)
 - **Not derived from the guide's `code/format` column** — that column mixes real code lists with format
   strings and the `-1`-on-numerics sentinel, so it cannot cleanly separate `coded` from `numeric`/`text`.
@@ -107,7 +126,8 @@ keep-in-place silver (stage 06) treats each column.
   `E06000036`, which the integer codebook cannot decode. (`local_authority_district`, which uses integer DfT
   codes, is `coded`.) ONS-code→name decoding is deferred.
 - The newer `enhanced_casualty_severity`, `collision_injury_based`/`casualty_injury_based`, `escooter_flag`,
-  `*_distance_banding` are `coded` (integer categories in the guide).
+  `*_distance_banding` are `coded` (integer categories in the guide). `escooter_flag` is in both the vehicle
+  and casualty files (the casualty one was added by DfT in its autumn 2026 re-issue).
 - **`enhanced_severity_collision` is `coded` but has NO codebook coverage** — its code list is absent from the
   2024 guide (only `enhanced_casualty_severity` is published). It cleans/types correctly, but its
   label column is NULL until DfT publishes the list. Decoding works by intersecting codes against the

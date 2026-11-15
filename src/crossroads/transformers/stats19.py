@@ -210,10 +210,14 @@ class Stats19Transformer(BaseTransformer):
     def _load_codebook(self, con):
         """Load the committed codebook CSV into the `codebook` reference table.
 
-        codebook(variable, code, label, is_missing) maps STATS19 integer codes to DfT
-        labels and marks missing/unknown sentinels. Reference data, NOT an audited
-        source. Read all-string then cast so `code` keeps '-1'/'07' exactly and
-        is_missing is a real BOOLEAN. CREATE OR REPLACE keeps a same-file rebuild
+        codebook(tbl, variable, code, label, is_missing) maps STATS19 integer codes to
+        DfT labels and marks missing/unknown sentinels. `tbl` is the source file
+        (collision / vehicle / casualty): the same column name can have different labels
+        in two files (escooter_flag is in both vehicle and casualty), so every lookup
+        matches on tbl as well as variable. Unique on (tbl, variable, code). Reference
+        data, NOT an audited source. Read all-string then cast so `code` keeps '-1'/'07'
+        exactly and is_missing is a real BOOLEAN. The CSV header is `table`; alias it to
+        tbl, as the column manifest does. CREATE OR REPLACE keeps a same-file rebuild
         idempotent. Path is code-controlled (trusted); no row values are interpolated.
         """
         if not os.path.exists(_CODEBOOK_PATH):
@@ -222,7 +226,8 @@ class Stats19Transformer(BaseTransformer):
                 f"It ships in the package under src/crossroads/reference/.")
         con.execute(
             f"CREATE OR REPLACE TABLE {self.CODEBOOK_TABLE} AS "
-            f"SELECT CAST(variable AS VARCHAR) AS variable, "
+            f'SELECT CAST("table" AS VARCHAR)  AS tbl, '
+            f"       CAST(variable AS VARCHAR) AS variable, "
             f"       CAST(code AS VARCHAR)     AS code, "
             f"       CAST(label AS VARCHAR)    AS label, "
             f"       CAST(is_missing AS BOOLEAN) AS is_missing "
@@ -274,9 +279,11 @@ class Stats19Transformer(BaseTransformer):
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
             [table]).fetchall()}
 
-    def _clean_fragment(self, col, kind, dtype):
+    def _clean_fragment(self, col, kind, dtype, table_kind):
         """SELECT fragment that carries one bronze column into silver, cleaned per kind.
 
+        `table_kind` (collision / vehicle / casualty) says which file the column is from,
+        so the codebook lookup only uses that file's codes.
         coded   -> full missing set (codebook is_missing) -> NULL, else INTEGER code kept.
         numeric -> NUMERIC_SENTINELS/blank/non-numeric -> NULL, else typed to dtype
                    (this is the path longitude/latitude take, typed to DOUBLE).
@@ -293,7 +300,8 @@ class Stats19Transformer(BaseTransformer):
             # can't silently leak a -1 into a cleaned code. It never nulls a real value:
             # no STATS19 coded field uses -1 as a meaningful category.
             return (f"CASE WHEN {col} = '-1' OR {col} IN (SELECT code FROM {self.CODEBOOK_TABLE} "
-                    f"WHERE variable = {sql_str(col)} AND is_missing) "
+                    f"WHERE tbl = {sql_str(table_kind)} AND variable = {sql_str(col)} "
+                    f"AND is_missing) "
                     f"THEN NULL ELSE TRY_CAST({col} AS INTEGER) END AS {col}")
         if kind == "numeric":
             typ = dtype or "INTEGER"
@@ -329,7 +337,7 @@ class Stats19Transformer(BaseTransformer):
         for col, kind, dtype in rows:
             if col.lower() in exclude:
                 continue
-            frags.append(self._clean_fragment(col, kind, dtype) if col.lower() in present
+            frags.append(self._clean_fragment(col, kind, dtype, table_kind) if col.lower() in present
                          else self._placeholder_fragment(col, kind, dtype))
         return frags
 
@@ -1014,9 +1022,11 @@ class Stats19Transformer(BaseTransformer):
         ALONGSIDE the canonical coded silver table. Default surface = the coded table;
         'translation off' = query the silver table. No global flag, no stored label column.
 
-        One LEFT JOIN per coded column, aliased, ON cb.variable='<col>' AND
-        cb.code = CAST(s.<col> AS VARCHAR). codebook is unique on (variable, code) and each
-        join filters variable, so joins are 1:1 -> the view row count == silver row count.
+        One LEFT JOIN per coded column, aliased, ON cb.tbl='<table>' AND cb.variable='<col>'
+        AND cb.code = CAST(s.<col> AS VARCHAR). codebook is unique on (tbl, variable, code)
+        and each join filters tbl and variable, so joins are 1:1 -> the view row count ==
+        silver row count. (Matching tbl matters for escooter_flag, which has different
+        labels in the vehicle and casualty files.)
         Column/variable identifiers come from the trusted manifest (interpolated); no row
         values are interpolated. Views are lazy: the join cost is paid only when queried.
 
@@ -1047,7 +1057,8 @@ class Stats19Transformer(BaseTransformer):
                 selects.append(f"{a}.label AS {col}_label")
                 joins.append(
                     f"LEFT JOIN {self.CODEBOOK_TABLE} {a} "
-                    f"  ON {a}.variable = {sql_str(col)} AND {a}.code = CAST(s.{col} AS VARCHAR)")
+                    f"  ON {a}.tbl = {sql_str(table_kind)} AND {a}.variable = {sql_str(col)} "
+                    f"  AND {a}.code = CAST(s.{col} AS VARCHAR)")
             con.execute(
                 f"CREATE OR REPLACE VIEW {silver}_labelled AS "
                 f"SELECT {', '.join(selects)} FROM {silver} s {' '.join(joins)}")
@@ -1055,8 +1066,8 @@ class Stats19Transformer(BaseTransformer):
             # --- REPORT (non-fatal): warn on undecoded codes in COVERED columns. ---
             # A covered column has >=1 codebook row; only those are expected to decode.
             covered = [c for c in coded if con.execute(
-                f"SELECT count(*) FROM {self.CODEBOOK_TABLE} WHERE variable = ?",
-                [c]).fetchone()[0] > 0]
+                f"SELECT count(*) FROM {self.CODEBOOK_TABLE} WHERE tbl = ? AND variable = ?",
+                [table_kind, c]).fetchone()[0] > 0]
             if covered:
                 # One scan of the view: an undecoded count per covered column.
                 exprs = ", ".join(
