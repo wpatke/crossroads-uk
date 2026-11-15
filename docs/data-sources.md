@@ -18,6 +18,30 @@ gate on licences" at the bottom for the reasoning.
 - **Required attribution** (reproduce when you publish):
   > Contains public sector information licensed under the Open Government Licence v3.0.
   > Source: Department for Transport, Road Safety Open Dataset.
+- **Downloads** (all from `https://data.dft.gov.uk/road-accidents-safety-data/`, listed on
+  DfT's [Road Safety Data](https://www.gov.uk/government/statistics/road-safety-data) page):
+  - Single-year files, `dft-road-casualty-statistics-{collision,vehicle,casualty}-{year}.csv`.
+    DfT publishes these for its most recent years only (2021–2025 when checked in November
+    2026), and the window moves forward each year. Crossroads tries this file first.
+  - Combined files, `dft-road-casualty-statistics-{collision,vehicle,casualty}-1979-latest-published-year.csv`
+    (about 4.3 GB in total), used for every year without a single-year file. Each is
+    downloaded once into the cache. The requested years are then split out into per-year
+    cache files using the `collision_year` column, which is in all three files, so a
+    year's vehicles and casualties always land with its collisions. Each record's text is
+    copied unchanged.
+- **Older years:** DfT did not collect every field in every year. Fields not yet collected
+  are `-1` or blank, so they are NULL after cleaning. For example, the LSOA of the collision
+  starts in 1999, the injury-based severity fields in 2004, and driver/casualty IMD deciles
+  in 2016. So for a build spanning many years, `stats19_completeness` reports these as partly
+  missing. That figure is accurate, but it blends years when the field was not collected
+  with years when it was.
+- **Coordinates before 1989 are less reliable.** In 1979–1988, 4–19% of collisions that
+  have coordinates fall outside every local authority, against about 0.1–0.3% from 1989.
+  The worst years are 1979 (19%), 1980–81 (about 13.5%) and 1986 (11%). The cause is
+  incorrect grid references in DfT's early data, not missing ones, so these rows keep
+  `geom_valid = TRUE` but get no `lad_code`. Some may also have been placed in the wrong
+  area. For area-level analysis of these years, check how many collisions have
+  `lad_code IS NULL`.
 
 ## 2. ONS Boundaries — Local Authority Districts & Counties/Unitary Authorities
 

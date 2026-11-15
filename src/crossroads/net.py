@@ -16,6 +16,7 @@ behave identically:
 
 import os
 import shutil
+import urllib.error
 import urllib.request
 
 # Socket INACTIVITY timeout in seconds (not a wall-clock budget): fires only when
@@ -47,4 +48,20 @@ def download_to_file(url, dest, *, timeout=HTTP_TIMEOUT_SECONDS, validator=None)
     except Exception:
         if os.path.exists(tmp):
             os.remove(tmp)
+        raise
+
+
+def url_exists(url, *, timeout=HTTP_TIMEOUT_SECONDS):
+    """True if `url` answers 200, False if it answers 404. Any other error is raised.
+
+    Uses a normal GET because some servers (DfT's included) refuse HEAD requests. The
+    response is closed straight away without reading the body, so even a large file
+    costs almost nothing to check.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
         raise

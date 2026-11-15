@@ -140,6 +140,14 @@ client.close()
 The **weather** source additionally needs the `weather` extra installed and a free
 Copernicus CDS API key. The build prints setup steps if it is missing.
 
+**STATS19 years.** Any year from 1979 to DfT's newest published year can be built. DfT
+publishes only its most recent years as single-year files (about 20 MB each). Older years
+are only in DfT's combined 1979-onwards files, about 4.3 GB in total. The first build that
+needs an older year downloads those files once into the cache folder
+(`.crossroads_cache/` in the folder you run from), and later builds reuse them. The wizard
+warns you about this before it starts. To free the space, or to pick up a DfT revision of
+older years, delete the `*-1979-latest-published-year.csv` files from that folder.
+
 ## Real-world examples
 
 ### Example 1: real risk, not raw counts

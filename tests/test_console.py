@@ -7,6 +7,7 @@ real input/print or network is involved: `reader` replays a list of answers and
 import importlib.metadata as md
 import os
 import shutil
+from datetime import date
 
 import pytest
 
@@ -203,6 +204,28 @@ def test_format_summary_includes_datasets():
         "years": [2023], "boundary_mode": "snapshot",
     })
     assert "Datasets" in summary and "stats19" in summary
+
+
+def test_summary_warns_about_large_download_for_old_years():
+    # An old STATS19 year may need DfT's large combined files: warn before confirming.
+    summary = console.format_summary({
+        "database_path": "x.db", "datasets": ["stats19"],
+        "years": [2000], "boundary_mode": "snapshot",
+    })
+    assert "one-time download of about 4.3 GB" in summary
+
+
+def test_summary_no_download_note_for_recent_years_or_without_stats19():
+    # Years computed from today, so this test never goes stale.
+    recent = console.format_summary({
+        "database_path": "x.db", "datasets": ["stats19"],
+        "years": [date.today().year - 1], "boundary_mode": "snapshot",
+    })
+    no_stats19 = console.format_summary({
+        "database_path": "x.db", "datasets": ["aadf"],
+        "years": [2000], "boundary_mode": "snapshot",
+    })
+    assert "4.3 GB" not in recent and "4.3 GB" not in no_stats19
 
 
 # --- Stage 02: build wiring, orchestration, and the entry point -------------

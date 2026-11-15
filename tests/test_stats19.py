@@ -8,6 +8,7 @@ import os
 import shutil
 import urllib.request
 import urllib.error
+from datetime import date
 
 import pytest
 import crossroads
@@ -358,22 +359,259 @@ def test_looks_like_stats19_csv_recognises_both_headers(tmp_path):
     assert t._looks_like_stats19_csv(str(html)) is False
 
 
-def test_fetch_missing_year_raises_friendly_error(tmp_path, monkeypatch):
-    """A 404 (unpublished year) -> ValueError, and nothing is cached."""
-    cache = str(tmp_path / "cache")
+# --- older years: DfT's combined 1979-onwards file (offline: DfT is faked) ---------
 
-    def fake_urlopen(url, timeout=None):
-        # Simulate DfT returning 404 for a not-yet-published year.
+# A small hand-made "combined" sample: rows for 2005, 2019 and 2020, mixed together by
+# year like DfT's real file (see "Combined-file sample" in tests/fixtures/stats19/README.md).
+COMBINED_FIXTURES = os.path.join(FIXTURES, "combined")
+_COMBINED_NAME = "dft-road-casualty-statistics-{}-1979-latest-published-year.csv"
+# Rows per year in the combined sample: (collisions, vehicles, casualties).
+COMBINED_COUNTS = {2005: (3, 8, 6), 2019: (2, 3, 2), 2020: (3, 6, 4)}
+
+
+def _single_name(ftype, year):
+    return f"dft-road-casualty-statistics-{ftype}-{year}.csv"
+
+
+def _read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _combined_bytes():
+    """The three combined sample files, keyed by DfT file name (as the fake serves them)."""
+    return {_COMBINED_NAME.format(t): _read_bytes(os.path.join(COMBINED_FIXTURES,
+                                                               _COMBINED_NAME.format(t)))
+            for t in ("collision", "vehicle", "casualty")}
+
+
+def _newest_year_probe():
+    """What the 'newest published year' check asks for: this calendar year's single-year
+    collision file. Serving it makes that check find a newest year without depending on
+    today's date."""
+    return {_single_name("collision", date.today().year): b"collision_index\n"}
+
+
+def _expected_year_bytes(ftype, year):
+    """What a split per-year file must contain: the combined sample's header line plus,
+    in order, exactly its lines for that year (the sample has no quoted fields, so one
+    line is one record)."""
+    lines = _read_bytes(os.path.join(COMBINED_FIXTURES, _COMBINED_NAME.format(ftype))
+                        ).splitlines(keepends=True)
+    return lines[0] + b"".join(l for l in lines[1:] if l.split(b",")[1] == str(year).encode())
+
+
+class _FakeDfT:
+    """Stands in for DfT's server: serves the files it was given (by file name), answers
+    404 for anything else, and records every URL it was asked for."""
+
+    def __init__(self, files):
+        self.files = files
+        self.requested = []
+
+    def __call__(self, url, timeout=None):
+        self.requested.append(url)
+        name = url.rsplit("/", 1)[-1]
+        if name in self.files:
+            return io.BytesIO(self.files[name])
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    def asked_for_combined(self):
+        return [u for u in self.requested if "latest-published-year" in u]
+
+
+def _seed_combined(cache):
+    os.makedirs(cache, exist_ok=True)
+    for name in _combined_bytes():
+        shutil.copy(os.path.join(COMBINED_FIXTURES, name), os.path.join(cache, name))
+
+
+def test_split_combined_writes_exact_per_year_files(tmp_path):
+    """Each requested year gets the header plus exactly its own records, byte for byte.
+    Years not asked for are not written, and no .part file is left behind."""
+    cache = str(tmp_path / "cache")
+    _seed_combined(cache)
+    combined = os.path.join(cache, _COMBINED_NAME.format("collision"))
+    Stats19Transformer()._split_combined(combined, "collision", [2005, 2020], cache)
+
+    for year in (2005, 2020):
+        assert _read_bytes(os.path.join(cache, _single_name("collision", year))) == \
+            _expected_year_bytes("collision", year)
+    assert not os.path.exists(os.path.join(cache, _single_name("collision", 2019)))
+    assert not any(f.endswith(".part") for f in os.listdir(cache))
+
+
+def test_split_combined_accepts_accident_year_header(tmp_path):
+    """An older-style header (accident_index, accident_year) splits the same way."""
+    src = tmp_path / "combined.csv"
+    src.write_bytes(b"accident_index,accident_year,x\nA1,2001,a\nB1,2002,b\nA2,2001,c\n")
+    Stats19Transformer()._split_combined(str(src), "collision", [2001], str(tmp_path))
+    assert _read_bytes(tmp_path / _single_name("collision", 2001)) == \
+        b"accident_index,accident_year,x\nA1,2001,a\nA2,2001,c\n"
+
+
+def test_split_combined_keeps_awkward_records_exact(tmp_path):
+    """Records are copied exactly as written: CRLF line endings, a quoted comma and line
+    break, and a "" cell survive unchanged; a blank line is skipped; and the last record
+    (which has no line ending) gets the file's own ending so records never merge."""
+    src = tmp_path / "combined.csv"
+    src.write_bytes(b'collision_index,collision_year,note\r\n'
+                    b'A,2001,"x, y\r\nz"\r\n'
+                    b'B,2002,""\r\n'
+                    b'\r\n'
+                    b'C,2001,last')
     t = Stats19Transformer()
+    t._split_combined(str(src), "collision", [2001, 2002], str(tmp_path))
+
+    out_2001 = tmp_path / _single_name("collision", 2001)
+    assert _read_bytes(out_2001) == \
+        b'collision_index,collision_year,note\r\nA,2001,"x, y\r\nz"\r\nC,2001,last\r\n'
+    assert _read_bytes(tmp_path / _single_name("collision", 2002)) == \
+        b'collision_index,collision_year,note\r\nB,2002,""\r\n'
+    # The independent row count sees exactly the two 2001 records.
+    assert t._count_source_rows([str(out_2001)]) == 2
+
+
+def test_split_combined_missing_year_raises_and_caches_nothing(tmp_path):
+    """A requested year with no rows -> clear error, and NO year is written (not even the
+    ones that had rows): the split is all-or-nothing."""
+    cache = str(tmp_path / "cache")
+    _seed_combined(cache)
+    combined = os.path.join(cache, _COMBINED_NAME.format("collision"))
+    with pytest.raises(ValueError, match="has no rows for 2010"):
+        Stats19Transformer()._split_combined(combined, "collision", [2005, 2010], cache)
+    assert sorted(os.listdir(cache)) == sorted(_combined_bytes())   # nothing new, no .part
+
+
+def test_split_combined_without_year_column_raises(tmp_path):
+    src = tmp_path / "combined.csv"
+    src.write_bytes(b"collision_index,something_else\n1,2\n")
+    with pytest.raises(ValueError, match="no collision_year or accident_year column"):
+        Stats19Transformer()._split_combined(str(src), "collision", [2001], str(tmp_path))
+    assert os.listdir(tmp_path) == ["combined.csv"]
+
+
+def test_extract_falls_back_to_combined_when_single_year_missing(tmp_path, monkeypatch):
+    """Single-year files 404 for older years, so extract downloads each combined file ONCE
+    and splits out the requested years."""
+    cache = str(tmp_path / "cache")
+    fake = _FakeDfT({**_combined_bytes(), **_newest_year_probe()})
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    Stats19Transformer().extract(cache, years=[2005, 2020])
+
+    for ftype in ("collision", "vehicle", "casualty"):
+        for year in (2005, 2020):
+            assert _read_bytes(os.path.join(cache, _single_name(ftype, year))) == \
+                _expected_year_bytes(ftype, year)
+    assert sorted(fake.asked_for_combined()) == sorted(set(fake.asked_for_combined()))
+    assert len(fake.asked_for_combined()) == 3          # one download per file type
+    assert not any(f.endswith(".part") for f in os.listdir(cache))
+
+
+def test_extract_prefers_single_year_file(tmp_path, monkeypatch):
+    """A year DfT still publishes on its own (2023 here) comes from its single-year file;
+    only the older year (2005) is split from the combined file."""
+    cache = str(tmp_path / "cache")
+    single_2023 = {_single_name(t, 2023): _read_bytes(os.path.join(FIXTURES, _single_name(t, 2023)))
+                   for t in ("collision", "vehicle", "casualty")}
+    fake = _FakeDfT({**_combined_bytes(), **_newest_year_probe(), **single_2023})
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    Stats19Transformer().extract(cache, years=[2005, 2023])
+
+    for ftype in ("collision", "vehicle", "casualty"):
+        assert _read_bytes(os.path.join(cache, _single_name(ftype, 2023))) == \
+            single_2023[_single_name(ftype, 2023)]
+        assert _read_bytes(os.path.join(cache, _single_name(ftype, 2005))) == \
+            _expected_year_bytes(ftype, 2005)
+
+
+def test_extract_reuses_cached_combined_file(tmp_path, monkeypatch):
+    """Combined files already in the cache are split, never downloaded again."""
+    cache = str(tmp_path / "cache")
+    _seed_combined(cache)
+    fake = _FakeDfT(_newest_year_probe())       # serves no combined files at all
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    Stats19Transformer().extract(cache, years=[2019])
+    assert fake.asked_for_combined() == []
+    assert os.path.exists(os.path.join(cache, _single_name("casualty", 2019)))
+
+
+def test_extract_skips_already_split_years(tmp_path, monkeypatch):
+    """A second extract for the same years downloads nothing and splits nothing."""
+    cache = str(tmp_path / "cache")
+    _seed_combined(cache)
+    monkeypatch.setattr(urllib.request, "urlopen", _FakeDfT(_newest_year_probe()))
+    Stats19Transformer().extract(cache, years=[2005, 2019])
+
+    second = _FakeDfT({})
+    monkeypatch.setattr(urllib.request, "urlopen", second)
+    t = Stats19Transformer()
+
+    def must_not_split(*args, **kwargs):
+        raise AssertionError("an already-cached year was split again")
+
+    monkeypatch.setattr(t, "_split_combined", must_not_split)
+    t.extract(cache, years=[2005, 2019])
+    assert second.requested == []
+
+
+def test_extract_too_recent_year_message(tmp_path, monkeypatch):
+    """A year newer than DfT's newest published year gets the 'not published yet'
+    message naming that newest year, BEFORE any combined file is downloaded."""
+    cache = str(tmp_path / "cache")
+    newest = date.today().year
+
+    # 2999 has no single-year files; this calendar year's collision file exists, so the
+    # newest-year check finds it. The combined files are served too, so the test would
+    # notice (via asked_for_combined) if extract wrongly went on to download them.
+    fake = _FakeDfT({**_combined_bytes(), **_newest_year_probe()})
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
     with pytest.raises(ValueError) as exc:
-        t.extract(cache, years=[2999])
+        Stats19Transformer().extract(cache, years=[2999])
     msg = str(exc.value)
-    assert "404" in msg and "earlier year" in msg
-    # Clean cache: no partial (.part) and no final (.csv) files left behind.
+    assert "2999 has not been published yet" in msg and f"newest published year is {newest}" in msg
+    assert fake.asked_for_combined() == []
     assert os.listdir(cache) == []
+
+
+def test_extract_year_before_1979_message(tmp_path, monkeypatch):
+    """A year before 1979 is rejected without touching the network."""
+    def no_network(url, timeout=None):
+        raise AssertionError(f"unexpected download: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", no_network)
+    with pytest.raises(ValueError, match="starts in 1979, so 1978 cannot be built"):
+        Stats19Transformer().extract(str(tmp_path / "cache"), years=[1978, 2005])
+
+
+def test_extract_combined_404_message(tmp_path, monkeypatch):
+    """If DfT's combined file itself is missing, say it may have moved; cache nothing."""
+    cache = str(tmp_path / "cache")
+    monkeypatch.setattr(urllib.request, "urlopen", _FakeDfT(_newest_year_probe()))
+    with pytest.raises(ValueError, match="may have renamed or moved it"):
+        Stats19Transformer().extract(cache, years=[2005])
+    assert os.listdir(cache) == []
+
+
+def test_build_from_combined_file_end_to_end(tmp_path, monkeypatch):
+    """A full build from split files only: bronze, conservation, silver and the link
+    checks all work unchanged, with every row of every requested year present."""
+    cache = str(tmp_path / "cache")
+    _seed_combined(cache)
+    monkeypatch.setattr(urllib.request, "urlopen", _FakeDfT(_newest_year_probe()))
+    client = crossroads.init_engine(cache_dir=cache)
+    client.registry._transformers = [Stats19Transformer()]
+    client.build(years=[2005, 2019, 2020])     # runs the invariants; raises if any fail
+
+    con = client.con
+    per_year = dict(con.execute(
+        "SELECT CAST(accident_year AS INTEGER), count(*) FROM collisions GROUP BY 1").fetchall())
+    assert per_year == {y: c[0] for y, c in COMBINED_COUNTS.items()}
+    for table, i in (("vehicles", 1), ("casualties", 2)):
+        assert con.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == \
+            sum(c[i] for c in COMBINED_COUNTS.values())
+        assert con.execute(f"SELECT count(*) FROM {table} WHERE NOT link_valid").fetchone()[0] == 0
+    client.close()
 
 
 def test_fetch_html_error_page_is_rejected(tmp_path, monkeypatch):

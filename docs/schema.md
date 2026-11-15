@@ -73,7 +73,7 @@ CREATE TABLE collisions (
     collision_injury_based INTEGER,     -- coded: whether severity is injury-based (post-adjustment marker)
     day_of_week            INTEGER,     -- coded: 1=Sunday … 7=Saturday
     did_police_officer_attend_scene_of_accident INTEGER, -- coded: police attendance
-    enhanced_severity_collision INTEGER, -- coded, but NO codebook coverage in the 2024 guide (label stays NULL)
+    enhanced_severity_collision INTEGER, -- coded, but the codebook has no rows for it (label stays NULL)
     first_road_class       INTEGER,     -- coded: class of the first (primary) road
     first_road_number      INTEGER,     -- numeric: road number of the first road (0 = not applicable)
     junction_control       INTEGER,     -- coded: control at the junction
