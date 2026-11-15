@@ -32,3 +32,46 @@ def test_write_build_metadata_is_idempotent():
     assert n == 1
     latest = con.execute("SELECT parameters FROM crossroads_meta").fetchone()[0]
     assert "era5_weather" in latest                       # reflects the LATEST build
+
+
+# --- data fingerprints: every input file is recorded (crossroads.provenance) -
+
+def _fixture_build(tmp_path, name):
+    """A full offline build (ONS boundaries, STATS19, AADF, bank holidays) from the
+    committed fixtures, into its own in-memory database."""
+    from tests.test_console import _seed_full_cache   # conftest puts the repo on sys.path
+    cache = str(tmp_path / name)
+    _seed_full_cache(cache)
+    client = crossroads.init_engine(cache_dir=cache)
+    client.build(datasets=["aadf", "bank_holidays", "stats19"], years=[2023])
+    return client
+
+
+def test_every_source_records_its_files_and_the_build_has_a_fingerprint(tmp_path):
+    client = _fixture_build(tmp_path, "cache")
+    con = client.con
+    # Coverage: every source that ran (audited or exempt) recorded at least one file.
+    ran = {r[0] for r in con.execute(
+        "SELECT source_id FROM source_ingest_log UNION SELECT source_id FROM quality_exemptions"
+    ).fetchall()}
+    recorded = {r[0] for r in con.execute("SELECT DISTINCT source_id FROM source_files").fetchall()}
+    assert ran and ran <= recorded, f"no source_files rows for {sorted(ran - recorded)}"
+    # Every row has a real 64-character fingerprint; the seeded fixtures have no sidecar,
+    # so their origin is recorded as unknown (NULL), never guessed.
+    assert con.execute("SELECT count(*) FROM source_files WHERE length(sha256) <> 64"
+                       ).fetchone()[0] == 0
+    assert con.execute("SELECT count(*) FROM source_files WHERE origin_url IS NOT NULL"
+                       ).fetchone()[0] == 0
+    fingerprint = con.execute("SELECT data_fingerprint FROM crossroads_meta").fetchone()[0]
+    assert fingerprint is not None and len(fingerprint) == 64
+    client.close()
+
+
+def test_same_files_give_identical_fingerprints(tmp_path):
+    # Two separate builds from identical caches record identical rows and fingerprint.
+    a, b = _fixture_build(tmp_path, "cache_a"), _fixture_build(tmp_path, "cache_b")
+    query = "SELECT * FROM source_files ORDER BY source_id, file_name"
+    assert a.con.execute(query).fetchall() == b.con.execute(query).fetchall()
+    meta = "SELECT data_fingerprint FROM crossroads_meta"
+    assert a.con.execute(meta).fetchone() == b.con.execute(meta).fetchone()
+    a.close(); b.close()

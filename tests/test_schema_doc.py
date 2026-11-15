@@ -26,7 +26,7 @@ CORE_TABLES = [
     "collisions", "vehicles", "casualties", "weather", "lad_boundaries", "ctyua_boundaries",
     "aadf", "aadf_clean",
     "collisions_spatial", "crossroads_meta", "data_quality_log", "quarantine_raw",
-    "source_ingest_log", "codebook", "column_manifest",
+    "source_ingest_log", "source_files", "codebook", "column_manifest",
 ]
 
 # Tables whose EVERY column must be documented (silver + provenance/quality + reference).
@@ -34,7 +34,7 @@ COLUMN_GUARDED = [
     "collisions", "vehicles", "casualties", "weather", "lad_boundaries", "ctyua_boundaries",
     "aadf",
     "crossroads_meta", "data_quality_log", "quarantine_raw", "source_ingest_log",
-    "quality_exemptions", "stats19_completeness", "codebook", "column_manifest",
+    "source_files", "quality_exemptions", "stats19_completeness", "codebook", "column_manifest",
 ]
 # Bronze copies of source columns — documented as a category, excluded from the column guard.
 # "aadf_" (with the trailing underscore) excludes the aadf_raw bronze while leaving the silver

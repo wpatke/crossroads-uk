@@ -35,6 +35,7 @@ from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import (
     SourceQuality, Dimension, create_clean_view, record_source_rows, log_exclusion,
 )
+from crossroads.provenance import record_source_files, write_sidecar
 
 # ERA5-Land native grid step (degrees). The join key is round(coord / GRID_DEG).
 GRID_DEG = 0.1
@@ -289,6 +290,12 @@ class Era5WeatherTransformer(BaseTransformer):
             month_paths.append(mpath)
 
         self._merge_months(month_paths, dest)           # writes dest atomically
+        # Sidecar note (crossroads.provenance). CDS builds a new file for every request
+        # and the monthly files are deleted below, so there is no single download to
+        # fingerprint: origin_sha256 is None. The year file itself is fingerprinted at
+        # build time like every other input.
+        write_sidecar(dest, origin_url=ERA5_LAND_URL, origin_sha256=None,
+                      derived_by="merged from 12 monthly CDS requests")
         for mpath in month_paths:                        # cleanup: yearly file is the cache key now
             os.remove(mpath)
 
@@ -363,6 +370,7 @@ class Era5WeatherTransformer(BaseTransformer):
         # xarray->dataframe materialisation would fail the invariant. NetCDF is read
         # all-or-nothing (no per-row reject concept), so there is no quarantine path here.
         record_source_rows(con, self.source_id, self._source_cell_count)
+        record_source_files(con, self.source_id, paths)   # fingerprint each file read
         create_clean_view(con, self.CLEAN_VIEW, self.SILVER, ["geom_valid"])   # gold
 
     def _load_bronze(self, con, nc_paths):

@@ -150,6 +150,22 @@ def test_extract_unzips_single_csv_member(tmp_path):
         assert fh.read() == "count_point_id,year\n1,2023\n"
 
 
+def test_unzipped_csv_sidecar_points_to_the_zip(tmp_path):
+    # The CSV is made from the downloaded zip, so its sidecar carries the zip's origin.
+    from crossroads import provenance
+    cache = str(tmp_path / "cache")
+    os.makedirs(cache)
+    zip_path = os.path.join(cache, ZIP_CACHE_FILE)
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("inner.csv", "count_point_id,year\n1,2023\n")
+    provenance.write_sidecar(zip_path, origin_url="https://example/aadf.zip", origin_sha256="z1")
+    AadfTransformer().extract(cache)
+    note = provenance.read_sidecar(os.path.join(cache, CSV_CACHE_FILE))
+    assert note["origin_url"] == "https://example/aadf.zip"
+    assert note["origin_sha256"] == "z1"
+    assert note["derived_by"] == "extracted from the downloaded zip"
+
+
 def test_extract_rejects_multi_csv_zip(tmp_path):
     # A zip with more than one CSV member is ambiguous -> fail loudly.
     cache = str(tmp_path / "cache")

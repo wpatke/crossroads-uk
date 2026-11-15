@@ -43,6 +43,7 @@ from crossroads.quality import (
     load_csv_bronze_with_quarantine,
 )
 from crossroads.net import download_to_file
+from crossroads.provenance import copy_origin, record_source_files
 
 # The single national AADF file. Public, Open Government Licence v3.0
 # (listed on https://roadtraffic.dft.gov.uk/downloads).
@@ -123,6 +124,8 @@ class AadfTransformer(BaseTransformer):
             with zf.open(members[0]) as src, open(tmp, "wb") as dst:
                 shutil.copyfileobj(src, dst)
         os.replace(tmp, csv_dest)
+        # Sidecar note: the CSV's origin is the downloaded zip (crossroads.provenance).
+        copy_origin(csv_dest, zip_path, "extracted from the downloaded zip")
 
     # --- transform_and_load ------------------------------------------------
     def transform_and_load(self, con, cache_dir):
@@ -144,6 +147,7 @@ class AadfTransformer(BaseTransformer):
         # CONSERVATION: record rows read INDEPENDENTLY (Python csv reader, not count(bronze)),
         # so source_rows == bronze + quarantine is a real check (spec §9).
         record_source_rows(con, self.source_id, self._count_source_rows(path))
+        record_source_files(con, self.source_id, [path])   # fingerprint the file read
         # GOLD: valid-geometry AND valid-count projection.
         create_clean_view(con, self.CLEAN_VIEW, self.SILVER, ["geom_valid", "count_valid"])
         # INDEX: bounding-box R-Tree over the silver geometry, for fast point-in-polygon

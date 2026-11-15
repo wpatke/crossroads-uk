@@ -101,6 +101,29 @@ vintages, produces a structurally identical database. Reference tables (STATS19 
 column manifest, ONS boundary manifest) are version-pinned and regenerable by committed
 scripts. See [../src/crossroads/reference/README.md](../src/crossroads/reference/README.md).
 
+### Data fingerprints
+
+"The same source vintages" cannot be taken on trust. Publishers re-issue files under the
+same name: for example, DfT's autumn 2026 re-issue of its 2023 STATS19 files kept the same
+row counts but added a casualty column and revised some values. So every build records
+exactly which files it read, in `source_files` (see [schema.md](schema.md#source_files)):
+
+- `sha256` is a fingerprint of each file's bytes, computed at build time from the file
+  actually read. Two files share a fingerprint only if they are byte-for-byte identical.
+- `crossroads_meta.data_fingerprint` combines them into one value. The same version,
+  parameters and data fingerprint mean the same database, on any machine.
+- The origin columns (`origin_url`, `origin_sha256`, `downloaded_at_utc`, `derived_by`)
+  come from a small `<file>.source.json` note Crossroads writes beside each cache file when
+  it downloads or creates it. A file split, unzipped or merged from a download keeps the
+  original download's details. NULL means the file was cached by a version before 1.1.0,
+  so its origin is unknown. Crossroads never guesses it. To get full provenance, clear the
+  cache and rebuild.
+- If a downloaded file no longer matches the fingerprint taken while downloading it (it was
+  changed by hand), the build warns and records the file as it is now.
+- Weather files are recorded with a NULL `origin_sha256`: CDS builds a new file for every
+  request, and the monthly downloads are deleted after merging, so only the merged year file
+  can be fingerprinted.
+
 ### Tested with (v1.0.0)
 
 Reproducibility depends on the runtime stack, and `duckdb>=1.5` is a floating floor. To
