@@ -22,6 +22,15 @@ release was tested against are listed in [docs/methodology.md](docs/methodology.
 ## [Unreleased]
 
 ### Added
+- **Data fingerprints.** Every database now records exactly which input files built it.
+  A new `source_files` table holds a SHA-256 fingerprint, size, source URL and download date
+  for every file each source read, and `crossroads_meta.data_fingerprint` gives one overall
+  value to quote. Publishers such as DfT sometimes re-issue a file under the same name, so
+  two builds with the same version and parameters can differ. Comparing data fingerprints
+  now shows whether they used identical data. Crossroads writes a small `<file>.source.json`
+  note beside each cache file to remember where it came from. Files cached by earlier
+  versions are fingerprinted too, but their source URL and download date are unknown (NULL)
+  until the cache is cleared and rebuilt.
 - `casualties.escooter_flag`: 1 when the casualty was using an e-scooter, 0 when not. DfT
   added this column to its casualty files in its autumn 2026 re-issue. Earlier builds
   loaded it into the bronze table but dropped it from `casualties`. It is NULL for casualty
@@ -42,7 +51,8 @@ release was tested against are listed in [docs/methodology.md](docs/methodology.
   for 2020 onwards. The guide prints the casualty code as a second `23`; its own conversion
   sheet gives `33`, and the codebook script corrects it (see
   [src/crossroads/reference/README.md](src/crossroads/reference/README.md)).
-- Database `schema_version` 4 → 5 (additive: the two columns above).
+- Database `schema_version` 4 → 5 (additive: the new `source_files` table and the columns
+  above).
 - The wizard's build summary now warns when the chosen years may need DfT's one-time
   4.3 GB download, before you confirm the build.
 

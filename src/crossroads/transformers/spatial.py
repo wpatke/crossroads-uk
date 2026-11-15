@@ -28,6 +28,7 @@ from crossroads.quality import (
 )
 from crossroads.sql import sql_str
 from crossroads.net import download_to_file
+from crossroads.provenance import record_source_files
 
 # British National Grid envelope, used to verify geometry really is EPSG:27700.
 # (DuckDB GEOMETRY stores no SRID, so we sanity-check coordinate ranges.)
@@ -241,6 +242,9 @@ class _BoundaryTransformer(BaseTransformer):
         # count(bronze)), so a feature ST_Read dropped would fail the invariant. GeoJSON is
         # parsed all-or-nothing by GDAL (no per-feature reject), so no quarantine path here.
         record_source_rows(con, self.source_id, source_features)
+        # Fingerprint each GeoJSON file read (crossroads.provenance).
+        record_source_files(con, self.source_id,
+                            [os.path.join(cache_dir, v.source_file) for v in vintages])
 
         # --- GOLD: valid-geometry view.
         create_clean_view(con, self.clean_view, self.silver_table, ["geom_valid"])

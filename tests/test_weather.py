@@ -206,6 +206,12 @@ def test_download_year_chunks_and_merges(tmp_path, monkeypatch):
     assert os.path.exists(dest)
     assert not any(f.endswith(".part") for f in os.listdir(cache))
     assert not any(f.startswith("era5_land_2022_") for f in os.listdir(cache))
+    # Sidecar note: origin is the CDS dataset; there is no single download to fingerprint.
+    from crossroads import provenance
+    note = provenance.read_sidecar(dest)
+    assert note["origin_url"].endswith("/datasets/reanalysis-era5-land")
+    assert note["origin_sha256"] is None
+    assert note["derived_by"] == "merged from 12 monthly CDS requests"
 
     import xarray as xr
     ds = xr.open_dataset(dest)

@@ -73,6 +73,15 @@ reproduce it exactly:
   collision counts into an exposure-adjusted rate).
 - A **provenance stamp** on every database (version, schema, build parameters, and build time)
   so a re-run reproduces the result and you can cite it: `SELECT * FROM crossroads_meta;`
+- A **fingerprint of every input file**, plus one overall data fingerprint to quote in a paper.
+  Two databases with the same version, parameters **and** data fingerprint were built from
+  byte-identical data. If the fingerprints differ, a publisher may have re-issued a file under
+  the same name: compare `source_files` to see which one.
+
+  ```sql
+  SELECT data_fingerprint FROM crossroads_meta;                -- one value to quote
+  SELECT * FROM source_files ORDER BY source_id, file_name;    -- every input file
+  ```
 
 The full table/column data dictionary is in **[docs/schema.md](https://github.com/wpatke/crossroads-uk/blob/main/docs/schema.md)**.
 

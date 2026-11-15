@@ -102,3 +102,31 @@ def test_url_exists_raises_other_errors(monkeypatch):
     monkeypatch.setattr(net.urllib.request, "urlopen", _raise_http(500))
     with pytest.raises(net.urllib.error.HTTPError):
         net.url_exists("http://example/x")
+
+
+# --- fingerprint taken while downloading (crossroads.provenance) ------------
+
+def test_download_to_file_returns_fingerprint_and_writes_sidecar(tmp_path, monkeypatch):
+    import hashlib
+    from crossroads import provenance
+    monkeypatch.setattr(net.urllib.request, "urlopen",
+                        lambda url, timeout=None: io.BytesIO(b"hello world"))
+    dest = str(tmp_path / "out.txt")
+    sha = net.download_to_file("http://example/x", dest)
+    assert sha == hashlib.sha256(b"hello world").hexdigest()
+    note = provenance.read_sidecar(dest)
+    assert note["origin_url"] == "http://example/x"
+    assert note["origin_sha256"] == sha
+    assert note["derived_by"] is None                    # a direct download
+
+
+def test_rejected_download_writes_no_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setattr(net.urllib.request, "urlopen",
+                        lambda url, timeout=None: io.BytesIO(b"<html>error</html>"))
+
+    def reject(tmp):
+        raise ValueError("not the file we wanted")
+
+    with pytest.raises(ValueError):
+        net.download_to_file("http://example/x", str(tmp_path / "out.txt"), validator=reject)
+    assert os.listdir(tmp_path) == []                    # no file, no .part, no sidecar

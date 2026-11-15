@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 
 from crossroads.sql import sql_str
+from crossroads.provenance import ensure_source_files_table, data_fingerprint
 
 # Default reject-rate ceiling (spec §9-3). A source/dimension may override it;
 # a build() call may override the default globally. 0.05 == 5%.
@@ -96,7 +97,7 @@ def create_clean_view(con, view_name, silver_table, flag_columns):
 def ensure_quality_tables(con):
     """Create the shared audit tables if they do not already exist.
 
-    Idempotent: safe to call on every build(). These four tables are
+    Idempotent: safe to call on every build(). These tables are
     source-agnostic (one set per database). Bronze/silver tables are NOT
     created here — each source owns its own bronze/silver DDL.
 
@@ -142,6 +143,8 @@ def ensure_quality_tables(con):
         " reason VARCHAR,"
         " ingested_at TIMESTAMP DEFAULT current_timestamp)"
     )
+    # Which input files each source read, with their fingerprints (crossroads.provenance).
+    ensure_source_files_table(con)
 
 
 def write_build_metadata(con, *, parameters):
@@ -154,6 +157,10 @@ def write_build_metadata(con, *, parameters):
     built_at_utc differs run-to-run by design, so it is a provenance field explicitly excluded
     from spec §2's "structurally identical database" guarantee (which already carves out
     machine-stamped provenance timestamps). It does not weaken reproducibility; it records it.
+
+    data_fingerprint is one SHA-256 over every input file this build read (see
+    crossroads.provenance). It depends only on the files, so the same data gives the same
+    value on any machine; NULL if no source recorded any files.
     """
     import json
     import crossroads  # lazy import: avoids a circular import at module load time
@@ -163,12 +170,13 @@ def write_build_metadata(con, *, parameters):
         " crossroads_version VARCHAR,"
         " schema_version INTEGER,"
         " built_at_utc TIMESTAMP,"
-        " parameters VARCHAR)"
+        " parameters VARCHAR,"
+        " data_fingerprint VARCHAR)"
     )
     con.execute(
-        "INSERT INTO crossroads_meta VALUES (?, ?, now() AT TIME ZONE 'UTC', ?)",
+        "INSERT INTO crossroads_meta VALUES (?, ?, now() AT TIME ZONE 'UTC', ?, ?)",
         [crossroads.__version__, crossroads.SCHEMA_VERSION,
-         json.dumps(parameters, default=str, sort_keys=True)],
+         json.dumps(parameters, default=str, sort_keys=True), data_fingerprint(con)],
     )
 
 
@@ -287,12 +295,13 @@ def record_exemption(con, source_id, reason):
     )
 
 
-# The four shared audit tables, all keyed by source_id.
+# The shared audit tables, all keyed by source_id.
 _SOURCE_AUDIT_TABLES = (
     "source_ingest_log",
     "data_quality_log",
     "quarantine_raw",
     "quality_exemptions",
+    "source_files",
 )
 
 

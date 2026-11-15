@@ -441,6 +441,22 @@ def test_split_combined_writes_exact_per_year_files(tmp_path):
     assert not any(f.endswith(".part") for f in os.listdir(cache))
 
 
+def test_split_files_get_a_sidecar_pointing_to_the_combined_file(tmp_path):
+    """Each split per-year file records where its data really came from: the combined
+    file's URL, fingerprint and download time (crossroads.provenance)."""
+    from crossroads import provenance
+    cache = str(tmp_path / "cache")
+    _seed_combined(cache)
+    combined = os.path.join(cache, _COMBINED_NAME.format("collision"))
+    provenance.write_sidecar(combined, origin_url="https://example/combined.csv",
+                             origin_sha256="c0ffee")
+    Stats19Transformer()._split_combined(combined, "collision", [2005], cache)
+    note = provenance.read_sidecar(os.path.join(cache, _single_name("collision", 2005)))
+    assert note["origin_url"] == "https://example/combined.csv"
+    assert note["origin_sha256"] == "c0ffee"
+    assert note["derived_by"].startswith("split by collision_year")
+
+
 def test_split_combined_accepts_accident_year_header(tmp_path):
     """An older-style header (accident_index, accident_year) splits the same way."""
     src = tmp_path / "combined.csv"
@@ -631,7 +647,8 @@ def test_fetch_html_error_page_is_rejected(tmp_path, monkeypatch):
 
 
 def test_fetch_valid_csv_is_cached_atomically(tmp_path, monkeypatch):
-    """A valid STATS19 CSV lands at its final path with no leftover .part file."""
+    """A valid STATS19 CSV lands at its final path, with its .source.json sidecar note and
+    no leftover .part file."""
     cache = str(tmp_path / "cache")
 
     def fake_urlopen(url, timeout=None):
@@ -645,8 +662,11 @@ def test_fetch_valid_csv_is_cached_atomically(tmp_path, monkeypatch):
     files = sorted(os.listdir(cache))
     assert files == [
         "dft-road-casualty-statistics-casualty-2999.csv",
+        "dft-road-casualty-statistics-casualty-2999.csv.source.json",
         "dft-road-casualty-statistics-collision-2999.csv",
+        "dft-road-casualty-statistics-collision-2999.csv.source.json",
         "dft-road-casualty-statistics-vehicle-2999.csv",
+        "dft-road-casualty-statistics-vehicle-2999.csv.source.json",
     ]
     assert not any(f.endswith(".part") for f in files), "no temporary .part file should remain"
 

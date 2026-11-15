@@ -353,7 +353,8 @@ CREATE TABLE crossroads_meta (
     crossroads_version     VARCHAR,     -- the git-derived crossroads package version that built this DB
     schema_version         INTEGER,     -- monotonic integer schema marker (== crossroads.SCHEMA_VERSION at build time)
     built_at_utc           TIMESTAMP,   -- build time, UTC (provenance only; excluded from the reproducibility guarantee)
-    parameters             VARCHAR      -- JSON of the build parameters (datasets, years, boundary_mode)
+    parameters             VARCHAR,     -- JSON of the build parameters (datasets, years, boundary_mode)
+    data_fingerprint       VARCHAR      -- one SHA-256 over every input file (see source_files); same files -> same value
 );
 ```
 
@@ -397,6 +398,28 @@ CREATE TABLE source_ingest_log (
     source_id              VARCHAR,     -- audited source
     source_rows            BIGINT,      -- number of rows read from that source's files
     ingested_at            TIMESTAMP    -- when recorded, UTC (DB-stamped provenance)
+);
+```
+
+### `source_files`
+
+Exactly which input files built this database: one row per file per source, so you can
+prove which data you used. Publishers sometimes re-issue a file under the same name, so
+two builds with the same version and parameters can differ. Compare `sha256` here (or
+`crossroads_meta.data_fingerprint`) to check. The origin columns come from a
+`<file>.source.json` note Crossroads writes beside each cache file. They are NULL for a file
+cached by a version before 1.1.0: clear the cache and rebuild to fill them in.
+
+```sql
+CREATE TABLE source_files (
+    source_id              VARCHAR,     -- source that read the file (e.g. stats19_collision, ons_lad, aadf)
+    file_name              VARCHAR,     -- cache file name that was read
+    sha256                 VARCHAR,     -- fingerprint of the file's bytes, computed at build time (64 hex characters)
+    size_bytes             BIGINT,      -- file size
+    origin_url             VARCHAR,     -- where the data was downloaded from (NULL if unknown)
+    origin_sha256          VARCHAR,     -- fingerprint of the downloaded file, taken while downloading (NULL if unknown, or for weather)
+    downloaded_at_utc      TIMESTAMP,   -- when it was downloaded, UTC (NULL if unknown; excluded from the reproducibility guarantee)
+    derived_by             VARCHAR      -- NULL for a direct download; else how the file was made (e.g. split from a combined file)
 );
 ```
 

@@ -26,6 +26,7 @@ from crossroads.quality import (
 )
 from crossroads.sql import sql_str
 from crossroads.net import download_to_file, url_exists
+from crossroads.provenance import copy_origin, record_source_files
 
 # DfT publishes its STATS19 CSVs under this base. Every file name below is
 # code-controlled. DfT's page listing them: ROAD_SAFETY_PAGE.
@@ -348,9 +349,12 @@ class Stats19Transformer(BaseTransformer):
                     f"{'it' if len(missing) == 1 else 'they'} cannot be built. The cached "
                     f"file may be out of date: delete {combined_path} to download a fresh "
                     f"copy.")
-            # Every year is complete: move each one into place.
+            # Every year is complete: move each one into place, with a sidecar note
+            # pointing back to the combined file it came from (crossroads.provenance).
             for path in wanted.values():
                 os.replace(path + ".part", path)
+                copy_origin(path, combined_path,
+                            "split by collision_year from DfT's combined 1979-onwards file")
         except BaseException:
             # Something went wrong (or the run was interrupted): leave nothing half-written.
             for year, fh in outputs.items():
@@ -648,6 +652,7 @@ class Stats19Transformer(BaseTransformer):
             files = self._cached_files(cache_dir, ftype)
             self._load_bronze(con, bronze, files, sid)   # captures + quarantines rejects
             record_source_rows(con, sid, self._count_source_rows(files))
+            record_source_files(con, sid, files)          # fingerprint each file read
 
         # --- SILVER (×3): keep-in-place 1:1. Collision silver must be derived FIRST —
         # vehicle/casualty silver compute link_valid by joining to the collisions table. ---

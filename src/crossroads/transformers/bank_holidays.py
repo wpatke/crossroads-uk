@@ -22,6 +22,7 @@ import os
 from crossroads.transformers.base import BaseTransformer
 from crossroads.quality import QualityExemption, create_clean_view
 from crossroads.net import download_to_file
+from crossroads.provenance import record_source_files
 
 # The live GOV.UK feed. Public, Open Government Licence v3.0.
 FEED_URL = "https://www.gov.uk/bank-holidays.json"
@@ -76,6 +77,9 @@ class BankHolidaysTransformer(BaseTransformer):
         self._derive_silver(con)
         # GOLD: no reject flags, so the clean view is every silver row (WHERE TRUE).
         create_clean_view(con, self.CLEAN_VIEW, self.SILVER, [])
+        # Fingerprint the feed file. Being exempt from the row-count check does not
+        # change the need to know exactly which file was used (crossroads.provenance).
+        record_source_files(con, self.source_id, [path])
         # NOTE: this source is quality-EXEMPT, so we deliberately do NOT call
         # record_source_rows here — there is no conservation invariant to feed.
 
