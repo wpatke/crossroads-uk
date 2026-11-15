@@ -124,11 +124,11 @@ exactly which files it read, in `source_files` (see [schema.md](schema.md#source
   request, and the monthly downloads are deleted after merging, so only the merged year file
   can be fingerprinted.
 
-### Tested with (v1.0.0)
+### Tested with (v1.0.0 and v1.1.0)
 
 Reproducibility depends on the runtime stack, and `duckdb>=1.5` is a floating floor. To
-reproduce the exact `1.0.0` behaviour (notably coordinate reprojection, which rides on
-DuckDB Spatial + PROJ), pin these versions:
+reproduce the exact `1.0.0` or `1.1.0` behaviour (notably coordinate reprojection, which
+rides on DuckDB Spatial + PROJ), pin these versions:
 
 | Component | Tested version             |
 |-----------|----------------------------|

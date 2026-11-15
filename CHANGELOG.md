@@ -19,7 +19,11 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
-## [Unreleased]
+## [1.1.0] - 2026-11-15
+
+Every STATS19 year from 1979 can now be built, every database records a fingerprint of
+each input file it was built from, and the STATS19 reference data follows DfT's 2025 Data
+Guide. Databases built with this version have `schema_version` 5.
 
 ### Added
 - **Data fingerprints.** Every database now records exactly which input files built it.
