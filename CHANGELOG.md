@@ -19,6 +19,31 @@ The physical database shape also carries its own monotonic `schema_version` inte
 declared dependencies or ingestion behaviour is a release** and is recorded here; the versions each
 release was tested against are listed in [docs/methodology.md](docs/methodology.md).
 
+## [Unreleased]
+
+### Added
+- `casualties.escooter_flag`: 1 when the casualty was using an e-scooter, 0 when not. DfT
+  added this column to its casualty files in its autumn 2026 re-issue. Earlier builds
+  loaded it into the bronze table but dropped it from `casualties`. It is NULL for casualty
+  files that do not have the column.
+- `codebook.tbl`: the source file (`collision` / `vehicle` / `casualty`) each code belongs
+  to. The codebook is now unique on `(tbl, variable, code)`, because `escooter_flag` is in
+  both the vehicle and casualty files with different labels. **A query that joins
+  `codebook` on `variable` alone should now also match `tbl`**, or it will get two rows for
+  each `escooter_flag` code.
+
+### Changed
+- The codebook is now built from the 2025 edition of DfT's Road Safety Open Dataset Data
+  Guide (previously the 2024 edition, whose download address now returns 404). New labels:
+  `junction_detail` 19 "Other junction" (in use in every year, about 3,000–7,000 collisions
+  a year), and `vehicle_type` 33 / `casualty_type` 33 "Personal powered transporter" (the
+  code DfT now uses for e-scooters). These labels were blank before, and every build warned
+  about undecoded codes in `junction_detail`, and also in `vehicle_type` and `casualty_type`
+  for 2020 onwards. The guide prints the casualty code as a second `23`; its own conversion
+  sheet gives `33`, and the codebook script corrects it (see
+  [src/crossroads/reference/README.md](src/crossroads/reference/README.md)).
+- Database `schema_version` 4 → 5 (additive: the two columns above).
+
 ## [1.0.5] - 2026-11-01
 
 Documentation only: the code and the databases it builds are the same as 1.0.4.

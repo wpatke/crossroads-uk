@@ -6,7 +6,7 @@ tables dynamically (`CREATE OR REPLACE ... AS SELECT`), so this file documents t
 it is never executed. Every built database also carries its own machine-readable schema
 marker: `SELECT * FROM crossroads_meta` (see [`crossroads_meta`](#crossroads_meta)).
 
-**Schema version:** 4  ·  See [methodology.md](methodology.md) for how the data is produced
+**Schema version:** 5  ·  See [methodology.md](methodology.md) for how the data is produced
 and [spec.md §9](spec.md) for the keep-in-place quality model.
 
 ## Conventions (keep-in-place model)
@@ -178,6 +178,7 @@ CREATE TABLE casualties (
     casualty_injury_based  INTEGER,     -- coded: whether severity is injury-based (post-adjustment marker)
     casualty_type          INTEGER,     -- coded: casualty road-user type
     enhanced_casualty_severity INTEGER, -- coded: enhanced (probability-based) casualty severity
+    escooter_flag          INTEGER,     -- coded: 1 = casualty was using an e-scooter, 0 = not (NULL in files published before DfT added it)
     lsoa_of_casualty       VARCHAR,     -- text: ONS LSOA code of the casualty's home
     pedestrian_location    INTEGER,     -- coded: pedestrian location at the time
     pedestrian_movement    INTEGER,     -- coded: pedestrian movement/direction
@@ -431,10 +432,14 @@ CREATE TABLE stats19_completeness (
 ### `codebook`
 
 Static reference lookup mapping STATS19 integer codes to DfT English labels. Not an audited
-source. See [reference/README.md](../src/crossroads/reference/README.md).
+source. Unique on `(tbl, variable, code)`: the same column name can have different labels in
+two files (`escooter_flag` is in both `vehicles` and `casualties`), so a join to the codebook
+should match `tbl` as well as `variable`. See
+[reference/README.md](../src/crossroads/reference/README.md).
 
 ```sql
 CREATE TABLE codebook (
+    tbl                    VARCHAR,     -- source file the code belongs to: collision / vehicle / casualty
     variable               VARCHAR,     -- coded column name (e.g. collision_severity)
     code                   VARCHAR,     -- the integer code as a string (e.g. '1', '-1'), preserved exactly
     label                  VARCHAR,     -- the DfT English label for that code
